@@ -13,7 +13,8 @@
 
 #include "gtm_string.h"
 
-#include "rtnhdr.h"
+#include "error.h"	/* For DBGEHND() */
+#include <rtnhdr.h>
 #include "stack_frame.h"
 
 GBLREF unsigned char 	*stacktop, *stackwarn, *msp;
@@ -61,4 +62,5 @@ void base_frame(rhdtyp *base_address)
 	fp->type = SFT_COUNT;
 	fp->ret_value = NULL;
 	fp->dollar_test = -1;
+	DBGEHND((stderr, "base_frame: New base frame allocated at 0x"lvaddr"\n", fp));
 }

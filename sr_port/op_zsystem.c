@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2010 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -47,9 +47,13 @@
 #define	ZSYSTEMSTR	"ZSYSTEM"
 #define	MAXZSYSSTRLEN	4096	/* maximum command line length supported by most Unix shells */
 
+GBLREF	uint4		dollar_trestart;
 GBLREF	int4		dollar_zsystem;			/* exit status of child */
 GBLREF	io_pair		io_std_device;
 GBLREF	uint4           trust;
+
+error_def(ERR_INVSTRLEN);
+error_def(ERR_SYSCALL);
 
 void op_zsystem(mval *v)
 {
@@ -67,14 +71,14 @@ void op_zsystem(mval *v)
 #else
 #error UNSUPPORTED PLATFORM
 #endif
-	error_def(ERR_INVSTRLEN);
-	error_def(ERR_SYSCALL);
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	TPNOTACID_CHECK(ZSYSTEMSTR);
 	MV_FORCE_STR(v);
 #ifdef UNIX
 	if (v->str.len > (MAXZSYSSTRLEN - 32 - 1)) /* 32 char for shell name, remaining for ZSYSTEM command */
-		rts_error(VARLSTCNT(4) ERR_INVSTRLEN, 2, v->str.len, (MAXZSYSSTRLEN - 32 - 1));
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_INVSTRLEN, 2, v->str.len, (MAXZSYSSTRLEN - 32 - 1));
 	/* get SHELL environment */
 	sh = GETENV("SHELL");
 	/* use bourn shell as default */
@@ -100,7 +104,7 @@ void op_zsystem(mval *v)
 #ifdef UNIX
 	dollar_zsystem = SYSTEM(cmd);
 	if (-1 == dollar_zsystem)
-		rts_error(VARLSTCNT(8) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("system"), CALLFROM, errno);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("system"), CALLFROM, errno);
 #ifdef _BSD
 	assert(SIZEOF(wait_stat) == SIZEOF(int4));
 	wait_stat.w_status = dollar_zsystem;
@@ -116,7 +120,7 @@ void op_zsystem(mval *v)
 		setterm(io_std_device.in);
 #ifdef VMS
 	if (status != SS$_NORMAL)
-		rts_error(VARLSTCNT(1) status);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) status);
 #endif
 	return;
 }

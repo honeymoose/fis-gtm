@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2012, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -33,6 +33,7 @@
 #include <errno.h>
 
 #include "gtm_string.h"
+#include "gtm_time.h"
 #include "gdsroot.h"
 #include "gdsblk.h"
 #include "gdsbml.h"
@@ -60,6 +61,7 @@
 #include "mu_truncate.h"
 #include "gtmio.h"
 #include "util.h"
+#include "anticipatory_freeze.h"
 
 #include "sleep_cnt.h"
 #include "wcs_sleep.h"
@@ -69,6 +71,8 @@
 #include "shmpool.h"
 #include "clear_cache_array.h"
 #include "wcs_flu.h"
+#include "repl_msg.h"
+#include "gtmsource.h"
 
 error_def(ERR_BUFFLUFAILED);
 error_def(ERR_DBFILERR);
@@ -105,6 +109,7 @@ GBLREF	unsigned char		t_fail_hist[CDB_MAX_TRIES];
 GBLREF	volatile int4		db_fsync_in_prog;	/* for DB_FSYNC macro usage */
 GBLREF	jnl_gbls_t		jgbl;
 GBLREF	int			num_additional_processors;
+GBLREF	jnlpool_addrs		jnlpool;
 
 boolean_t mu_truncate(int4 truncate_percent)
 {
@@ -120,6 +125,7 @@ boolean_t mu_truncate(int4 truncate_percent)
 	uint4			old_free, new_free;
 	uint4			end_blocks;
 	int4			blks_in_lmap, blk;
+	gtm_uint64_t		before_trunc_file_size;
 	off_t			trunc_file_size;
 	uchar_ptr_t		lmap_addr;
 	boolean_t		was_crit;
@@ -141,20 +147,21 @@ boolean_t mu_truncate(int4 truncate_percent)
 	csd = cs_data;
 	if (dba_mm == csd->acc_meth)
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_MUTRUNCNOTBG, 2, REG_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_MUTRUNCNOTBG, 2, REG_LEN_STR(gv_cur_region));
 		return TRUE;
 	}
 	if ((GDSVCURR != csd->desired_db_format) || (csd->blks_to_upgrd != 0))
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_MUTRUNCNOV4, 2, REG_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_MUTRUNCNOV4, 2, REG_LEN_STR(gv_cur_region));
 		return TRUE;
 	}
 	if (csa->ti->free_blocks < (truncate_percent * csa->ti->total_blks / 100))
 	{
-		gtm_putmsg(VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region), truncate_percent);
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region), truncate_percent);
 		return TRUE;
 	}
 	/* already checked for parallel truncates on this region --- see mupip_reorg.c */
+	gv_target = NULL;
 	assert(csa->nl->trunc_pid == process_id);
 	assert(dba_mm != csd->acc_meth);
 	old_total = csa->ti->total_blks;
@@ -175,7 +182,8 @@ boolean_t mu_truncate(int4 truncate_percent)
 		assert(csa->ti->total_blks >= old_total); /* otherwise, a concurrent truncate happened... */
 		if (csa->ti->total_blks != old_total) /* Extend (likely called by mupip extend) -- don't truncate */
 		{
-			gtm_putmsg(VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region), truncate_percent);
+			gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region),
+					truncate_percent);
 			return TRUE;
 		}
 		lmap_blk_num = lmap_num * BLKS_PER_LMAP;
@@ -253,8 +261,12 @@ boolean_t mu_truncate(int4 truncate_percent)
 					/* block processed, scan from the next one */
 					blk++;
 					break;
+				} else
+				{
+					assert(t_tries < CDB_STAGNATE);
+					t_retry(cdb_sc_badbitmap);
+					continue;
 				}
-				assertpro(FALSE);
 			} /* END recycled2free retry loop */
 		} /* END scanning blocks of this particular lmap */
 		/* Write PBLK for the bitmap block, in case it hasn't been written i.e. t_end() was never called above */
@@ -264,7 +276,6 @@ boolean_t mu_truncate(int4 truncate_percent)
 		for (;;)
 		{
 			RESET_UPDATE_ARRAY;
-			gv_target->clue.end = 0;
 			BLK_ADDR(blkid_ptr, SIZEOF(block_id), block_id);
 			*blkid_ptr = 0;
 			update_trans = UPDTRNS_DB_UPDATED_MASK;
@@ -294,10 +305,10 @@ boolean_t mu_truncate(int4 truncate_percent)
 	for (;;)
 	{ /* wait for FREEZE, we don't want to truncate a frozen database */
 		grab_crit(gv_cur_region);
-		if (!cs_data->freeze)
+		if (!cs_data->freeze && !IS_REPL_INST_FROZEN)
 			break;
 		rel_crit(gv_cur_region);
-		while (cs_data->freeze)
+		while (cs_data->freeze || IS_REPL_INST_FROZEN)
 			hiber_start(1000);
 	}
 	assert(csa->nl->trunc_pid == process_id);
@@ -305,13 +316,14 @@ boolean_t mu_truncate(int4 truncate_percent)
 	if (!wcs_flu(WCSFLU_FLUSH_HDR | WCSFLU_WRITE_EPOCH | WCSFLU_MSYNC_DB))
 	{
 		assert(FALSE);
-		gtm_putmsg(VARLSTCNT(6) ERR_BUFFLUFAILED, 4, LEN_AND_LIT("MUPIP REORG TRUNCATE"), DB_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(6) ERR_BUFFLUFAILED, 4, LEN_AND_LIT("MUPIP REORG TRUNCATE"),
+				DB_LEN_STR(gv_cur_region));
 		rel_crit(gv_cur_region);
 		return FALSE;
 	}
 	csa->nl->highest_lbm_with_busy_blk = MAX(found_busy_blk, csa->nl->highest_lbm_with_busy_blk);
-	assert(csa->nl->highest_lbm_with_busy_blk % BLKS_PER_LMAP == 0); /* should be a bitmap block */
-	new_total = MIN(old_total, csa->nl->highest_lbm_with_busy_blk +  BLKS_PER_LMAP);
+	assert(IS_BITMAP_BLK(csa->nl->highest_lbm_with_busy_blk));
+	new_total = MIN(old_total, csa->nl->highest_lbm_with_busy_blk + BLKS_PER_LMAP);
 	if (mu_ctrly_occurred || mu_ctrlc_occurred)
 	{
 		rel_crit(gv_cur_region);
@@ -319,22 +331,22 @@ boolean_t mu_truncate(int4 truncate_percent)
 	} else if (csa->ti->total_blks != old_total || new_total == old_total)
 	{
 		assert(csa->ti->total_blks >= old_total); /* Better have been an extend, not a truncate... */
-		gtm_putmsg(VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region), truncate_percent);
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_MUTRUNCNOSPACE, 3, REG_LEN_STR(gv_cur_region), truncate_percent);
 		rel_crit(gv_cur_region);
 		return TRUE;
 	} else if (GDSVCURR != csd->desired_db_format || csd->blks_to_upgrd != 0 || !csd->fully_upgraded)
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_MUTRUNCNOV4, 2, REG_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_MUTRUNCNOV4, 2, REG_LEN_STR(gv_cur_region));
 		rel_crit(gv_cur_region);
 		return TRUE;
 	} else if (SNAPSHOTS_IN_PROG(csa->nl))
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_MUTRUNCSSINPROG, 2, REG_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_MUTRUNCSSINPROG, 2, REG_LEN_STR(gv_cur_region));
 		rel_crit(gv_cur_region);
 		return TRUE;
 	} else if (BACKUP_NOT_IN_PROGRESS != cs_addrs->nl->nbb)
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_MUTRUNCBACKINPROG, 2, REG_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_MUTRUNCBACKINPROG, 2, REG_LEN_STR(gv_cur_region));
 		rel_crit(gv_cur_region);
 		return TRUE;
 	}
@@ -352,7 +364,7 @@ boolean_t mu_truncate(int4 truncate_percent)
 		ADJUST_GBL_JREC_TIME(jgbl, jbp);
 		jnl_status = jnl_ensure_open();
 		if (SS_NORMAL != jnl_status)
-			send_msg(VARLSTCNT(6) jnl_status, 4, JNL_LEN_STR(csd), DB_LEN_STR(gv_cur_region));
+			send_msg_csa(CSA_ARG(csa) VARLSTCNT(6) jnl_status, 4, JNL_LEN_STR(csd), DB_LEN_STR(gv_cur_region));
 		else
 		{
 			if (0 == jpc->pini_addr)
@@ -363,7 +375,7 @@ boolean_t mu_truncate(int4 truncate_percent)
 			jnl_status = jnl_flush(gv_cur_region);
 			if (SS_NORMAL != jnl_status)
 			{
-				send_msg(VARLSTCNT(9) ERR_JNLFLUSH, 2, JNL_LEN_STR(csd),
+				send_msg_csa(CSA_ARG(csa) VARLSTCNT(9) ERR_JNLFLUSH, 2, JNL_LEN_STR(csd),
 					ERR_TEXT, 2, RTS_ERROR_TEXT("Error with journal flush during mu_truncate"),
 					jnl_status);
 				assert(NOJNL == jpc->channel); /* jnl file lost has been triggered */
@@ -375,12 +387,10 @@ boolean_t mu_truncate(int4 truncate_percent)
 	CHECK_TN(csa, csd, curr_tn);
 	udi = FILE_INFO(gv_cur_region);
 	/* Information used by recover_truncate to check if the file size and csa->ti->total_blks are INCONSISTENT */
-	csd->before_trunc_file_size = gds_file_size(gv_cur_region->dyn.addr->file_cntl); /* in DISK_BLOCKs */
-	assert((off_t)csd->before_trunc_file_size * DISK_BLOCK_SIZE > (off_t)(old_total - new_total) * csd->blk_size);
-	trunc_file_size = (off_t)csd->before_trunc_file_size * DISK_BLOCK_SIZE
+	before_trunc_file_size = gds_file_size(gv_cur_region->dyn.addr->file_cntl); /* in DISK_BLOCKs */
+	assert((off_t)before_trunc_file_size * DISK_BLOCK_SIZE > (off_t)(old_total - new_total) * csd->blk_size);
+	trunc_file_size = (off_t)before_trunc_file_size * DISK_BLOCK_SIZE
 		- (off_t)(old_total - new_total) * csd->blk_size; /* in bytes */
-	DBGEHND((stdout, "DBG:: csd->before_trunc_file_size * DISK_BLOCK_SIZE = [%lld], trunc_file_size = [%lld]\n",
-		(off_t)csd->before_trunc_file_size * DISK_BLOCK_SIZE, trunc_file_size));
 	csd->after_trunc_total_blks = new_total;
 	csd->before_trunc_free_blocks = csa->ti->free_blocks;
 	csd->before_trunc_total_blks = old_total; /* Flags interrupted truncate for recover_truncate */
@@ -401,7 +411,7 @@ boolean_t mu_truncate(int4 truncate_percent)
 	if (0 != save_errno)
 	{
 		err_msg = (char *)STRERROR(errno);
-		rts_error(VARLSTCNT(6) ERR_MUTRUNCERROR, 4, REG_LEN_STR(gv_cur_region), LEN_AND_STR(err_msg));
+		rts_error_csa(CSA_ARG(csa) VARLSTCNT(6) ERR_MUTRUNCERROR, 4, REG_LEN_STR(gv_cur_region), LEN_AND_STR(err_msg));
 		return FALSE;
 	}
 	KILL_TRUNC_TEST(WBTEST_CRASH_TRUNCATE_3); /* 57 : Issue a kill -9 after reducing csa->ti->total_blks, before FTRUNCATE */
@@ -414,12 +424,17 @@ boolean_t mu_truncate(int4 truncate_percent)
 	if (0 != ftrunc_status)
 	{
 		err_msg = (char *)STRERROR(errno);
-		rts_error(VARLSTCNT(6) ERR_MUTRUNCERROR, 4, REG_LEN_STR(gv_cur_region), LEN_AND_STR(err_msg));
+		rts_error_csa(CSA_ARG(csa) VARLSTCNT(6) ERR_MUTRUNCERROR, 4, REG_LEN_STR(gv_cur_region), LEN_AND_STR(err_msg));
 		/* should go through recover_truncate now, which will again try to FTRUNCATE */
 		return FALSE;
 	}
 	/* file size and total blocks: CONSISTENT (shrunk) */
 	KILL_TRUNC_TEST(WBTEST_CRASH_TRUNCATE_4); /* 58 : Issue a kill -9 after FTRUNCATE, before 2nd fsync */
+	csa->nl->root_search_cycle++;	/* Force concurrent processes to restart in t_end/tp_tend to make sure no one
+					 * tries to commit updates past the end of the file. Bitmap validations together
+					 * with highest_lbm_with_busy_blk should actually be sufficient, so this is
+					 * just to be safe.
+					 */
 	csd->before_trunc_total_blks = 0; /* indicate CONSISTENT */
 	/* Increment TN */
 	assert(csa->ti->early_tn == csa->ti->curr_tn);
@@ -432,7 +447,7 @@ boolean_t mu_truncate(int4 truncate_percent)
 	ENABLE_INTERRUPTS(INTRPT_IN_TRUNC);
 	curr_tn = csa->ti->curr_tn;
 	rel_crit(gv_cur_region);
-	send_msg(VARLSTCNT(7) ERR_MUTRUNCSUCCESS, 5, DB_LEN_STR(gv_cur_region), old_total, new_total, &curr_tn);
+	send_msg_csa(CSA_ARG(csa) VARLSTCNT(7) ERR_MUTRUNCSUCCESS, 5, DB_LEN_STR(gv_cur_region), old_total, new_total, &curr_tn);
 	util_out_print("Truncated region: !AD. Reduced total blocks from [!UL] to [!UL]. Reduced free blocks from [!UL] to [!UL].",
 					FLUSH, REG_LEN_STR(gv_cur_region), old_total, new_total, old_free, new_free);
 	return TRUE;
@@ -459,7 +474,7 @@ STATICFNDEF int4 bml_find_busy_recycled(int4 hint, uchar_ptr_t base_addr, int4 b
 			GET_STATUS(*ptr, i, status);
 			if (status != BLK_FREE)
 			{
-				assert(status == BLK_BUSY || status == BLK_RECYCLED);
+				assert((t_tries < CDB_STAGNATE) || (status == BLK_BUSY) || (status == BLK_RECYCLED));
 				*bml_status_ptr = status;
 				return blknum;
 			}

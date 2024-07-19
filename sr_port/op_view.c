@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -12,14 +12,20 @@
 #include "mdef.h"
 
 #include <stdarg.h>
+#if defined(UNIX) && defined(DEBUG)
+# include "gtm_syslog.h"	/* Needed for white box case in VTK_STORDUMP */
+#endif
 #include "gtm_string.h"
+#include "gtm_stdio.h"
 
 #include "gtmio.h"
+#include "util.h"
 #include "have_crit.h"
 #include "gdsroot.h"
 #include "gtm_facility.h"
 #include "fileinfo.h"
 #include "gdsbt.h"
+#include "gdsbgtr.h"
 #include "gdsfhead.h"
 #include "filestruct.h"
 #include "cmd_qlf.h"
@@ -46,12 +52,23 @@
 #include "gtm_malloc.h"
 #include "alias.h"
 #include "fullbool.h"
+#include "anticipatory_freeze.h"
 #ifdef GTM_TRIGGER
-#include "rtnhdr.h"		/* for rtn_tabent in gv_trigger.h */
-#include "gv_trigger.h"
-#include "gtm_trigger.h"
+# include "rtnhdr.h"		/* for rtn_tabent in gv_trigger.h */
+# include "gv_trigger.h"
+# include "gtm_trigger.h"
+#endif
+#ifdef UNIX
+# include "wbox_test_init.h"
+# include "mutex.h"
+# ifdef DEBUG
+#  include "gtmsecshr.h"
+# endif
 #endif
 
+STATICFNDCL void view_dbflushop(unsigned char keycode, viewparm *parmblkptr, mval *thirdarg);
+
+GBLREF	volatile int4 		db_fsync_in_prog;
 GBLREF	boolean_t		certify_all_blocks;
 GBLREF	bool			undef_inhibit, jobpid;
 GBLREF	bool			view_debug1, view_debug2, view_debug3, view_debug4;
@@ -76,10 +93,12 @@ GBLREF	uint4			gtmDebugLevel;
 GBLREF	boolean_t		lvmon_enabled;
 GBLREF	spdesc			stringpool;
 GBLREF	boolean_t		is_updproc;
+GBLREF	pid_t			process_id;
 
 error_def(ERR_ACTRANGE);
 error_def(ERR_COLLATIONUNDEF);
 error_def(ERR_COLLDATAEXISTS);
+error_def(ERR_DBFSYNCERR);
 error_def(ERR_INVZDIRFORM);
 error_def(ERR_ISOLATIONSTSCHN);
 error_def(ERR_JNLFLUSH);
@@ -100,22 +119,22 @@ error_def(ERR_ZDEFACTIVE);
 #define WRITE_LITERAL(x) (outval.str.len = SIZEOF(x) - 1, outval.str.addr = (x), op_write(&outval))
 
 /* if changing noisolation status within TP and already referenced the global, then error */
-#define SET_GVNH_NOISOLATION_STATUS(gvnh, status)							\
-{													\
-	GBLREF	uint4			dollar_tlevel;							\
-													\
-	if (!dollar_tlevel || gvnh->read_local_tn != local_tn || status == gvnh->noisolation)		\
-		gvnh->noisolation = status;								\
-	else												\
-		rts_error(VARLSTCNT(6) ERR_ISOLATIONSTSCHN, 4, gvnh->gvname.var_name.len, 		\
-			gvnh->gvname.var_name.addr, gvnh->noisolation, status);				\
+#define SET_GVNH_NOISOLATION_STATUS(gvnh, status)								\
+{														\
+	GBLREF	uint4			dollar_tlevel;								\
+														\
+	if (!dollar_tlevel || gvnh->read_local_tn != local_tn || status == gvnh->noisolation)			\
+		gvnh->noisolation = status;									\
+	else													\
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_ISOLATIONSTSCHN, 4, gvnh->gvname.var_name.len, 	\
+			gvnh->gvname.var_name.addr, gvnh->noisolation, status);					\
 }
 
 void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 {
 	int4			testvalue, tmpzdefbufsiz;
 	uint4			jnl_status, dummy_errno;
-	int			status;
+	int			status, lcnt, icnt;
 	gd_region		*reg, *r_top, *save_reg;
 	gv_namehead		*gvnh;
 	mval			*arg, *nextarg, outval;
@@ -125,7 +144,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 	viewtab_entry		*vtp;
 	gd_addr			*addr_ptr;
 	noisolation_element	*gvnh_entry;
-	int			lct, ncol;
+	int			lct, ncol, nct;
 	collseq			*new_lcl_collseq;
 	ht_ent_mname		*tabent, *topent;
 	lv_val			*lv;
@@ -196,30 +215,13 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			outval.mvtype = MV_STR;
 			view_debug4 = (0 != MV_FORCE_INT(parmblk.value));
 			break;
+		case VTK_DBSYNC:
+		case VTK_EPOCH:
 		case VTK_FLUSH:
-			if (NULL == gd_header)		/* open gbldir */
-				gvinit();
-			save_reg = gv_cur_region;
-			if (NULL == parmblk.gv_ptr)
-			{	/* flush all regions */
-				reg = gd_header->regions;
-				r_top = reg + gd_header->n_regions - 1;
-			} else	/* flush selected region */
-				r_top = reg = parmblk.gv_ptr;
-			for (;  reg <= r_top;  reg++)
-			{
-				if (!reg->open)
-					gv_init_reg(reg);
-				if (!reg->read_only)
-				{
-					gv_cur_region = reg;
-					change_reg(); /* for jnl_ensure_open */
-					ENSURE_JNL_OPEN(cs_addrs, gv_cur_region);
-					wcs_flu(WCSFLU_FLUSH_HDR | WCSFLU_WRITE_EPOCH | WCSFLU_SYNC_EPOCH);
-				}
-			}
-			gv_cur_region = save_reg;
-			change_reg();
+		case VTK_JNLFLUSH:
+		case VTK_DBFLUSH:
+			arg = (numarg > 1) ? va_arg(var, mval *) : NULL;
+			view_dbflushop(vtp->keycode, &parmblk, arg);
 			break;
 		case VTK_FULLBOOL:
 			TREF(gtm_fullbool) = FULL_BOOL;
@@ -318,58 +320,6 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			}
 			break;
 #		endif
-		case VTK_JNLFLUSH:
-			if (NULL == gd_header)		/* open gbldir */
-				gvinit();
-			save_reg = gv_cur_region;
-			if (NULL == parmblk.gv_ptr)
-			{	/* flush all journal files */
-				reg = gd_header->regions;
-				r_top = reg + gd_header->n_regions - 1;
-			} else	/* flush journal for selected region */
-				r_top = reg = parmblk.gv_ptr;
-			for (;  reg <= r_top;  reg++)
-			{
-				if (!reg->open)
-					gv_init_reg(reg);
-				gv_cur_region = reg;
-				change_reg();
-				csa = cs_addrs;
-				csd = csa->hdr;
-				if (JNL_ENABLED(csd))
-				{
-					was_crit = csa->now_crit;
-					if (!was_crit)
-						grab_crit(reg);
-					if (JNL_ENABLED(csd))
-					{
-						jnl_status = jnl_ensure_open();
-						if (0 == jnl_status)
-						{
-							jb = csa->jnl->jnl_buff;
-							if (SS_NORMAL == (jnl_status = jnl_flush(reg)))
-							{
-								assert(jb->dskaddr == jb->freeaddr);
-								UNIX_ONLY(jnl_fsync(reg, jb->dskaddr));
-								UNIX_ONLY(assert(jb->freeaddr == jb->fsync_dskaddr));
-							} else
-							{
-								send_msg(VARLSTCNT(9) ERR_JNLFLUSH, 2, JNL_LEN_STR(csd),
-									ERR_TEXT, 2,
-									RTS_ERROR_TEXT("Error with journal flush during op_view"),
-									jnl_status);
-								assert(FALSE);
-							}
-						} else
-							send_msg(VARLSTCNT(6) jnl_status, 4, JNL_LEN_STR(csd), DB_LEN_STR(reg));
-					}
-					if (!was_crit)
-						rel_crit(reg);
-				}
-			}
-			gv_cur_region = save_reg;
-			change_reg();
-			break;
 		case VTK_JNLWAIT:
 			/* go through all regions that could have possibly been open across all global directories */
 			for (addr_ptr = get_next_gdr(NULL); addr_ptr; addr_ptr = get_next_gdr(addr_ptr))
@@ -417,7 +367,8 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			if (0 == status)
 			{
 				va_end(var);
-				rts_error(VARLSTCNT(4) ERR_PATTABNOTFND, 2, parmblk.value->str.len, parmblk.value->str.addr);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_PATTABNOTFND, 2, parmblk.value->str.len,
+						parmblk.value->str.addr);
 			}
 			break;
 		case VTK_RESETGVSTATS:
@@ -461,7 +412,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			if (TREF(view_ydirt_str_len) > MAX_YDIRTSTR)
 			{
 				va_end(var);
-				rts_error(VARLSTCNT(1) ERR_YDIRTSZ);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_YDIRTSZ);
 			}
 			if (TREF(view_ydirt_str_len) > 0)
 				memcpy(TREF(view_ydirt_str), parmblk.value->str.addr, TREF(view_ydirt_str_len));
@@ -494,7 +445,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			else
 			{
 				va_end(var);
-				rts_error(VARLSTCNT(1) ERR_REQDVIEWPARM);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_REQDVIEWPARM);
 			}
 			nextarg = NULL;
 			ncol = -1;
@@ -503,7 +454,14 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 				nextarg = va_arg(var, mval *);
 				ncol = MV_FORCE_INT(nextarg);
 			}
-			if ((-1 == lct) && (-1 == ncol))
+			nextarg = NULL;
+			nct = -1;
+			if (numarg > 2)
+			{
+				nextarg = va_arg(var, mval *);
+				nct = MV_FORCE_INT(nextarg);
+			}
+			if ((-1 == lct) && (-1 == ncol) && (-1 == nct))
 				break;
 			/* lct = -1 indicates user wants to change only ncol, not lct */
 			if (-1 != lct)
@@ -511,7 +469,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 				if ((lct < MIN_COLLTYPE) || (lct > MAX_COLLTYPE))
 				{
 					va_end(var);
-					rts_error(VARLSTCNT(3) ERR_ACTRANGE, 1, lct);
+					rts_error_csa(CSA_ARG(NULL) VARLSTCNT(3) ERR_ACTRANGE, 1, lct);
 				}
 			}
 			/* at this point, verify that there is no local data with subscripts */
@@ -526,7 +484,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 						if (lv && LV_HAS_CHILD(lv))
 						{
 							va_end(var);
-							rts_error(VARLSTCNT(1) ERR_COLLDATAEXISTS);
+							rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_COLLDATAEXISTS);
 						}
 					}
 				}
@@ -539,7 +497,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 					if (0 == new_lcl_collseq)
 					{
 						va_end(var);
-						rts_error(VARLSTCNT(3) ERR_COLLATIONUNDEF, 1, lct);
+						rts_error_csa(CSA_ARG(NULL) VARLSTCNT(3) ERR_COLLATIONUNDEF, 1, lct);
 					}
 					TREF(local_collseq) = new_lcl_collseq;
 				} else
@@ -556,12 +514,15 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			}
 			if (-1 != ncol)
 				TREF(local_collseq_stdnull) = (ncol ? TRUE: FALSE);
+			if (-1 != nct)
+				TREF(local_coll_nums_as_strings) = (nct ? TRUE: FALSE);
 			break;
 		case VTK_PATLOAD:
 			if (!load_pattern_table(parmblk.value->str.len, parmblk.value->str.addr))
 			{
 				va_end(var);
-				rts_error(VARLSTCNT(4) ERR_PATLOAD, 2, parmblk.value->str.len, parmblk.value->str.addr);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_PATLOAD, 2, parmblk.value->str.len,
+						parmblk.value->str.addr);
 			}
 			break;
 		case VTK_NOUNDEF:
@@ -578,7 +539,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			if (zdefactive)
 			{
 				va_end(var);
-				rts_error(VARLSTCNT(1) ERR_ZDEFACTIVE);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_ZDEFACTIVE);
 			}
 			zdefactive = TRUE;
 			tmpzdefbufsiz = MV_FORCE_INT(parmblk.value);
@@ -600,7 +561,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 				if (2 > numarg)
 				{
 					va_end(var);
-					rts_error(VARLSTCNT(1) ERR_TRACEON);
+					rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_TRACEON);
 				}
 				arg = va_arg(var, mval *);
 				MV_FORCE_STR(arg);
@@ -624,7 +585,7 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 					if (!IS_VALID_ZDIR_FORM(testvalue))
 					{
 						va_end(var);
-						rts_error(VARLSTCNT(3) ERR_INVZDIRFORM, 1, testvalue);
+						rts_error_csa(CSA_ARG(NULL) VARLSTCNT(3) ERR_INVZDIRFORM, 1, testvalue);
 					}
 				} else
 					testvalue = ZDIR_FORM_FULLPATH;
@@ -665,6 +626,26 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			DEFER_BASE_REL_HASHTAB(table, FALSE);
 			break;
 		case VTK_STORDUMP:
+#			if defined(DEBUG) && defined(UNIX)
+			if (gtm_white_box_test_case_enabled
+			    && (WBTEST_HOLD_CRIT_TILL_LCKALERT == gtm_white_box_test_case_number))
+			{	/* Hold crit for a long enough interval to generate lock alert which then does a continue_proc */
+				grab_crit(gv_cur_region);
+				icnt = TREF(continue_proc_cnt);
+				DBGGSSHR((LOGFLAGS, "op_view: Pid %d, initial icnt: %d\n", process_id, icnt));
+				for (lcnt = 0; (MUTEXLCKALERT_INTERVAL * 12) > lcnt; lcnt++)
+				{	/* Poll for icnt to be increased - check every quarter second */
+					SHORT_SLEEP(250);	/* Quarter second nap */
+					if (TREF(continue_proc_cnt) > icnt)
+						break;
+					DBGGSSHR((LOGFLAGS, "op_view: loop: %d - continue_proc_cnt: %d\n", lcnt,
+						  TREF(continue_proc_cnt)));
+				}
+				DBGGSSHR((LOGFLAGS, "op_view: pid %d, lcnt: %d, icnt: %d, continue_proc_cnt: %d\n",
+					  process_id, lcnt, icnt, TREF(continue_proc_cnt)));
+				rel_crit(gv_cur_region);
+			} else		/* If we do the white box test, avoid the rest */
+#			endif
 			if (gtmDebugLevel)
 			{	/* gtmdbglvl must be non-zero to have hope of printing a storage dump */
 				dbgdmpenabled = (GDL_SmDump & gtmDebugLevel);
@@ -673,6 +654,37 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 				if (!dbgdmpenabled)
 					gtmDebugLevel &= (~GDL_SmDump);	/* Shut indicator back off */
 			}
+			break;
+		case VTK_LOGTPRESTART:
+			/* The TPRESTART logging frequency can be specified through environment variable or
+			 * through VIEW command. The default value for logging frequency is 1 if value is
+			 * not specified in the view command and env variable is not defined. There are 4
+			 * possible combinations which will determine the final value of logging frequency
+			 * depending upon whether value is specified in the VIEW command or env variables
+			 * is defined. These combinations are summarized in the following table.
+			 *
+			 *	value in	environment	Final
+			 *	VIEW command 	variable	value
+			 *	X		X		1
+			 *	X		A		A
+			 *	B		X		B
+			 *	B		C		B
+			 */
+			if (!numarg)
+			{
+				if (!TREF(tprestart_syslog_delta))
+					TREF(tprestart_syslog_delta) = 1;
+			}
+			else
+			{
+				TREF(tprestart_syslog_delta) = MV_FORCE_INT(parmblk.value);
+				if (0 > TREF(tprestart_syslog_delta))
+					TREF(tprestart_syslog_delta) = 0;
+			}
+			TREF(tp_restart_count) = 0;
+			break;
+		case VTK_NOLOGTPRESTART:
+			TREF(tprestart_syslog_delta) = 0;
 			break;
 #		ifdef DEBUG_ALIAS
 		case VTK_LVMONOUT:
@@ -699,10 +711,138 @@ void	op_view(UNIX_ONLY_COMMA(int numarg) mval *keyword, ...)
 			lvmon_enabled = FALSE;
 			break;
 #		endif
+#		ifdef DEBUG
+		case VTK_LVDMP:		/* Write partial lv_val into to output device */
+			outval.mvtype = MV_STR;
+			lv = (lv_val *)parmblk.value;
+			util_out_print("", RESET);	/* Reset the buffer */
+			util_out_print("LV: !AD  addr: 0x!XJ  mvtype: 0x!4XW  sign: !UB  exp: !UL  m[0]: !UL [0x!XL]  "
+				       "m[1]: !UL [0x!XL]  str.len: !UL  str.addr: 0x!XJ", SPRINT, arg->str.len, arg->str.addr,
+				       lv, lv->v.mvtype, lv->v.sgn, lv->v.e, lv->v.m[0], lv->v.m[0], lv->v.m[1], lv->v.m[1],
+				       lv->v.str.len, lv->v.str.addr);
+			outval.str.addr = TREF(util_outptr);
+			outval.str.len = STRLEN(TREF(util_outptr));
+			op_write(&outval);
+			op_wteol(1);
+			break;
+#		endif
 		default:
 			va_end(var);
-			rts_error(VARLSTCNT(1) ERR_VIEWCMD);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_VIEWCMD);
 	}
 	va_end(var);
+	return;
+}
+
+void view_dbflushop(unsigned char keycode, viewparm *parmblkptr, mval *thirdarg)
+{
+	uint4			jnl_status, dummy_errno;
+	int4			nbuffs;
+	int			save_errno;
+	int			status, lcnt, icnt;
+	gd_region		*reg, *r_top, *save_reg;
+	sgmnt_addrs		*csa;
+	sgmnt_data_ptr_t	csd;
+	jnl_buffer_ptr_t	jb;
+	boolean_t		was_crit;
+	UNIX_ONLY(unix_db_info	*udi;)
+
+	if (NULL == gd_header)		/* open gbldir */
+		gvinit();
+	save_reg = gv_cur_region;
+	if (NULL == parmblkptr->gv_ptr)
+	{	/* operate on all regions */
+		reg = gd_header->regions;
+		r_top = reg + gd_header->n_regions - 1;
+	} else	/* operate on selected region */
+		r_top = reg = parmblkptr->gv_ptr;
+	for (; reg <= r_top; reg++)
+	{
+		if (!reg->open)
+			gv_init_reg(reg);
+		gv_cur_region = reg;
+		switch(keycode)
+		{
+			case VTK_DBSYNC:
+#				ifdef UNIX
+				if (!reg->read_only)
+				{
+					change_reg();
+					csa = cs_addrs;
+					udi = FILE_INFO(reg);
+					DB_FSYNC(reg, udi, csa, db_fsync_in_prog, save_errno);
+					if (0 != save_errno)
+					{
+						send_msg_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_DBFSYNCERR, 2, DB_LEN_STR(reg),
+								save_errno);
+						save_errno = 0;
+					}
+				}
+#				endif
+				break;
+			case VTK_FLUSH:
+			case VTK_EPOCH:
+				if (!reg->read_only)
+				{
+					change_reg(); /* for jnl_ensure_open */
+					ENSURE_JNL_OPEN(cs_addrs, gv_cur_region);
+					/* We should NOT invoke wcs_recover here because it's possible we are in the final retry
+					 * of a TP transaction. In this case, we likely have pointers to non-dirty global buffers
+					 * in our transaction histories. Doing cache recovery could dry clean most of these buffers.
+					 * And that might cause us to get confused, attempt to restart, and incorrectly issue a
+					 * TPFAIL error because we are already in the final retry. By passing the WCSFLU_IN_COMMIT
+					 * bit, we instruct wcs_flu to avoid wcs_recover.
+					 */
+					wcs_flu(WCSFLU_FLUSH_HDR | WCSFLU_WRITE_EPOCH | WCSFLU_SYNC_EPOCH | WCSFLU_IN_COMMIT);
+				}
+				break;
+			case VTK_JNLFLUSH:
+				change_reg();
+				csa = cs_addrs;
+				csd = csa->hdr;
+				if (JNL_ENABLED(csd))
+				{
+					was_crit = csa->now_crit;
+					if (!was_crit)
+						grab_crit(reg);
+					if (JNL_ENABLED(csd))
+					{
+						jnl_status = jnl_ensure_open();
+						if (0 == jnl_status)
+						{
+							jb = csa->jnl->jnl_buff;
+							if (SS_NORMAL == (jnl_status = jnl_flush(reg)))
+							{
+								assert(jb->dskaddr == jb->freeaddr);
+								UNIX_ONLY(jnl_fsync(reg, jb->dskaddr));
+								UNIX_ONLY(assert(jb->freeaddr == jb->fsync_dskaddr));
+							} else
+							{
+								send_msg_csa(CSA_ARG(csa) VARLSTCNT(9) ERR_JNLFLUSH, 2,
+									JNL_LEN_STR(csd), ERR_TEXT, 2,
+									RTS_ERROR_TEXT("Error with journal flush during op_view"),
+									jnl_status);
+								assert(FALSE);
+							}
+						} else
+							send_msg_csa(CSA_ARG(csa) VARLSTCNT(6) jnl_status, 4, JNL_LEN_STR(csd),
+									DB_LEN_STR(reg));
+					}
+					if (!was_crit)
+						rel_crit(reg);
+				}
+				break;
+			case VTK_DBFLUSH:
+				if (!reg->read_only)
+				{
+					change_reg(); /* for jnl_ensure_open */
+					nbuffs = (NULL != thirdarg) ? MV_FORCE_INT(thirdarg) : cs_addrs->nl->wcs_active_lvl;
+					JNL_ENSURE_OPEN_WCS_WTSTART(cs_addrs, reg, nbuffs, dummy_errno);
+				}
+				break;
+		}
+	}
+	gv_cur_region = save_reg;
+	change_reg();
 	return;
 }

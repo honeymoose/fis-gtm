@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -41,14 +41,14 @@
 #include "rc_oflow.h"
 #include "repl_msg.h"
 #include "gtmsource.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "stack_frame.h"
+#include "mv_stent.h"
 #ifdef GTM_TRIGGER
 # include "gv_trigger.h"
 # include "gtm_trigger.h"
 # include "gv_trigger_protos.h"
 # include "subscript.h"
-# include "mv_stent.h"
 # include "stringpool.h"
 #endif
 #include "tp_frame.h"
@@ -70,12 +70,19 @@
 #include "tp_set_sgm.h"		/* for tp_set_sgm prototype */
 #include "op_tcommit.h"		/* for op_tcommit prototype */
 #include "have_crit.h"
+#include "error.h"
+#include "gtmimagename.h" /* for spanning nodes */
+#ifdef UNIX
+#include "preemptive_db_clnup.h"
+#endif
 
 #ifdef GTM_TRIGGER
 LITREF	mval	literal_null;
 LITREF	mval	literal_one;
 LITREF	mval	literal_zero;
 #endif
+LITREF	mval	literal_batch;
+LITREF	mstr	nsb_dummy;
 
 /* Globals that will not change in value across nested trigger calls of gvcst_put OR even if they might change in value,
  * the change is such that they dont need save/restore logic surrounding the "gtm_trigger" call. Any new GBLREFs that are
@@ -105,6 +112,7 @@ GBLREF	unsigned int		t_tries;
 GBLREF	cw_set_element		cw_set[CDB_CW_SET_SIZE];/* create write set. */
 GBLREF	boolean_t		skip_dbtriggers;	/* see gbldefs.c for description of this global */
 GBLREF	stack_frame		*frame_pointer;
+GBLREF	mv_stent		*mv_chain;
 #ifdef GTM_TRIGGER
 GBLREF	int			tprestart_state;
 GBLREF	int4			gtm_trigger_depth;
@@ -114,6 +122,7 @@ GBLREF	boolean_t		ztwormhole_used;	/* TRUE if $ztwormhole was used by trigger co
 #endif
 #ifdef DEBUG
 GBLREF	boolean_t		skip_block_chain_tail_check;
+GBLREF	boolean_t		donot_INVOKE_MUMTSTART;
 #endif
 
 /* Globals that could change in value across nested trigger calls of gvcst_put AND need to be saved/restored */
@@ -126,52 +135,56 @@ GBLREF	mval			increment_delta_mval;
 GBLREF	sgm_info		*sgm_info_ptr;
 GBLREF	sgmnt_addrs		*cs_addrs;
 GBLREF	sgmnt_data_ptr_t	cs_data;
+UNIX_ONLY(GBLREF	enum gtmImageTypes	image_type;)
+UNIX_ONLY(GBLREF	boolean_t 		span_nodes_disallowed;)
 
-GTMTRIG_ONLY(error_def(ERR_DBROLLEDBACK);)
+error_def(ERR_DBROLLEDBACK);
 error_def(ERR_GVINCRISOLATION);
 error_def(ERR_GVIS);
 error_def(ERR_GVPUTFAIL);
 error_def(ERR_REC2BIG);
 error_def(ERR_RSVDBYTE2HIGH);
+error_def(ERR_TEXT);
 error_def(ERR_TPRETRY);
+error_def(ERR_UNIMPLOP);
 
 /* Before issuing an error, add GVT to the list of known gvts in this TP transaction in case it is not already done.
  * This GVT addition is usually done by "tp_hist" but that function has most likely not yet been invoked in gvcst_put.
  * Doing this addition will ensure we remember to reset any non-zero clue in dir_tree as part of tp_clean_up when a TROLLBACK
- * or TRESTART (implicit or explicit) occurs. Not doing so could cause transfer of control from the current gvcst_put action
- * to a user-defined error trap which if it does further database references, it could end up using invalid clues from GVT
- * and potentially incorrectly commit the transaction causing db integ errors as well.
+ * or TRESTART (implicit or explicit) occurs. Not doing so could means if an ERR_REC2BIG happens here, control will
+ * go to the error trap and if it does a TROLLBACK (which does a tp_clean_up) we would be left with a potentially out-of-date
+ * clue of GVT which if used for later global references could result in db integ errors.
  */
-#define	ENSURE_VALUE_WITHIN_MAX_REC_SIZE(value, GVT)								\
-{														\
-	if (dollar_tlevel)											\
-		ADD_TO_GVT_TP_LIST(GVT);	/* note: macro also updates read_local_tn if necessary */	\
-	if (gv_currkey->end + 1 + value.len + SIZEOF(rec_hdr) > gv_cur_region->max_rec_size)			\
-	{                                                                                                       \
-		if (0 == (end = format_targ_key(buff, MAX_ZWR_KEY_SZ, gv_currkey, TRUE)))			\
-			end = &buff[MAX_ZWR_KEY_SZ - 1];                                                        \
-		rts_error(VARLSTCNT(10) ERR_REC2BIG, 4, gv_currkey->end + 1  + value.len + SIZEOF(rec_hdr),	\
-			  (int4)gv_cur_region->max_rec_size,                                                    \
-			  REG_LEN_STR(gv_cur_region), ERR_GVIS, 2, end - buff, buff);				\
-	}                                                                                                       \
+#define	ENSURE_VALUE_WITHIN_MAX_REC_SIZE(value, GVT)										\
+{																\
+	if (dollar_tlevel)													\
+		ADD_TO_GVT_TP_LIST(GVT, RESET_FIRST_TP_SRCH_STATUS_FALSE); /* note: macro updates read_local_tn if necessary */	\
+	if (VMS_ONLY(gv_currkey->end + 1 + SIZEOF(rec_hdr) +) value.len > gv_cur_region->max_rec_size)				\
+	{															\
+		if (0 == (end = format_targ_key(buff, MAX_ZWR_KEY_SZ, gv_currkey, TRUE)))					\
+			end = &buff[MAX_ZWR_KEY_SZ - 1];									\
+		rts_error_csa(CSA_ARG(cs_addrs) VARLSTCNT(10) ERR_REC2BIG, 4, VMS_ONLY(gv_currkey->end + 1 + SIZEOF(rec_hdr) +)	\
+			  value.len, (int4)gv_cur_region->max_rec_size,								\
+			  REG_LEN_STR(gv_cur_region), ERR_GVIS, 2, end - buff, buff);						\
+	}															\
 }
 
 /* See comment before ENSURE_VALUE_WITHIN_MAX_REC_SIZE macro definition for why the ADD_TO_GVT_TP_LIST call below is necessary */
-#define	ISSUE_RSVDBYTE2HIGH_ERROR(GVT)										\
-{														\
-	if (dollar_tlevel)											\
-		ADD_TO_GVT_TP_LIST(GVT);	/* note: macro also updates read_local_tn if necessary */	\
-	/* The record that is newly inserted/updated does not fit by itself in a separate block			\
-	 * if the current reserved-bytes for this database is taken into account. Cannot go on.			\
-	 */													\
-	if (0 == (end = format_targ_key(buff, MAX_ZWR_KEY_SZ, gv_currkey, TRUE)))				\
-		end = &buff[MAX_ZWR_KEY_SZ - 1];								\
-	rts_error(VARLSTCNT(11) ERR_RSVDBYTE2HIGH, 5, new_blk_size_single,					\
-		REG_LEN_STR(gv_cur_region), blk_size, blk_reserved_bytes,					\
-		ERR_GVIS, 2, end - buff, buff);									\
+#define	ISSUE_RSVDBYTE2HIGH_ERROR(GVT)												\
+{																\
+	if (dollar_tlevel)													\
+		ADD_TO_GVT_TP_LIST(GVT, RESET_FIRST_TP_SRCH_STATUS_FALSE); /* note: macro updates read_local_tn if necessary */	\
+	/* The record that is newly inserted/updated does not fit by itself in a separate block					\
+	 * if the current reserved-bytes for this database is taken into account. Cannot go on.					\
+	 */															\
+	if (0 == (end = format_targ_key(buff, MAX_ZWR_KEY_SZ, gv_currkey, TRUE)))						\
+		end = &buff[MAX_ZWR_KEY_SZ - 1];										\
+	rts_error_csa(CSA_ARG(cs_addrs) VARLSTCNT(11) ERR_RSVDBYTE2HIGH, 5, new_blk_size_single,				\
+		REG_LEN_STR(gv_cur_region), blk_size, blk_reserved_bytes,							\
+		ERR_GVIS, 2, end - buff, buff);											\
 }
 
-#define	RESTORE_ZERO_GVT_ROOT_ON_RETRY(LCL_ROOT, GV_TARGET, TP_ROOT, DIR_HIST, DIR_TREE)			\
+#define	RESTORE_ZERO_GVT_ROOT_ON_RETRY(LCL_ROOT, GV_TARGET, DIR_HIST, DIR_TREE)					\
 {														\
 	if (!LCL_ROOT)												\
 	{													\
@@ -182,18 +195,30 @@ error_def(ERR_TPRETRY);
 		 * was validated (in t_end/tp_hist),so we need to reset its clue before the next try.		\
 		 */												\
 		DIR_TREE->clue.end = 0;										\
-		/* Check if LCL_ROOT & GV_TARGET->root are in sync. If not make them so. */			\
-		if (GV_TARGET->root)										\
-		{	/* We had reset the root block from zero to a non-zero value within			\
-			 * this function, but since we are restarting, we can no longer be			\
-			 * sure of the validity of the root block. Reset it to 0 so it will			\
-			 * be re-determined in the next global reference.					\
-			 */											\
-			assert((TP_ROOT == GV_TARGET->root)							\
-				|| ((0 == TP_ROOT) GTMTRIG_ONLY(&& (0 < gvtr_parms.num_triggers_invoked))));	\
-			GV_TARGET->root = 0;									\
-		}												\
+		/* We had reset the root block from zero to a non-zero value within				\
+		 * this function, but since we are restarting, we can no longer be				\
+		 * sure of the validity of the root block. Reset it to 0 so it will				\
+		 * be re-determined in the next global reference.						\
+		 */												\
+		GV_TARGET->root = 0;										\
 	}													\
+}
+
+#define RECORD_FITS_IN_A_BLOCK(VAL, KEY, BLK_SZ, RESERVED_BYTES)						\
+	((VAL)->str.len <= COMPUTE_CHUNK_SIZE(KEY, BLK_SZ, RESERVED_BYTES))
+
+#define ZKILL_NODELETS												\
+{														\
+	APPEND_HIDDEN_SUB(gv_currkey);										\
+	if (gv_target->root)											\
+		gvcst_kill2(FALSE, NULL, TRUE); /* zkill any existing spanning nodelets.. */			\
+	RESTORE_CURRKEY(gv_currkey, oldend);									\
+}
+
+#define POP_MVALS_FROM_M_STACK_IF_REALLY_NEEDED(lcl_span_status, ztold_mval, save_msp, save_mv_chain)		\
+{														\
+	if (!lcl_span_status)											\
+		POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp, save_mv_chain);				\
 }
 
 #ifdef DEBUG
@@ -222,14 +247,178 @@ error_def(ERR_TPRETRY);
 	goto retry;									\
 }
 
+CONDITION_HANDLER(gvcst_put_ch)
+{
+	int rc;
+
+	START_CH;
+	if ((int)ERR_TPRETRY == SIGNAL)
+	{	/* delay tp_restart till after the long jump and some other stuff */
+		UNWIND(NULL, NULL);
+	}
+	NEXTCH;
+}
+
 void	gvcst_put(mval *val)
+{
+	boolean_t			sn_tpwrapped, fits;
+	boolean_t			est_first_pass;
+	mval				val_ctrl, val_piece, val_dummy;
+	mval				*pre_incr_mval, *save_val;
+	block_id			lcl_root;
+	int				gblsize, chunk_size, i, oldend;
+	unsigned short			numsubs;
+	unsigned char			mychars[MAX_NSBCTRL_SZ];
+	int				save_dollar_tlevel, rc;
+	boolean_t			save_in_gvcst_incr; /* gvcst_put2 sets this FALSE, so save it in case we need to back out */
+	span_parms			parms;
+	DCL_THREADGBL_ACCESS;
+
+	SETUP_THREADGBL_ACCESS;
+	parms.span_status = FALSE;
+	parms.blk_reserved_bytes = cs_data->reserved_bytes; /* Only want to read once for consistency */
+	parms.enable_trigger_read_and_fire = TRUE;
+	parms.enable_jnl_format = TRUE;
+	lcl_root = gv_target->root;
+	VMS_ONLY(gvcst_put2(val, &parms));
+#	ifdef UNIX /* deal with possibility of spanning nodes */
+	DEBUG_ONLY(save_dollar_tlevel = dollar_tlevel);
+	fits = RECORD_FITS_IN_A_BLOCK(val, gv_currkey, cs_data->blk_size, parms.blk_reserved_bytes);
+	save_in_gvcst_incr = in_gvcst_incr;
+	if (fits)
+	{
+		gvcst_put2(val, &parms);
+		if (!parms.span_status)
+		{
+			assert(save_dollar_tlevel == dollar_tlevel);
+			return; /* We've successfully set a normal non-spanning global. */
+		}
+	}
+	RTS_ERROR_IF_SN_DISALLOWED;
+	/* Either we need to create a spanning node, or kill one before resetting it */
+	GTMTRIG_ONLY(parms.ztold_mval = NULL);
+	cs_data->span_node_absent = FALSE;
+	oldend = gv_currkey->end;
+	val_dummy.str = nsb_dummy;
+	if (!dollar_tlevel)
+	{
+		sn_tpwrapped = TRUE;
+		save_val = val;
+		/* We pass the IMPLICIT_TRIGGER_TSTART flag because we might invoke a trigger, and in that case we want to avoid
+		 * invoking a restart from within gtm_trigger. Since we remove gvcst_put_ch before invoking the trigger
+		 * (see comment in errorsp.h), an attempt to invoke a restart returns us back to the mdb_condition_handler created
+		 * by the initial dm-start. Unwinding from there returns to the OS -- i.e., the process silently dies.
+		 * Also note that we need to ensure the retry logic at the bottom of gvcst_put2 is executed in case a restart
+		 * happens within a trigger invocation. We want to return from gvtr_match_n_invoke so we can goto retry.
+		 */
+		op_tstart((IMPLICIT_TSTART + IMPLICIT_TRIGGER_TSTART), TRUE, &literal_batch, 0);
+		frame_pointer->flags |= SFF_IMPLTSTART_CALLD;
+		assert(!donot_INVOKE_MUMTSTART);
+		DEBUG_ONLY(donot_INVOKE_MUMTSTART = TRUE);
+		ESTABLISH_NORET(gvcst_put_ch, est_first_pass);
+		if (est_first_pass)
+		{	/* did a long jump back to here */
+			val = save_val;
+			GTMTRIG_ONLY(POP_MVALS_FROM_M_STACK_IF_NEEDED(parms.ztold_mval,
+					parms.save_msp, ((mv_stent *)parms.save_mv_chain)));
+			preemptive_db_clnup(ERROR); /* Bluff about SEVERITY to reset gv_target and reset_gv_target tp_restart resets
+						     * but not reset_gv_target This matches flow with non-spanning-node tp_restart,
+						     * which does preemptive_db_clnup in mdb_condition_handler
+						     */
+			rc = tp_restart(1, !TP_RESTART_HANDLES_ERRORS);
+			DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC(CHECK_CSA_TRUE);
+			RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, &cs_addrs->dir_tree->hist, cs_addrs->dir_tree);
+			fits = RECORD_FITS_IN_A_BLOCK(val, gv_currkey, cs_data->blk_size, parms.blk_reserved_bytes);
+			if (cdb_sc_onln_rlbk2 == LAST_RESTART_CODE)
+				/* Database was taken back to a different logical state. We are an implicit TP transaction, and
+				 * as in the case of implicit TP for triggers, we issue a DBROLLEDBACK error that the application
+				 * programmer can catch.
+				 */
+				rts_error_csa(CSA_ARG(cs_addrs) VARLSTCNT(1) ERR_DBROLLEDBACK);
+		}
+		tp_set_sgm();
+		GVCST_ROOT_SEARCH;
+	} else
+		sn_tpwrapped = FALSE;
+	parms.span_status = TRUE;
+	parms.enable_trigger_read_and_fire = TRUE;
+	parms.enable_jnl_format = TRUE;
+	parms.ztval_gvcst_put_redo = FALSE;
+	if (save_in_gvcst_incr)
+	{
+		in_gvcst_incr = FALSE;		/* allow gvcst_put2 to do a regular set */
+		PUSH_MV_STENT(MVST_MVAL);       /* protect pre_incr_mval from stp_gcol */
+		pre_incr_mval = &mv_chain->mv_st_cont.mvs_mval;
+		gvcst_get(pre_incr_mval);	/* what if it doesn't exist? needs to be treated as 0 */
+		pre_incr_mval->mvtype = MV_STR;
+		op_add(pre_incr_mval, &increment_delta_mval, post_incr_mval);
+		POP_MV_STENT();			/* pre_incr_mval */
+		assert(MV_IS_NUMERIC(post_incr_mval));
+		MV_FORCE_STR(post_incr_mval);
+		val = post_incr_mval;		/* its a number, should fit in single block.. unless ridick rsrvdbytes.. */
+		fits = RECORD_FITS_IN_A_BLOCK(val, gv_currkey, cs_data->blk_size, parms.blk_reserved_bytes);
+	}
+	/* Set the primary node. If we're setting a spanning node, that the primary node will have a dummy value, $char(0).
+	 * Journal formatting and triggers happen here. If ztval changed during trigger invocations to a large value,
+	 * we do a second gvcst_put2 to set the new value.
+	 */
+	parms.val_forjnl = val;
+	gvcst_put2(((fits) ? val : &val_dummy), &parms);
+	parms.enable_trigger_read_and_fire = FALSE;
+#	ifdef GTM_TRIGGER
+	if (parms.ztval_gvcst_put_redo)
+	{
+		val = parms.ztval_mval;
+		parms.enable_jnl_format = TRUE;	/* new val needs to be journaled */
+		parms.val_forjnl = val;
+		fits = RECORD_FITS_IN_A_BLOCK(val, gv_currkey, cs_data->blk_size, parms.blk_reserved_bytes);
+		assert(!fits);
+		gvcst_put2(&val_dummy, &parms);
+	}
+#	endif
+	ZKILL_NODELETS; /* Even if not creating a spanning node, may be replacing one */
+	if (!fits)
+	{	/* Need to create a spanning node. Break value up into chunks. */
+		parms.enable_jnl_format = FALSE; /* jnl formatting already done */
+		APPEND_HIDDEN_SUB(gv_currkey);
+		chunk_size = COMPUTE_CHUNK_SIZE(gv_currkey, cs_data->blk_size, parms.blk_reserved_bytes);
+		gblsize = val->str.len;
+		numsubs = DIVIDE_ROUND_UP(gblsize, chunk_size);
+		PUT_NSBCTRL(mychars, numsubs, gblsize);
+		val_ctrl.str.addr = (char *)mychars;
+		val_ctrl.str.len = 6;
+		/* Count the spanning node set as one set */
+		INCR_GVSTATS_COUNTER(cs_addrs, cs_addrs->nl, n_set, 1);
+		gvcst_put2(&val_ctrl, &parms);	/* Set control subscript, indicating glbsize and number of chunks */
+		for (i = 0; i < numsubs; i++)
+		{
+			NEXT_HIDDEN_SUB(gv_currkey, i);
+			val_piece.str.len = MIN(chunk_size, gblsize - i * chunk_size);
+			val_piece.str.addr = val->str.addr + i * chunk_size;
+			gvcst_put2(&val_piece, &parms);
+		}
+		RESTORE_CURRKEY(gv_currkey, oldend);
+	}
+	GTMTRIG_ONLY(POP_MVALS_FROM_M_STACK_IF_NEEDED(parms.ztold_mval, parms.save_msp, ((mv_stent *)parms.save_mv_chain)));
+		/* pop any stacked mvals before op_tcommit as it does its own popping */
+	if (sn_tpwrapped)
+	{
+		op_tcommit();
+		DEBUG_ONLY(donot_INVOKE_MUMTSTART = FALSE);
+		REVERT; /* remove our condition handler */
+	}
+	assert(save_dollar_tlevel == dollar_tlevel);
+#	endif /* ifdef UNIX */
+}
+
+void	gvcst_put2(mval *val, span_parms *parms)
 {
 	sgmnt_addrs		*csa;
 	sgmnt_data_ptr_t	csd;
 	node_local_ptr_t	cnl;
 	int4			blk_size, blk_fill_size, blk_reserved_bytes;
 	const int4		zeroes = 0;
-	boolean_t		jnl_format_done;
+	boolean_t		jnl_format_done, is_dummy, needfmtjnl, fits, lcl_span_status;
 	blk_segment		*bs1, *bs_ptr, *new_blk_bs;
 	block_id		allocation_clue, tp_root, gvt_for_root, blk_num, last_split_blk_num[MAX_BT_DEPTH];
 	block_index		left_hand_index, ins_chain_index, root_blk_cw_index, next_blk_index;
@@ -238,14 +427,15 @@ void	gvcst_put(mval *val)
 	gv_namehead		*save_targ, *split_targ, *dir_tree;
 	enum cdb_sc		status;
 	gv_key			*temp_key;
+	int			tmp_cmpc;
 	mstr			value;
 	off_chain		chain1, curr_chain, prev_chain, chain2;
-	rec_hdr_ptr_t		curr_rec_hdr, extra_rec_hdr, next_rec_hdr, new_star_hdr, rp;
+	rec_hdr_ptr_t		curr_rec_hdr, extra_rec_hdr, next_rec_hdr, new_star_hdr, rp, tmp_rp;
 	srch_blk_status		*bh, *bq, *tp_srch_status;
 	srch_hist		*dir_hist;
 	int			cur_blk_size, blk_seg_cnt, delta, i, j, left_hand_offset, n, ins_chain_offset,
 				new_blk_size_l, new_blk_size_r, new_blk_size_single, new_blk_size, blk_reserved_size,
-				last_possible_left_offset, new_rec_size, next_rec_shrink, next_rec_shrink1,
+				last_possible_left_offset, new_rec_size, next_rec_shrink, next_rec_shrink1, start_len,
 				offset_sum, rec_cmpc, target_key_size, tp_lev, undo_index, cur_val_offset, curr_offset, bh_level;
 	uint4			segment_update_array_size, key_top, cp2_len, bs1_2_len, bs1_3_len;
 	char			*va, last_split_direction[MAX_BT_DEPTH];
@@ -258,6 +448,7 @@ void	gvcst_put(mval *val)
 	jnl_format_buffer	*jfb, *ztworm_jfb;
 	jnl_action		*ja;
 	mval			*set_val;	/* actual right-hand-side value of the SET or $INCR command */
+	mval			*val_forjnl;
 	ht_ent_int4		*tabent;
 	unsigned char		buff[MAX_ZWR_KEY_SZ], *end, old_ch, new_ch;
 	sm_uc_ptr_t		buffaddr;
@@ -270,6 +461,7 @@ void	gvcst_put(mval *val)
 	int			rc;
 	int4			cse_first_off;
 	enum split_dir		last_split_dir;
+	int4			data_len;
 #	ifdef GTM_TRIGGER
 	boolean_t		is_tpwrap;
 	boolean_t		ztval_gvcst_put_redo, skip_hasht_read;
@@ -277,11 +469,11 @@ void	gvcst_put(mval *val)
 	gvt_trigger_t		*gvt_trigger;
 	gvtr_invoke_parms_t	gvtr_parms;
 	int			gtm_trig_status;
-	int4			data_len;
 	unsigned char		*save_msp;
 	mv_stent		*save_mv_chain;
 	mval			*ztold_mval = NULL;
 	mval			*ztval_mval;
+	mint			dlr_data;
 	boolean_t		lcl_implicit_tstart;		/* local copy of the global variable "implicit_tstart" */
 	mval			lcl_increment_delta_mval;	/* local copy of "increment_delta_mval" */
 	boolean_t		lcl_is_dollar_incr;		/* local copy of is_dollar_incr taken at start of module.
@@ -290,6 +482,8 @@ void	gvcst_put(mval *val)
 								 * used to restore "post_incr_mval" in case of TP restarts */
 	mval			*lcl_val;			/* local copy of "val" at function entry.
 								 * used to restore "val" in case of TP restarts */
+	mval			*lcl_val_forjnl;
+	mval			*pval;				/* copy of "value" (an mstr), protected from stp gcol */
 	DEBUG_ONLY(enum cdb_sc	save_cdb_status;)
 #	endif
 #	ifdef DEBUG
@@ -349,15 +543,31 @@ void	gvcst_put(mval *val)
 #	endif
 	JNLPOOL_INIT_IF_NEEDED(csa, csd, cnl);
 	blk_size = csd->blk_size;
-	blk_reserved_bytes = csd->reserved_bytes;
+	blk_reserved_bytes = parms->blk_reserved_bytes;
 	blk_fill_size = (blk_size * gv_fillfactor) / 100 - blk_reserved_bytes;
-	jnl_format_done = FALSE; /* do "jnl_format" only once per logical non-tp transaction irrespective of number of retries */
+	lcl_span_status = parms->span_status;
+	if (lcl_span_status)
+	{
+		needfmtjnl = parms->enable_jnl_format;
+		val_forjnl = parms->val_forjnl;
+#		ifdef GTM_TRIGGER
+		ztold_mval = parms->ztold_mval;
+		skip_hasht_read = !parms->enable_trigger_read_and_fire;
+#		endif
+	} else
+	{
+		needfmtjnl = TRUE;
+		val_forjnl = val;
+	}
+	jnl_format_done = !needfmtjnl; 	/* do "jnl_format" only once per logical non-tp transaction irrespective of
+					 * number of retries or number of chunks if spanning node
+					 */
 	GTMTRIG_ONLY(
 		ztval_gvcst_put_redo = FALSE;
 		skip_hasht_read = FALSE;
 	)
 	assert(('\0' != gv_currkey->base[0]) && gv_currkey->end);
-	DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC;
+	DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC(CHECK_CSA_TRUE);
 	/* this needs to be initialized before any code that does a "goto retry" since this gets used there */
 	save_targ = gv_target;
 	gbl_target_was_set = (INVALID_GV_TARGET != reset_gv_target);
@@ -380,7 +590,7 @@ void	gvcst_put(mval *val)
 fresh_tn_start:
 	DEBUG_ONLY(lcl_t_tries = -1;)
 	DEBUG_ONLY(is_fresh_tn_start = TRUE;)
-	assert(!jnl_format_done || (dollar_tlevel GTMTRIG_ONLY(&& ztval_gvcst_put_redo)));
+	assert(!jnl_format_done || (dollar_tlevel GTMTRIG_ONLY(&& ztval_gvcst_put_redo)) || lcl_span_status);
 	T_BEGIN_SETORKILL_NONTP_OR_TP(ERR_GVPUTFAIL);
 tn_restart:
 	/* t_tries should never decrease - it either increases or stays the same. If should decrease we could live-lock with
@@ -405,16 +615,12 @@ tn_restart:
 		dbg_trace_array[dbg_num_iters].retry_line = 0;
 		split_targ = NULL;
 	)
-	/* If MM and file extension occurred, reset csd to cs_data to avoid out-of-date value. If BG we dont need the reset
-	 * but if checks are costlier than unconditional sets in a pipelined architecture so we choose not to do the if.
-	 */
-	assert(is_mm || (csd == cs_data));
-	csd = cs_data;
+	assert(csd == cs_data);	/* To ensure they are the same even if MM extensions happened in between */
 #	ifdef GTM_TRIGGER
 	gvtr_parms.num_triggers_invoked = 0;	/* clear any leftover value */
 	assert(!ztval_gvcst_put_redo || IS_PTR_INSIDE_M_STACK(val));
 	is_tpwrap = FALSE;
-	if (!skip_dbtriggers && !skip_hasht_read)
+	if (!skip_dbtriggers && !skip_hasht_read && parms->enable_trigger_read_and_fire)
 	{
 		GVTR_INIT_AND_TPWRAP_IF_NEEDED(csa, csd, gv_target, gvt_trigger, lcl_implicit_tstart, is_tpwrap, ERR_GVPUTFAIL);
 		assert(gvt_trigger == gv_target->gvt_trigger);
@@ -432,11 +638,21 @@ tn_restart:
 			assert(lcl_implicit_tstart);
 			lcl_is_dollar_incr = is_dollar_incr;
 			lcl_val = val;
+			lcl_val_forjnl = val_forjnl;
 			lcl_post_incr_mval = post_incr_mval;
 			lcl_increment_delta_mval = increment_delta_mval;
+			jnl_format_done = FALSE;
 		}
 		if (NULL != gvt_trigger)
+		{
 			PUSH_ZTOLDMVAL_ON_M_STACK(ztold_mval, save_msp, save_mv_chain);
+			if (lcl_span_status)
+			{	/* Need the ability to pop vals from gvcst_put. */
+				parms->ztold_mval = ztold_mval;
+				parms->save_msp = save_msp;
+				parms->save_mv_chain = (unsigned char *)save_mv_chain;
+			}
+		}
 	}
 #	endif
 	assert(csd == cs_data);	/* assert csd is in sync with cs_data even if there were MM db file extensions */
@@ -497,9 +713,10 @@ tn_restart:
 			GOTO_RETRY;
 		if (gv_altkey->end + 1 == dir_hist->h[0].curr_rec.match)
 		{
+			tmp_rp = (rec_hdr_ptr_t)(dir_hist->h[0].buffaddr + dir_hist->h[0].curr_rec.offset);
+			EVAL_CMPC2(tmp_rp, tmp_cmpc);
 			GET_LONG(tp_root, (dir_hist->h[0].buffaddr + SIZEOF(rec_hdr)
-					   + dir_hist->h[0].curr_rec.offset + gv_altkey->end + 1
-					   - ((rec_hdr_ptr_t)(dir_hist->h[0].buffaddr + dir_hist->h[0].curr_rec.offset))->cmpc));
+					   + dir_hist->h[0].curr_rec.offset + gv_altkey->end + 1 - tmp_cmpc));
 			if (dollar_tlevel)
 			{
 				gvt_for_root = dir_hist->h[0].blk_num;
@@ -552,7 +769,7 @@ tn_restart:
 		}
 		BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 		curr_rec_hdr->rsiz = SIZEOF(rec_hdr) + temp_key->end + 1 + value.len;
-		curr_rec_hdr->cmpc = 0;
+		SET_CMPC(curr_rec_hdr, 0);
 		BLK_INIT(bs_ptr, new_blk_bs);
 		BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 		BLK_ADDR(cp1, temp_key->end + 1, unsigned char);
@@ -574,7 +791,7 @@ tn_restart:
 		/* Create the index block */
 		BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 		curr_rec_hdr->rsiz = BSTAR_REC_SIZE;
-		curr_rec_hdr->cmpc = 0;
+		SET_CMPC(curr_rec_hdr, 0);
 		BLK_INIT(bs_ptr, bs1);
 		BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 		BLK_SEG(bs_ptr, (unsigned char *)&zeroes, SIZEOF(block_id));
@@ -599,11 +816,84 @@ tn_restart:
 		no_pointers = FALSE;
 	} else
 	{
+#		ifdef GTM_TRIGGER
+		if (lcl_span_status && (NULL != ztold_mval) && !skip_hasht_read && parms->enable_trigger_read_and_fire)
+		{	/* Dealing with spanning nodes, need to use a get routine to find ztold_val. Need to do this BEFORE
+			 * gvcst_search below or we'll disrupt gv_target->hist, which is used in the subsequent constructions.
+			 * Though we don't need dollar_data, we use gvcst_dataget since it returns status, allowing retry
+			 * cleanup to be done (RESET_GV_TARGET_LCL_AND_CLR_GBL in particular) before invoking a restart.
+			 */
+			assert(dollar_tlevel && !skip_dbtriggers);
+			dlr_data = DG_GETONLY; /* tell dataget we just want to do a get; we don't care about descendants */
+			status = gvcst_dataget(&dlr_data, ztold_mval);
+			if (cdb_sc_normal != status)
+				GOTO_RETRY;
+		}
+#		endif
+#if defined(DEBUG) && defined(UNIX)
+		if (gtm_white_box_test_case_enabled && (WBTEST_ANTIFREEZE_GVINCRPUTFAIL == gtm_white_box_test_case_number))
+		{
+			status = cdb_sc_blknumerr;
+			GOTO_RETRY;
+		}
+#endif
 		if (cdb_sc_normal != (status = gvcst_search(gv_currkey, NULL)))
 			GOTO_RETRY;
 		target_key_size = gv_currkey->end + 1;
 		bh = &gv_target->hist.h[0];
 		key_exists = (target_key_size == bh->curr_rec.match);
+#		ifdef UNIX
+		if (key_exists)
+		{	/* check for spanning node dummy value: a single zero byte */
+			rp = (rec_hdr_ptr_t)((sm_uc_ptr_t)bh->buffaddr + bh->curr_rec.offset);
+			GET_USHORT(rec_size, &rp->rsiz);
+			cur_val_offset = SIZEOF(rec_hdr) + target_key_size - EVAL_CMPC((rec_hdr_ptr_t)rp);
+			data_len = rec_size - cur_val_offset;
+			is_dummy = (1 == data_len) && ('\0' == *(sm_uc_ptr_t)((sm_uc_ptr_t)rp + cur_val_offset));
+			if (is_dummy && !lcl_span_status && (csa->dir_tree != gv_target)
+						&& !(span_nodes_disallowed && csd->span_node_absent))
+			{	/* Validate that value is really $zchar(0) and either restart or back out of gvcst_put2.
+				 * Three cases:
+				 * 1)	not in TP, no triggers
+				 * 2)	in TP (triggers invoked or not)
+				 * 3)	weren't in TP when we entered gvcst_put2, but did an op_tstart to check for triggers
+				 */
+				RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ, DO_GVT_GVKEY_CHECK);
+				if (!dollar_tlevel)
+				{
+					update_trans = 0;
+					succeeded = ((trans_num)0 != t_end(&gv_target->hist, dir_hist, TN_NOT_SPECIFIED));
+					if (!succeeded)
+					{	/* see other t_end */
+						RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, dir_hist, dir_tree);
+						jnl_format_done = !needfmtjnl;
+						GTMTRIG_DBG_ONLY(dbg_trace_array[dbg_num_iters].retry_line = __LINE__);
+						update_trans = UPDTRNS_DB_UPDATED_MASK;
+						goto tn_restart;
+					}
+				} else
+				{
+					status = tp_hist(dir_hist);
+					if (NULL != dir_hist)
+						ADD_TO_GVT_TP_LIST(dir_tree, RESET_FIRST_TP_SRCH_STATUS_FALSE);
+					if (cdb_sc_normal != status)
+						GOTO_RETRY;
+#					ifdef GTM_TRIGGER
+					if (lcl_implicit_tstart)
+					{	/* Started TP for playing triggers. Abort and try again outside after nsb op_tstart
+						 * Otherwise, we were already in TP when we came into gvcst_put. Triggers can stay,
+						 * but finish put outside.
+						 */
+						POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp, save_mv_chain);
+						OP_TROLLBACK(-1);
+					}
+#					endif
+				}
+				parms->span_status = TRUE;
+				return;
+			}
+		}
+#		endif
 		if (is_dollar_incr)
 		{
 			if (key_exists)
@@ -692,7 +982,7 @@ tn_restart:
 		} else
 		{
 			GET_USHORT(rec_size, &rp->rsiz);
-			rec_cmpc = rp->cmpc;
+			rec_cmpc = EVAL_CMPC(rp);
 			if ((sm_uc_ptr_t)rp + rec_size > (sm_uc_ptr_t)buffaddr + cur_blk_size)
 			{
 				assert(CDB_STAGNATE > t_tries);
@@ -720,7 +1010,8 @@ tn_restart:
 			assert(target_key_size > rec_cmpc);
 			cur_val_offset = SIZEOF(rec_hdr) + (target_key_size - rec_cmpc);
 #			ifdef GTM_TRIGGER
-			if (no_pointers && (NULL != ztold_mval) && !skip_hasht_read)
+			if (no_pointers && (NULL != ztold_mval) && !skip_hasht_read && parms->enable_trigger_read_and_fire
+					&& !lcl_span_status)
 			{	/* Complete initialization of ztold_mval */
 				assert(!skip_dbtriggers);
 				data_len = rec_size - cur_val_offset;
@@ -730,14 +1021,22 @@ tn_restart:
 					status = cdb_sc_rmisalign;
 					GOTO_RETRY;
 				}
+				ztold_mval->str.len = data_len;
 				if (data_len)
 				{
-					ENSURE_STP_FREE_SPACE(data_len);
+					if (!(IS_STP_SPACE_AVAILABLE(data_len)))
+					{
+						PUSH_MV_STENT(MVST_MVAL);       /* protect "value" mstr from stp gcol */
+						pval = &mv_chain->mv_st_cont.mvs_mval;
+						pval->str = value;
+						ENSURE_STP_FREE_SPACE(data_len);
+						value = pval->str;
+						POP_MV_STENT();                 /* pval */
+					}
 					ztold_mval->str.addr = (char *)stringpool.free;
 					memcpy(ztold_mval->str.addr, (sm_uc_ptr_t)rp + cur_val_offset, data_len);
 					stringpool.free += data_len;
 				}
-				ztold_mval->str.len = data_len;
 				ztold_mval->mvtype = MV_STR;	/* ztold_mval is now completely initialized */
 			}
 #			endif
@@ -800,7 +1099,7 @@ tn_restart:
 				BLK_SEG(bs_ptr, buffaddr + SIZEOF(blk_hdr), curr_rec_offset - SIZEOF(blk_hdr));
 				BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 				curr_rec_hdr->rsiz = new_rec_size;
-				curr_rec_hdr->cmpc = prev_rec_match;
+				SET_CMPC(curr_rec_hdr, prev_rec_match);
 				BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 				BLK_ADDR(cp1, target_key_size - prev_rec_match, unsigned char);
 				memcpy(cp1, temp_key->base + prev_rec_match, target_key_size - prev_rec_match);
@@ -820,7 +1119,7 @@ tn_restart:
 					{
 						BLK_ADDR(next_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 						next_rec_hdr->rsiz = rec_size - next_rec_shrink;
-						next_rec_hdr->cmpc = curr_rec_match;
+						SET_CMPC(next_rec_hdr, curr_rec_match);
 						BLK_SEG(bs_ptr, (sm_uc_ptr_t)next_rec_hdr, SIZEOF(rec_hdr));
 						next_rec_shrink += SIZEOF(rec_hdr);
 					}
@@ -841,21 +1140,22 @@ tn_restart:
 				 */
 				assert(FALSE);
 				curr_rec_hdr = (rec_hdr_ptr_t)(buffaddr + curr_rec_offset);
+				EVAL_CMPC2(curr_rec_hdr, tmp_cmpc);
 				/* First piece is block prior to record + key + data prior to fragment */
 				BLK_SEG(bs_ptr,
 					buffaddr + SIZEOF(blk_hdr),
 					curr_rec_offset - SIZEOF(blk_hdr) + SIZEOF(rec_hdr) + rc_set_fragment
-						+ gv_currkey->end + 1 - curr_rec_hdr->cmpc);
+						+ gv_currkey->end + 1 - tmp_cmpc);
 				/* Second piece is fragment itself */
 				BLK_ADDR(va, value.len, char);
 				memcpy(va, value.addr, value.len);
 				BLK_SEG(bs_ptr, (unsigned char *)va, value.len);
 				/* Third piece is data after fragment + rest of block after record */
 				n = (int)(cur_blk_size - ((sm_uc_ptr_t)curr_rec_hdr - buffaddr) - SIZEOF(rec_hdr)
-					- (gv_currkey->end + 1 - curr_rec_hdr->cmpc) - rc_set_fragment - value.len);
+					- (gv_currkey->end + 1 - tmp_cmpc) - rc_set_fragment - value.len);
 				if (0 < n)
 					BLK_SEG(bs_ptr,
-						(sm_uc_ptr_t)curr_rec_hdr + gv_currkey->end + 1 - curr_rec_hdr->cmpc
+						(sm_uc_ptr_t)curr_rec_hdr + gv_currkey->end + 1 - tmp_cmpc
 							+ rc_set_fragment + value.len,
 						n);
 			}
@@ -965,10 +1265,11 @@ tn_restart:
 				{
 					assert(dollar_tlevel);
 					if (is_dollar_incr)
-					{
-						ADD_TO_GVT_TP_LIST(gv_target); /* See comment in ENSURE_VALUE_WITHIN_MAX_REC_SIZE
-									  * macro definition for why this macro call is necessary */
-						rts_error(VARLSTCNT(4) ERR_GVINCRISOLATION, 2,
+					{	/* See comment in ENSURE_VALUE_WITHIN_MAX_REC_SIZE macro
+						 * definition for why the below macro call is necessary.
+						 */
+						ADD_TO_GVT_TP_LIST(gv_target, RESET_FIRST_TP_SRCH_STATUS_FALSE);
+						rts_error_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_GVINCRISOLATION, 2,
 							gv_target->gvname.var_name.len, gv_target->gvname.var_name.addr);
 					}
 					if (NULL == cse->recompute_list_tail ||
@@ -1008,7 +1309,6 @@ tn_restart:
 			assert(blk_reserved_size >= blk_fill_size);
 			extra_record_orig_size = 0;
 			prev_rec_offset = bh->prev_rec.offset;
-			assert(new_blk_size_single <= new_blk_size_r);
 			/* Decide which side (left or right) the new record goes. Ensure either side has at least one record.
 			 * This means we might not honor the desired FillFactor if the only record in a block exceeds the
 			 * blk_fill_size, but in this case we are guaranteed the block has room for the current reserved bytes.
@@ -1108,7 +1408,7 @@ tn_restart:
 					BLK_SEG(bs_ptr, buffaddr + SIZEOF(blk_hdr), prev_rec_offset - SIZEOF(blk_hdr));
 					BLK_ADDR(new_star_hdr, SIZEOF(rec_hdr), rec_hdr);
 					new_star_hdr->rsiz = BSTAR_REC_SIZE;
-					new_star_hdr->cmpc = 0;
+					SET_CMPC(new_star_hdr, 0);
 					BLK_SEG(bs_ptr, (sm_uc_ptr_t)new_star_hdr, SIZEOF(rec_hdr));
 					BLK_SEG(bs_ptr, (sm_uc_ptr_t)rp - SIZEOF(block_id), SIZEOF(block_id));
 				}
@@ -1137,7 +1437,7 @@ tn_restart:
 					rp = (rec_hdr_ptr_t)((sm_uc_ptr_t)rp + rec_size);
 				BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 				curr_rec_hdr->rsiz = target_key_size + SIZEOF(rec_hdr) + value.len;
-				curr_rec_hdr->cmpc = 0;
+				SET_CMPC(curr_rec_hdr, 0);
 				BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 				BLK_ADDR(cp1, target_key_size, unsigned char);
 				memcpy(cp1, temp_key->base, target_key_size);
@@ -1153,7 +1453,7 @@ tn_restart:
 					BLK_ADDR(next_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 					GET_USHORT(next_rec_hdr->rsiz, &rp->rsiz);
 					next_rec_hdr->rsiz -= next_rec_shrink;
-					next_rec_hdr->cmpc = new_rec ? curr_rec_match : rp->cmpc;
+					SET_CMPC(next_rec_hdr, new_rec ? curr_rec_match : EVAL_CMPC(rp));
 					BLK_SEG(bs_ptr, (sm_uc_ptr_t)next_rec_hdr, SIZEOF(rec_hdr));
 					next_rec_shrink += SIZEOF(rec_hdr);
 					n = cur_blk_size - INTCAST(((sm_uc_ptr_t)rp - buffaddr)) - next_rec_shrink;
@@ -1229,7 +1529,7 @@ tn_restart:
 					{
 						BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 						curr_rec_hdr->rsiz = new_rec_size;
-						curr_rec_hdr->cmpc = prev_rec_match;
+						SET_CMPC(curr_rec_hdr, prev_rec_match);
 						BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 						BLK_ADDR(cp1, target_key_size - prev_rec_match, unsigned char);
 						memcpy(cp1, temp_key->base + prev_rec_match, target_key_size - prev_rec_match);
@@ -1250,7 +1550,7 @@ tn_restart:
 							{
 								BLK_ADDR(extra_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 								extra_rec_hdr->rsiz = n;
-								extra_rec_hdr->cmpc = curr_rec_match;
+								SET_CMPC(extra_rec_hdr, curr_rec_match);
 								BLK_SEG(bs_ptr, (sm_uc_ptr_t)extra_rec_hdr, SIZEOF(rec_hdr));
 								if (n < (signed)SIZEOF(rec_hdr)) /* want signed compare */
 								{				     /* as 'n' can be negative */
@@ -1272,7 +1572,7 @@ tn_restart:
 					{
 						BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 						curr_rec_hdr->rsiz = new_rec_size;
-						curr_rec_hdr->cmpc = prev_rec_match;
+						SET_CMPC(curr_rec_hdr, prev_rec_match);
 						BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 						BLK_ADDR(cp1, target_key_size - prev_rec_match, unsigned char);
 						memcpy(cp1, temp_key->base + prev_rec_match, target_key_size - prev_rec_match);
@@ -1286,7 +1586,7 @@ tn_restart:
 						new_blk_size_l = curr_rec_offset + BSTAR_REC_SIZE;
 					BLK_ADDR(new_star_hdr, SIZEOF(rec_hdr), rec_hdr);
 					new_star_hdr->rsiz = BSTAR_REC_SIZE;
-					new_star_hdr->cmpc = 0;
+					SET_CMPC(new_star_hdr, 0);
 					BLK_SEG(bs_ptr, (sm_uc_ptr_t)new_star_hdr, SIZEOF(rec_hdr));
 					if (!copy_extra_record)
 					{
@@ -1315,7 +1615,7 @@ tn_restart:
 				if (!new_rec || copy_extra_record)
 				{	/* Should guard for empty block??? */
 					rp = (rec_hdr_ptr_t)((sm_uc_ptr_t)rp + rec_size);
-					rec_cmpc = rp->cmpc;
+					rec_cmpc = EVAL_CMPC(rp);
 					temp_short = rec_size;
 					GET_USHORT(rec_size, &rp->rsiz);
 				}
@@ -1337,7 +1637,7 @@ tn_restart:
 				BLK_INIT(bs_ptr, bs1);
 				BLK_ADDR(next_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 				next_rec_hdr->rsiz = rec_size;
-				next_rec_hdr->cmpc = 0;
+				SET_CMPC(next_rec_hdr, 0);
 				BLK_SEG(bs_ptr, (sm_uc_ptr_t)next_rec_hdr, SIZEOF(rec_hdr));
 				BLK_ADDR(cp1, rec_cmpc, unsigned char);
 				memcpy(cp1, temp_key->base, rec_cmpc);
@@ -1695,12 +1995,17 @@ tn_restart:
 			 * not many intervening possible keys and and therefore it does not matter that much whether we pass
 			 * the left or (right-1) key to the parent.
 			 *
+			 * There are two additional cases in which we let the left key go unmodified: 1) if the backoff would
+			 * result in a key larger than max_key_size and 2) if the left key ends in "00 00" and the right key ends
+			 * in "00 01 ... ". Backing off the 01 would give a index key with "00 00" in the middle.
+			 *
 			 * temp_key already holds the key corresponding to the last record of the left block.
 			 * bs1[2] and bs1[3] hold the key corresponding to the first record of the right block.
 			 */
 			if (level_0)
 			{	/* Determine key for record to pass on to parent index block */
 				cp1 = temp_key->base;
+				assert(KEY_DELIMITER != *temp_key->base);
 				cp2 = (unsigned char *)bs1[2].addr;
 				bs1_2_len = bs1[2].len;
 				for (i = 0; (i < bs1_2_len) && (*cp2 == *cp1); ++i)
@@ -1743,13 +2048,16 @@ tn_restart:
 				} else if (1 == n)
 				{
 					cp1++;
-					if ((cp1 - temp_key->base + 2) < temp_key->top)
+					start_len = cp1 - temp_key->base + 2;
+					if (start_len < temp_key->top)
 					{
 						if (i == (bs1_2_len - 1))
 							cp2 = (unsigned char *)bs1[3].addr;
 						else
 							cp2++;
-						if ((STR_SUB_MAXVAL != *cp1) || (KEY_DELIMITER != *cp2))
+						if (((KEY_DELIMITER != *(cp1 - 1)) || (KEY_DELIMITER != *(cp1 - 2)))
+						 && ((STR_SUB_MAXVAL != *cp1) || (KEY_DELIMITER != *cp2))
+						 && (gv_cur_region->max_key_size > start_len))
 						{
 							if (!new_rec_goes_to_right)
 							{
@@ -1794,8 +2102,11 @@ tn_restart:
 			{	/* Not root;  write blocks and continue */
 				if (cdb_sc_normal != (status = gvcst_search_blk(temp_key, bq)))
 					GOTO_RETRY;
-				cse = t_write(bh, (unsigned char *)bs1, ins_chain_offset,
-							ins_chain_index, bh_level, TRUE, FALSE, GDS_WRITE_PLAIN);
+				/* It's necessary to disable the indexmod optimization for splits of index blocks. Refer to
+				 * GTM-7353, C9B11-001813 (GTM-3984), and C9H12-002934 (GTM-6104).
+				 */
+				cse = t_write(bh, (unsigned char *)bs1, ins_chain_offset, ins_chain_index, bh_level,
+							TRUE, FALSE, (level_0) ? GDS_WRITE_PLAIN : GDS_WRITE_KILLTN);
 				assert(!dollar_tlevel || !cse->high_tlevel);
 				if (cse)
 				{
@@ -1854,7 +2165,7 @@ tn_restart:
 				BLK_INIT(bs_ptr, bs1);
 				BLK_ADDR(curr_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 				curr_rec_hdr->rsiz = target_key_size + SIZEOF(rec_hdr) + SIZEOF(block_id);
-				curr_rec_hdr->cmpc = 0;
+				SET_CMPC(curr_rec_hdr, 0);
 				BLK_SEG(bs_ptr, (sm_uc_ptr_t)curr_rec_hdr, SIZEOF(rec_hdr));
 				BLK_ADDR(cp1, target_key_size, unsigned char);
 				memcpy(cp1, temp_key->base, target_key_size);
@@ -1862,7 +2173,7 @@ tn_restart:
 				BLK_SEG(bs_ptr, (unsigned char *)&zeroes, SIZEOF(block_id));
 				BLK_ADDR(next_rec_hdr, SIZEOF(rec_hdr), rec_hdr);
 				next_rec_hdr->rsiz = BSTAR_REC_SIZE;
-				next_rec_hdr->cmpc = 0;
+				SET_CMPC(next_rec_hdr, 0);
 				BLK_SEG(bs_ptr, (sm_uc_ptr_t)next_rec_hdr, SIZEOF(rec_hdr));
 				BLK_SEG(bs_ptr, (unsigned char *)&zeroes, SIZEOF(block_id));
 				if (0 == BLK_FINI(bs_ptr, bs1))
@@ -1917,7 +2228,7 @@ tn_restart:
 	assert(succeeded);
 	horiz_growth = FALSE;
 	assert((csa->dir_tree == gv_target) || tp_root);
-	RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ);
+	RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ, DO_GVT_GVKEY_CHECK);
 	/* The only case where gv_target is still csa->dir_tree after the above RESET macro is if op_gvput was invoked
 	 * with gv_target being set to cs_addrs->dir_tree. In that case gbl_target_was_set would have been set to TRUE. Assert.
 	 */
@@ -1940,7 +2251,7 @@ tn_restart:
                         inctn_opcode = inctn_gvcstput_extra_blk_split;
 		else if (JNL_WRITE_LOGICAL_RECS(csa) && !jnl_format_done)
 		{
-			jfb = jnl_format(JNL_SET, gv_currkey, (!is_dollar_incr ? val : post_incr_mval), nodeflags);
+			jfb = jnl_format(JNL_SET, gv_currkey, (!is_dollar_incr ? val_forjnl : post_incr_mval), nodeflags);
 			assert(NULL != jfb);
 			jnl_format_done = TRUE;
 		}
@@ -1960,8 +2271,9 @@ tn_restart:
 		{	/* "t_retry" would have already been invoked by "t_end".
 			 * So instead of going to "retry:", do only whatever steps from there are necessary here.
 			 */
-			RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, tp_root, dir_hist, dir_tree);
-			jnl_format_done = FALSE;	/* need to reformat jnl records for $INCR even in case of non-TP */
+			RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, dir_hist, dir_tree);
+			/*if (is_dollar_incr)*/
+				jnl_format_done = FALSE;	/* need to reformat jnl records for $INCR even in case of non-TP */
 			GTMTRIG_DBG_ONLY(dbg_trace_array[dbg_num_iters].retry_line = __LINE__);
 			goto tn_restart;
 		}
@@ -1972,14 +2284,16 @@ tn_restart:
 		{	/* Note that although "tp_hist" processes the "dir_hist" history, it only adds "gv_target" to gvt_tp_list.
 			 * But csa->dir_tree might have had clue, blk-split related info etc. modified as part of this
 			 * gvcst_put invocation that might also need cleanup (just like any other gv_target) so add
-			 * csa->dir_tree to gvt_tp_list (if not already done).
+			 * csa->dir_tree to gvt_tp_list (if not already done). Therefore treat this as if tp_hist is doing
+			 * the ADD_TO_GVT_TP_LIST call for dir_tree.
 			 */
 			assert(dir_tree == csa->dir_tree);
-			ADD_TO_GVT_TP_LIST(dir_tree);	/* note: macro also updates read_local_tn if necessary */
+			ADD_TO_GVT_TP_LIST(dir_tree, RESET_FIRST_TP_SRCH_STATUS_FALSE);
+				/* note: above macro updates read_local_tn if necessary */
 		}
 		if (cdb_sc_normal != status)
 			GOTO_RETRY;
-		jnl_format_done = FALSE;
+		jnl_format_done = !needfmtjnl;
 	}
 	if (succeeded)
 	{
@@ -2015,7 +2329,7 @@ tn_restart:
 		{	/* The logical update required an extra block split operation first (which succeeded) so
 			 * get back to doing the logical update before doing any trigger invocations etc.
 			 */
-			GTMTRIG_ONLY(skip_hasht_read = TRUE;)
+			GTMTRIG_ONLY(skip_hasht_read = (dollar_tlevel) ? TRUE : skip_hasht_read;)
 			goto fresh_tn_start;
 		}
 		for (bh_level = 0; bh_level < split_depth; bh_level++)
@@ -2048,10 +2362,10 @@ tn_restart:
 				nodeflags |= JS_SKIP_TRIGGERS_MASK;
 			if (duplicate_set)
 				nodeflags |= JS_IS_DUPLICATE;
-			ja_val = (!is_dollar_incr ? val : post_incr_mval);
+			ja_val = (!is_dollar_incr ? val_forjnl : post_incr_mval);
 			write_logical_jnlrecs = JNL_WRITE_LOGICAL_RECS(csa);
 #			ifdef GTM_TRIGGER
-			if (!skip_dbtriggers)
+			if (!skip_dbtriggers && parms->enable_trigger_read_and_fire)
 			{
 				/* Since we are about to invoke the trigger, we better have gv_target->gvt_trigger and
 				 * the local variable gvt_trigger in sync. The only exception is when we are here because
@@ -2073,7 +2387,7 @@ tn_restart:
 					PUSH_MV_STENT(MVST_MVAL);	/* protect $ztval from stp_gcol */
 					ztval_mval = &mv_chain->mv_st_cont.mvs_mval;
 					if (!is_dollar_incr)
-						*ztval_mval = *val;
+						*ztval_mval = *val_forjnl;
 					else
 					{
 						*ztval_mval = *post_incr_mval;
@@ -2099,7 +2413,7 @@ tn_restart:
 						 * necessary tp_restart() logic (t_retry is already completed so should be skipped)
 						 * and then re-do the gvcst_put logic.
 						 */
-						assert(lcl_implicit_tstart);
+						assert(lcl_implicit_tstart || lcl_span_status);
 						assert(CDB_STAGNATE >= t_tries);
 						status = cdb_sc_normal;	/* signal "retry:" to avoid t_retry call */
 						GOTO_RETRY;
@@ -2112,7 +2426,29 @@ tn_restart:
 						 */
 						assert(0 < gvtr_parms.num_triggers_invoked);
 						val = trigparms.ztvalue_new;
+						val_forjnl = trigparms.ztvalue_new;
 						MV_FORCE_STR(val); /* in case the updated value happens to be a numeric quantity */
+						fits = RECORD_FITS_IN_A_BLOCK(val, gv_currkey, blk_size, blk_reserved_bytes);
+						if (!fits)
+						{	/* If val is now too big to fit in a block, we need to back out into
+							 * gvcst_put and try again with spanning nodes. This means we should
+							 * OP_TROLLBACK if lcl_implicit_tstart.
+							 */
+							if (lcl_implicit_tstart)
+							{
+								POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp,
+										save_mv_chain);
+								OP_TROLLBACK(-1);
+								assert(!lcl_span_status);
+								parms->span_status = TRUE;
+							} else
+							{
+								parms->ztval_gvcst_put_redo = TRUE;
+								parms->ztval_mval = val;
+							}
+							RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ, DO_GVT_GVKEY_CHECK);
+							return;
+						}
 						ztval_gvcst_put_redo = TRUE;
 						skip_hasht_read = TRUE;
 						/* In case, the current gvcst_put invocation was for $INCR, reset the corresponding
@@ -2127,7 +2463,8 @@ tn_restart:
 						goto fresh_tn_start;
 					}
 				}
-				POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp, save_mv_chain);
+				/* We don't want to pop mvals yet if we still need to set chunks of ztval */
+				POP_MVALS_FROM_M_STACK_IF_REALLY_NEEDED(lcl_span_status, ztold_mval, save_msp, save_mv_chain);
 					/* pop any stacked mvals before op_tcommit as it does its own popping */
 			}
 #			endif
@@ -2160,7 +2497,8 @@ tn_restart:
 		}
 		assert(!JNL_WRITE_LOGICAL_RECS(csa) || jnl_format_done);
 		/* Now that the SET/$INCR is finally complete, increment the corresponding GVSTAT counter */
-		INCR_GVSTATS_COUNTER(csa, cnl, n_set, 1);
+		if (!lcl_span_status)
+			INCR_GVSTATS_COUNTER(csa, cnl, n_set, 1);
 		DBG_CHECK_VAL_AT_FUN_EXIT;
 		assert(lcl_dollar_tlevel == dollar_tlevel);
 		return;
@@ -2170,11 +2508,6 @@ retry:
 	 * invocations and in case those triggers referenced globals in different regions. But this should be fixed
 	 * by a call to t_retry/tp_restart below (it does a TP_CHANGE_REG(tp_pointer->gd_reg)).
 	 */
-	RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ);
-	/* Need to restart. If directory tree was used in this transaction, nullify its clue as well (not normally
-	 * done by t_retry). The RESTORE_ZERO_GVT_ROOT_ON_RETRY macro call below takes care of that for us.
-	 */
-	RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, tp_root, dir_hist, dir_tree);
 #	ifdef GTM_TRIGGER
 	if (lcl_implicit_tstart)
 	{
@@ -2191,28 +2524,45 @@ retry:
 		ztval_gvcst_put_redo = FALSE;
 		skip_hasht_read = FALSE;
 		val = lcl_val;
+		val_forjnl = lcl_val_forjnl;
 		/* $increment related fields need to be restored */
 		is_dollar_incr = lcl_is_dollar_incr;
 		post_incr_mval = lcl_post_incr_mval;
 		increment_delta_mval = lcl_increment_delta_mval;
 	}
 #	endif
-	assert((cdb_sc_normal != status) GTMTRIG_ONLY(|| lcl_implicit_tstart));
+	assert((cdb_sc_normal != status) GTMTRIG_ONLY(|| lcl_implicit_tstart || lcl_span_status));
 	if (cdb_sc_normal != status)
-	{
-		GTMTRIG_ONLY(POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp, save_mv_chain));
+	{	/* Need to restart. If directory tree was used in this transaction, nullify its clue as well (not normally
+		 * done by t_retry). The RESTORE_ZERO_GVT_ROOT_ON_RETRY macro call below takes care of that for us.
+		 */
+		RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ, dollar_tlevel ? DO_GVT_GVKEY_CHECK_RESTART : DO_GVT_GVKEY_CHECK);
+		RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, dir_hist, dir_tree);
+		GTMTRIG_ONLY(POP_MVALS_FROM_M_STACK_IF_REALLY_NEEDED(lcl_span_status, ztold_mval, save_msp, save_mv_chain));
 		t_retry(status);
+		GTMTRIG_ONLY(skip_INVOKE_RESTART = FALSE);
 	} else
 	{	/* else: t_retry has already been done so no need to do that again but need to still invoke tp_restart
 		 * to complete pending "tprestart_state" related work.
+		 * SKIP_GVT_GVKEY_CHECK allows us to skip DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC if a trigger invocation
+		 * restarted during GVCST_ROOT_SEARCH, in which case gv_currkey will correspond to ^#t.
+		 * The subsequent tp_restart restores gv_currkey/gv_target to an in-sync state.
 		 */
+		RESET_GV_TARGET_LCL_AND_CLR_GBL(save_targ, SKIP_GVT_GVKEY_CHECK);
 #		ifdef GTM_TRIGGER
 		assert(ERR_TPRETRY == gtm_trig_status);
 		TRIGGER_BASE_FRAME_UNWIND_IF_NOMANSLAND;
-		POP_MVALS_FROM_M_STACK_IF_NEEDED(ztold_mval, save_msp, save_mv_chain);
+		POP_MVALS_FROM_M_STACK_IF_REALLY_NEEDED(lcl_span_status, ztold_mval, save_msp, save_mv_chain)
+		if (!lcl_implicit_tstart)
+		{	/* We started an implicit transaction for spanning nodes in gvcst_put. Invoke restart to return. */
+			assert(lcl_span_status && !skip_INVOKE_RESTART && (&gvcst_put_ch == ctxt->ch));
+			INVOKE_RESTART;
+		}
 #		endif
 		rc = tp_restart(1, !TP_RESTART_HANDLES_ERRORS);
 		assert(0 == rc GTMTRIG_ONLY(&& TPRESTART_STATE_NORMAL == tprestart_state));
+		DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC(CHECK_CSA_TRUE); /* finishs the check skipped above */
+		RESTORE_ZERO_GVT_ROOT_ON_RETRY(lcl_root, gv_target, dir_hist, dir_tree);
 	}
 #	ifdef GTM_TRIGGER
 	assert(0 < t_tries);
@@ -2220,16 +2570,16 @@ retry:
 	if (cdb_sc_normal == status)
 	{
 		DEBUG_ONLY(save_cdb_status = status);
-		status = t_fail_hist[t_tries - 1]; /* get the last restart code */
+		status = LAST_RESTART_CODE;
 	}
-	assert(((cdb_sc_onln_rlbk1 != status) && (cdb_sc_onln_rlbk2 != status))
-		|| (TREF(dollar_zonlnrlbk) && !gv_target->root));
+	assert((cdb_sc_onln_rlbk2 != status) || TREF(dollar_zonlnrlbk));
+	assert(((cdb_sc_onln_rlbk1 != status) && (cdb_sc_onln_rlbk2 != status)) || !gv_target->root);
 	if ((cdb_sc_onln_rlbk2 == status) && lcl_implicit_tstart)
 	{	/* Database was taken back to a different logical state and we are an implicit TP transaction.
 		 * Issue DBROLLEDBACK error that the application programmer can catch and do the necessary stuff.
 		 */
 		assert(gtm_trigger_depth == tstart_trigger_depth);
-		rts_error(VARLSTCNT(1) ERR_DBROLLEDBACK);
+		rts_error_csa(CSA_ARG(cs_addrs) VARLSTCNT(1) ERR_DBROLLEDBACK);
 	}
 	/* Note: In case of cdb_sc_onln_rlbk1, the restart logic will take care of doing the root search */
 #	endif
@@ -2241,11 +2591,11 @@ retry:
 	assert(!dollar_tlevel GTMTRIG_ONLY(|| lcl_implicit_tstart));
 	if (dollar_tlevel)
 	{
-		jnl_format_done = FALSE;	/* need to reformat jnl records unconditionally in case of TP */
+		jnl_format_done = !needfmtjnl;	/* need to reformat jnl records unconditionally in case of TP */
 		tp_set_sgm();	/* set sgm_info_ptr & first_sgm_info for TP start */
 		T_BEGIN_SETORKILL_NONTP_OR_TP(ERR_GVPUTFAIL);	/* set update_trans and t_err for wrapped TP */
 	} else if (is_dollar_incr)
-		jnl_format_done = FALSE;	/* need to reformat jnl records for $INCR even in case of non-TP */
+		jnl_format_done = !needfmtjnl;	/* need to reformat jnl records for $INCR even in case of non-TP */
 	assert(dollar_tlevel || update_trans);
 	goto tn_restart;
 }

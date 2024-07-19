@@ -32,7 +32,7 @@ GBLREF int	 omi_pkdbg;
 GBLREF char	*omi_oprlist[];
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/omi_dmp_pkt.c,v 1.8 2013/10/23 03:49:32 tuskentower Exp $";
 #endif
 
 

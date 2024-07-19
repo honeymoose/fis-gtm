@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -15,7 +15,6 @@
 #define DEF_RM_WIDTH		32767
 #define DEF_RM_RECORDSIZE	32767
 #define DEF_RM_LENGTH		66
-#define RM_BUFLEN		80
 #define CHUNK_SIZE		512
 
 #define	ONE_COMMA			"1,"
@@ -121,6 +120,7 @@ typedef struct
 	boolean_t	def_width;	/* WIDTH has not been changed */
 	boolean_t	def_recsize;	/* RECORDSIZE has not been changed */
 	boolean_t	bom_read_one_done;	/* If pipe/fifo and UTF8, read one byte to check for bom if not set */
+	boolean_t	follow;	/* True if disk read with follow - similar to tail -f on a file */
 	pipe_interrupt	pipe_save_state;	/* Saved state of interrupted IO */
 	boolean_t	mupintr;	/* We were mupip interrupted */
 	unsigned int	lastop;		/* Last operation done on file */
@@ -130,8 +130,6 @@ typedef struct
 	struct	io_desc_struct	*stderr_child;	/* pointer to io descriptor for pipe stderr device */
 	struct	io_desc_struct	*stderr_parent;	/* pointer to io descriptor for pipe which opened stderr device */
 	pid_t		pipe_pid;		/* child process id for reaping on close */
-	char		dollar_key[RM_BUFLEN];	/* String representation of process id of child - $KEY */
-	char		dollar_device[RM_BUFLEN];/* String representation $DEVICE */
 	Dev_param_pairs dev_param_pairs;
 	int		bufsize;	/* Size of inbuf */
 	int		outbufsize;	/* Size of outbuf */
@@ -163,6 +161,9 @@ typedef struct
 int gtm_utf_bomcheck(io_desc *iod, gtm_chset_t *chset, unsigned char *buffer, int len);
 int iorm_get_bom(io_desc *io_ptr, int *blocked_in, boolean_t ispipe, int flags, int4 *tot_bytes_read,
 		 TID timer_id, int4 *msec_timeout, boolean_t colon_zero);
+int iorm_get_bom_fol(io_desc *io_ptr, int4 *tot_bytes_read, int4 *msec_timeout, boolean_t timed, boolean_t *bom_timeout);
+int iorm_get_fol(io_desc *io_ptr, int4 *tot_bytes_read, int4 *msec_timeout, boolean_t timed, boolean_t zint_restart,
+		 boolean_t *follow_timeout);
 int iorm_get(io_desc *io_ptr, int *blocked_in, boolean_t ispipe, int flags, int4 *tot_bytes_read,
 	     TID timer_id, int4 *msec_timeout, boolean_t colon_zero, boolean_t zint_restart);
 int iorm_write_utf_ascii(io_desc *iod, char *string, int len);

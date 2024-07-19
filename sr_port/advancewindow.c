@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -52,7 +52,7 @@ static readonly unsigned char apos_ok[] =
 void advancewindow(void)
 {
 	unsigned char	*cp1, *cp2, *cp3, x;
-	char		*tmp, source_line_buff[MAX_SRCLINE + SIZEOF(ARROW)];
+	char		*tmp;
 	int		y, charlen;
 #	ifdef UNICODE_SUPPORTED
 	uint4		ch;
@@ -96,7 +96,7 @@ void advancewindow(void)
 				}
 				if (!run_time)
 				{
-					show_source_line(source_line_buff, SIZEOF(source_line_buff), TRUE);
+					show_source_line(TRUE);
 					dec_err(VARLSTCNT(1) ERR_LITNONGRAPH);
 				}
 			}
@@ -151,7 +151,7 @@ void advancewindow(void)
 		{
 			if (cp2 < cp3)
 				*cp2++ = x;
-			y = ctypetab[x = *++lexical_ptr];
+			y = ctypetab[x = *++lexical_ptr];			/* note assignment */
 			if ((TK_UPPER != y) && (TK_DIGIT != y) && (TK_LOWER != y))
 				break;
 		}
@@ -159,7 +159,7 @@ void advancewindow(void)
 		TREF(director_token) = TK_IDENT;
 		return;
 	case TK_PERIOD:
-		if (ctypetab[x = *(lexical_ptr + 1)] != TK_DIGIT)
+		if (ctypetab[x = *(lexical_ptr + 1)] != TK_DIGIT)		/* note assignment */
 			break;
 	case TK_DIGIT:
 		(TREF(director_mval)).str.addr = lexical_ptr;
@@ -186,14 +186,14 @@ void advancewindow(void)
 		}
 		return;
 	case TK_APOSTROPHE:
-		if (( x = *++lexical_ptr) >= 32)
+		if (32 <= (x = *++lexical_ptr))				/* note assignment */
 		{
 			x -= 32;
-			if (x < SIZEOF(apos_ok) / SIZEOF(unsigned char))
+			if (x < ARRAYSIZE(apos_ok))
 			{
 				if (y = apos_ok[x])
 				{
-					if (DEL < (x = *++lexical_ptr))
+					if (DEL < (x = *++lexical_ptr))		/* note assignment */
 					{
 						TREF(director_token) = TK_ERROR;
 						return;
@@ -210,6 +210,14 @@ void advancewindow(void)
 		}
 		TREF(director_token) = TK_APOSTROPHE;
 		return;
+	case TK_GREATER:
+	case TK_LESS:
+		if (TK_EQUAL == ctypetab[*(lexical_ptr + 1)])
+		{
+			++lexical_ptr;
+			y = ((TK_LESS == y) ? TK_NGREATER : TK_NLESS);
+		}
+		break;
 	case TK_SEMICOLON:
 		while (*++lexical_ptr)
 			;
@@ -217,7 +225,7 @@ void advancewindow(void)
 		TREF(director_token) = TK_EOL;
 		return;		/* if next character is terminator, avoid incrementing past it */
 	case TK_ASTERISK:
-		if (DEL < (x = *(lexical_ptr + 1)))
+		if (DEL < (x = *(lexical_ptr + 1)))				/* note assignment */
 		{
 			TREF(director_token) = TK_ERROR;
 			return;
@@ -229,7 +237,7 @@ void advancewindow(void)
 		}
 		break;
 	case TK_RBRACKET:
-		if ((x = *(lexical_ptr + 1)) > DEL)
+		if ((x = *(lexical_ptr + 1)) > DEL)				/* note assignment */
 		{
 			TREF(director_token) = TK_ERROR;
 			return;
@@ -240,6 +248,17 @@ void advancewindow(void)
 			y = TK_SORTS_AFTER;
 		}
 		break;
+	case TK_ATSIGN:
+		if (DEL < (x = *(lexical_ptr + 1)))				/* note assignment */
+		{
+			TREF(director_token) = TK_ERROR;
+			return;
+		}
+		if (TK_HASH == ctypetab[x])
+		{
+			lexical_ptr++;
+			y = TK_ATHASH;
+		}
 	default:
 		;
 	}

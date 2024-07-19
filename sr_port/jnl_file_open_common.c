@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2003, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2003, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -53,6 +53,7 @@
 #include "repl_sp.h"
 #include "iosp.h"	/* for SS_NORMAL */
 #include "get_fs_block_size.h"
+#include "anticipatory_freeze.h"
 
 GBLREF	jnlpool_ctl_ptr_t	jnlpool_ctl;
 GBLREF	boolean_t		pool_init;
@@ -91,6 +92,7 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 	io_status_block_disk	iosb;
 #endif
 	uint4			jnl_fs_block_size, read_write_size, read_size;
+	gtm_uint64_t		header_virtual_size;
 
 	csa = &FILE_INFO(reg)->s_addrs;
 	csd = csa->hdr;
@@ -141,7 +143,7 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 	}
 	if (!is_gdid_file_identical(&FILE_ID(reg), (char *)header->data_file_name, header->data_file_name_length))
 	{
-		rts_error(VARLSTCNT(7) ERR_JNLOPNERR, 4, JNL_LEN_STR(csd), DB_LEN_STR(reg), ERR_FILEIDMATCH);
+		rts_error_csa(CSA_ARG(csa) VARLSTCNT(7) ERR_JNLOPNERR, 4, JNL_LEN_STR(csd), DB_LEN_STR(reg), ERR_FILEIDMATCH);
 		assert(FALSE);	/* we dont expect the rts_error in the line above to return */
 		return ERR_JNLOPNERR;
 	}
@@ -168,7 +170,7 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 	GTMCRYPT_ONLY(
 		if (memcmp(header->encryption_hash, csd->encryption_hash, GTMCRYPT_HASH_LEN))
 		{
-			send_msg(VARLSTCNT(6) ERR_CRYPTJNLWRONGHASH, 4, JNL_LEN_STR(csd), DB_LEN_STR(reg));
+			send_msg_csa(CSA_ARG(csa) VARLSTCNT(6) ERR_CRYPTJNLWRONGHASH, 4, JNL_LEN_STR(csd), DB_LEN_STR(reg));
 			jpc->status = ERR_CRYPTJNLWRONGHASH;
 			return ERR_JNLOPNERR;
 		}
@@ -181,10 +183,11 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 	assert(((off_jnl_t)os_file_size) % JNL_REC_START_BNDRY == 0);
 	assert(((off_jnl_t)os_file_size) % DISK_BLOCK_SIZE == 0);
 	assert(((off_jnl_t)os_file_size) % jnl_fs_block_size == 0);
-	if ((ROUND_UP2((header->virtual_size * DISK_BLOCK_SIZE), jnl_fs_block_size) < os_file_size)
-		|| (header->jnl_deq && 0 != ((header->virtual_size - header->jnl_alq) % header->jnl_deq)))
+	header_virtual_size = header->virtual_size;	/* saving in 8-byte int to avoid overflow below */
+	if ((ROUND_UP2((header_virtual_size * DISK_BLOCK_SIZE), jnl_fs_block_size) < os_file_size)
+		|| (header->jnl_deq && 0 != ((header_virtual_size - header->jnl_alq) % header->jnl_deq)))
 	{
-		send_msg(VARLSTCNT(8) ERR_JNLVSIZE, 6, JNL_LEN_STR(csd), header->virtual_size,
+		send_msg_csa(CSA_ARG(csa) VARLSTCNT(8) ERR_JNLVSIZE, 6, JNL_LEN_STR(csd), header->virtual_size,
 			 header->jnl_alq, header->jnl_deq, os_file_size, jnl_fs_block_size);
 		jpc->status = ERR_JNLVSIZE;
 		return ERR_JNLOPNERR;
@@ -199,8 +202,9 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 	VMS_ONLY(jb->buff_off = 0;)
 	jb->size = ROUND_DOWN2(csd->jnl_buffer_size * DISK_BLOCK_SIZE - jb->buff_off, jnl_fs_block_size);
 	/* Assert that journal buffer does NOT spill past the allocated journal buffer size in shared memory */
-	assert((sm_uc_ptr_t)&jb->buff[jb->buff_off + jb->size] < ((sm_uc_ptr_t)csa->nl + NODE_LOCAL_SPACE + JNL_SHARE_SIZE(csd)));
-	assert((sm_uc_ptr_t)jb == ((sm_uc_ptr_t)csa->nl + NODE_LOCAL_SPACE + JNL_NAME_EXP_SIZE));
+	assert((sm_uc_ptr_t)&jb->buff[jb->buff_off + jb->size] < ((sm_uc_ptr_t)csa->nl + NODE_LOCAL_SPACE(csd)
+											+ JNL_SHARE_SIZE(csd)));
+	assert((sm_uc_ptr_t)jb == ((sm_uc_ptr_t)csa->nl + NODE_LOCAL_SPACE(csd) + JNL_NAME_EXP_SIZE));
 	jb->freeaddr = jb->dskaddr = UNIX_ONLY(jb->fsync_dskaddr = ) header->end_of_data;
 	jb->fs_block_size = jnl_fs_block_size;
 	/* The following is to make sure that the data in jnl_buffer is aligned with the data in the
@@ -250,10 +254,10 @@ uint4 jnl_file_open_common(gd_region *reg, off_jnl_t os_file_size)
 		if (REPL_ENABLED(csd) && pool_init)
 			header->update_disabled = jnlpool_ctl->upd_disabled;
 	)
-	DO_FILE_WRITE(jpc->channel, 0, header, read_write_size, jpc->status, jpc->status2);
+	JNL_DO_FILE_WRITE(csa, csd->jnl_file_name, jpc->channel, 0, header, read_write_size, jpc->status, jpc->status2);
 	if (SS_NORMAL != jpc->status)
 	{
-		assert(FALSE);
+		assert(WBTEST_ENABLED(WBTEST_RECOVER_ENOSPC));
 		return ERR_JNLWRERR;
 	}
 	if (!jb->prev_jrec_time || !header->prev_jnl_file_name_length)

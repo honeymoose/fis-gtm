@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2006, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2006, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -58,6 +58,7 @@
 #ifdef GTM_CRYPT
 #include "gtmcrypt.h"
 #endif
+#include "gtmdbgflags.h"
 
 #define LOG_WAIT_FOR_JNL_RECS_PERIOD	(10 * 1000) /* ms */
 #define LOG_WAIT_FOR_JNLOPEN_PERIOD	(10 * 1000) /* ms */
@@ -78,17 +79,20 @@ GBLREF	int			gtmsource_msgbufsiz;
 GBLREF	seq_num			seq_num_zero, seq_num_one;
 GBLREF	gd_region		*gv_cur_region;
 GBLREF	FILE			*gtmsource_log_fp;
-GBLREF	FILE			*gtmsource_statslog_fp;
 GBLREF	gtmsource_state_t	gtmsource_state;
 GBLREF	uint4			process_id;
 
+LITREF char *jnl_file_state_lit[];
+
 error_def(ERR_JNLBADRECFMT);
 error_def(ERR_JNLEMPTY);
+error_def(ERR_JNLFILRDOPN);
 error_def(ERR_JNLRECINCMPL);
 error_def(ERR_NOPREVLINK);
 error_def(ERR_REPLBRKNTRANS);
 error_def(ERR_REPLCOMM);
 error_def(ERR_REPLFILIOERR);
+error_def(ERR_SEQNUMSEARCHTIMEOUT);
 error_def(ERR_TEXT);
 
 static	int4			num_tcom = -1;
@@ -139,6 +143,11 @@ static	int repl_read_file(repl_buff_t *rb)
 		assert(!fc->jfh->crash);
 		dskaddr = REAL_END_OF_DATA(fc);
 	}
+#	ifdef DEBUG
+	b->save_readaddr = b->readaddr;
+	b->save_dskaddr = dskaddr;
+	b->save_buffremaining = b->buffremaining;
+#	endif
 	/* Make sure we do not read beyond end of data in the journal file */
 	/* Note : This logic is always needed when journal file is pre-allocated.
 	 * With no pre-allocation, this logic is needed only when repl_read_file is called from
@@ -163,11 +172,11 @@ static	int repl_read_file(repl_buff_t *rb)
 	if ((off_t)-1 == lseek(fc->fd, (off_t)start_addr, SEEK_SET))
 	{
 		repl_errno = EREPL_JNLFILESEEK;
-		return (ERRNO);
+		return (errno);
 	}
 	READ_FILE(fc->fd, b->base + REPL_BLKSIZE(rb) - b->buffremaining - (b->readaddr - start_addr),
 		  end_addr - start_addr, nb);
-	status = ERRNO;
+	status = errno;
 	if (nb < (b->readaddr - start_addr))
 	{	/* This case means that we didn't read enough bytes to get from the alignment point in the disk file
 		 * to the start of the actual desired read (the offset we did the lseek to above).  This can't happen
@@ -199,16 +208,18 @@ static	int repl_next(repl_buff_t *rb)
 	uint4			maxreclen;
 	int			status, sav_buffremaining;
 	char			err_string[BUFSIZ];
-	GTMCRYPT_ONLY(
-		int				crypt_status;
-		enum jnl_record_type		rectype;
-		jnl_record			*rec;
-		jnl_string			*keystr;
-	)
+	repl_ctl_element	*backctl;
+#	ifdef GTM_CRYPT
+	int			gtmcrypt_errno;
+	enum jnl_record_type	rectype;
+	jnl_record		*rec;
+	jnl_string		*keystr;
+#	endif
 
 	b = &rb->buff[rb->buffindex];
 	b->recbuff += b->reclen; /* The next record */
 	b->recaddr += b->reclen;
+	backctl = rb->backctl;
 	if (b->recaddr == b->readaddr && b->buffremaining == 0)
 	{
 		/* Everything in this buffer processed */
@@ -217,7 +228,7 @@ static	int repl_next(repl_buff_t *rb)
 		b->buffremaining = REPL_BLKSIZE(rb);
 	}
 	if (b->recaddr == b->readaddr || b->reclen == 0 ||
-		(rb->backctl->eof_addr_final && (b->readaddr != REAL_END_OF_DATA(rb->fc)) && b->buffremaining))
+		(backctl->eof_addr_final && (b->readaddr != REAL_END_OF_DATA(rb->fc)) && b->buffremaining))
 	{
 		sav_buffremaining = b->buffremaining;
 		if ((status = repl_read_file(rb)) == SS_NORMAL)
@@ -240,7 +251,7 @@ static	int repl_next(repl_buff_t *rb)
 				MEMCPY_LIT(err_string, READ_ERR_STR);
 			else
 				MEMCPY_LIT(err_string, UNKNOWN_ERR_STR);
-			rts_error(VARLSTCNT(9) ERR_REPLFILIOERR, 2, rb->backctl->jnl_fn_len, rb->backctl->jnl_fn,
+			rts_error(VARLSTCNT(9) ERR_REPLFILIOERR, 2, backctl->jnl_fn_len, backctl->jnl_fn,
 			  	  ERR_TEXT, 2, LEN_AND_STR(err_string), status);
 		}
 	}
@@ -261,10 +272,9 @@ static	int repl_next(repl_buff_t *rb)
 				keystr = (jnl_string *)&rec->jrec_set_kill.mumps_node;
 				/* Assert that ZTWORMHOLE type record too has same layout as KILL/SET */
 				assert((sm_uc_ptr_t)keystr == (sm_uc_ptr_t)&rec->jrec_ztworm.ztworm_str);
-				DECODE_SET_KILL_ZKILL_ZTRIG(keystr, rec->prefix.forwptr, rb->backctl->encr_key_handle,
-							    crypt_status);
-				if (0 != crypt_status)
-					GC_RTS_ERROR(crypt_status, rb->backctl->jnl_fn);
+				MUR_DECRYPT_LOGICAL_RECS(keystr, rec->prefix.forwptr, backctl->encr_key_handle, gtmcrypt_errno);
+				if (0 != gtmcrypt_errno)
+					GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, rts_error, backctl->jnl_fn_len, backctl->jnl_fn);
 			}
 		}
 #		endif
@@ -383,7 +393,7 @@ static	int open_newer_gener_jnlfiles(gd_region *reg, repl_ctl_element *reg_ctl_e
 	}
 	/* Except the latest generation, mark the newly opened future generations CLOSED, or EMPTY.
 	 * We assume that when a new file is opened, the previous generation has been flushed to disk fully.
-	 */
+	C9M06-999999 */
 	for (ctl = reg_ctl_end, n = nopen; n; n--, ctl = ctl->next)
 	{
 		if (ctl->file_state == JNL_FILE_UNREAD)
@@ -440,7 +450,7 @@ static	int update_eof_addr(repl_ctl_element *ctl, int *eof_change)
 			F_READ_BLK_ALIGNED(fc->fd, 0, fc->jfh, REAL_JNL_HDR_LEN, status);
 			if (SS_NORMAL != status)
 				rts_error(VARLSTCNT(9) ERR_REPLFILIOERR, 2, ctl->jnl_fn_len, ctl->jnl_fn,
-						ERR_TEXT, 2, RTS_ERROR_LITERAL("Error in reading jfh in update_eof_addr"), status);
+						ERR_TEXT, 2, LEN_AND_LIT("Error in reading jfh in update_eof_addr"), status);
 			REPL_DPRINT2("Update EOF : Jnl file hdr refreshed from file for %s\n", ctl->jnl_fn);
 			ctl->eof_addr_final = TRUE; /* No more updates to fc->eof_addr for this journal file */
 		}
@@ -758,13 +768,17 @@ static void increase_buffer(unsigned char **buff, int *buflen, int buffer_needed
 	REPL_DPRINT3("Buff space shortage. Attempting to increase buff space. Curr buff space %d. Attempt increase to atleast %d\n",
 		     gtmsource_msgbufsiz, newbuffsize);
 	old_msgp = (unsigned char *)gtmsource_msgp;
-	if ((alloc_status = gtmsource_alloc_msgbuff(newbuffsize)) != SS_NORMAL)
+	if ((alloc_status = gtmsource_alloc_msgbuff(newbuffsize, FALSE)) != SS_NORMAL)
 	{
 		rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
 			  LEN_AND_LIT("Error extending buffer space while reading files. Malloc error"), alloc_status);
 	}
+	REPL_DPRINT3("Old gtmsource_msgp = 0x%llx; New gtmsource_msgp = 0x%llx\n", (long long)old_msgp, (long long)gtmsource_msgp);
+	REPL_DPRINT2("Old *buff = 0x%llx\n", *buff);
 	*buff = (unsigned char *)gtmsource_msgp + (*buff - old_msgp);
+	REPL_DPRINT2("New *buff = 0x%llx\n", *buff);
 	*buflen =(int)(gtmsource_msgbufsiz - (*buff - (unsigned char *)gtmsource_msgp));
+	REPL_DPRINT2("New remaining len = %ld\n", *buflen);
 	return;
 }
 
@@ -864,7 +878,7 @@ static	int read_transaction(repl_ctl_element *ctl, unsigned char **buff, int *bu
 			{
 				assert(FALSE);
 				rts_error(VARLSTCNT(7) ERR_REPLBRKNTRANS, 1, &read_jnl_seqno,
-						ERR_TEXT, 2, RTS_ERROR_LITERAL("Early EOF found"));
+						ERR_TEXT, 2, LEN_AND_LIT("Early EOF found"));
 			}
 		} else if (status == EREPL_JNLRECINCMPL)
 		{	/* Log warning message for every certain number of attempts. There might have been a crash and the file
@@ -1237,16 +1251,19 @@ static	tr_search_state_t position_read(repl_ctl_element *ctl, seq_num read_seqno
 			lo_addr = ctl->min_seqno_dskaddr;
 			hi_addr = b->recaddr + b->reclen;
 		} else
-		{ /* trying to locate min, better to do linear search */
+		{	/* trying to locate min, better to do linear search */
 			srch_func = do_linear_search;
 			lo_addr = ctl->min_seqno_dskaddr;
 			hi_addr = MAXUINT4;
-			if (read_seqno == ctl->seqno) /* we are positioned where we want to be, no need for read */
-			{
-				assert(lo_addr == b->recaddr);
+			/* read_seqno == ctl->seqno == ctl->min_seqno is a special case. But, don't know how that can happen without
+			 * lookback set and hence the assert below.
+			 */
+			assert((read_seqno != ctl->seqno) || ctl->lookback);
+			if ((read_seqno == ctl->seqno) && (lo_addr == b->recaddr))
+			{	/* we are positioned where we want to be, no need for a read */
 				assert(MIN_JNLREC_SIZE <= b->reclen);
-				DEBUG_ONLY(jrec = (jnl_record *)b->recbuff;)
-				DEBUG_ONLY(rectype = (enum jnl_record_type)jrec->prefix.jrec_type;)
+				DEBUG_ONLY(jrec = (jnl_record *)b->recbuff);
+				DEBUG_ONLY(rectype = (enum jnl_record_type)jrec->prefix.jrec_type);
 				assert(b->reclen == jrec->prefix.forwptr);
 				assert(IS_VALID_JNLREC(jrec, rb->fc->jfh));
 				assert(IS_REPLICATED(rectype));
@@ -1257,13 +1274,13 @@ static	tr_search_state_t position_read(repl_ctl_element *ctl, seq_num read_seqno
 			}
 		}
 	}
-#if defined(GTMSOURCE_READFILES_LINEAR_SEARCH_TEST)
+#	if defined(GTMSOURCE_READFILES_LINEAR_SEARCH_TEST)
 	srch_func = do_linear_search;
 	hi_addr = MAXUINT4;
-#elif defined(GTMSOURCE_READFILES_BINARY_SEARCH_TEST)
+#	elif defined(GTMSOURCE_READFILES_BINARY_SEARCH_TEST)
 	srch_func = do_binary_search;
 	hi_addr = rb->fc->eof_addr;
-#endif
+#	endif
 	REPL_DPRINT6("position_read: Using %s search to locate %llu in %s between %u and %u\n",
 			(srch_func == do_linear_search) ? "linear" : "binary", read_seqno, ctl->jnl_fn, lo_addr, hi_addr);
 	found = srch_func(ctl, lo_addr, hi_addr, read_seqno, &srch_status);
@@ -1289,7 +1306,11 @@ static	int read_and_merge(unsigned char *buff, int maxbufflen, seq_num read_jnl_
 	boolean_t		brkn_trans;
 	unsigned char		*seq_num_ptr, seq_num_str[32]; /* INT8_PRINT */
 	repl_ctl_element	*ctl;
+	int			wait_for_jnlopen_log_num = -1;
+	sgmnt_addrs		*csa;
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	trans_read = FALSE;
 	num_tcom = -1;
 	tot_tcom_len = 0;
@@ -1298,18 +1319,47 @@ static	int read_and_merge(unsigned char *buff, int maxbufflen, seq_num read_jnl_
 	total_wait_for_jnlopen = 0;
 	tcombuffp = gtmsource_tcombuff_start;
 	buff_avail = maxbufflen;
+	/* ensure that buff is always within gtmsource_msgp bounds (especially in case the buffer got expanded in the last call) */
+	assert((buff >= (uchar_ptr_t)gtmsource_msgp + REPL_MSG_HDRLEN)
+			&& (buff <= (uchar_ptr_t)gtmsource_msgp + gtmsource_msgbufsiz));
 	for (ctl = repl_ctl_list->next; ctl != NULL; ctl = ctl->next)
 		ctl->read_complete = FALSE;
 	for (pass = 1; !trans_read; pass++)
 	{
-		if (pass > 1)
+		if (1 < pass)
 		{
 			gtmsource_poll_actions(TRUE);
 			SHORT_SLEEP(GTMSOURCE_WAIT_FOR_JNLOPEN);
-			if ((total_wait_for_jnlopen += GTMSOURCE_WAIT_FOR_JNLOPEN) % LOG_WAIT_FOR_JNLOPEN_PERIOD == 0)
+			if (0 == ((total_wait_for_jnlopen += GTMSOURCE_WAIT_FOR_JNLOPEN) % LOG_WAIT_FOR_JNLOPEN_PERIOD))
+			{
+			    if (LOG_WAIT_FOR_JNLOPEN_TIMES > ++wait_for_jnlopen_log_num)
 				repl_log(gtmsource_log_fp, TRUE, TRUE, "REPL_WARN : Source server waited %dms for journal file(s) "
 					 "to be opened, or updated while attempting to read seqno %llu [0x%llx]. Check for "
 					 "problems with journaling\n", total_wait_for_jnlopen, read_jnl_seqno, read_jnl_seqno);
+			    else
+			    {
+				for (ctl = repl_ctl_list->next; NULL != ctl; ctl = ctl->next)
+				{
+					repl_log(gtmsource_log_fp, FALSE, FALSE, "DGB_INFO: Journal File: %s for Database File: %s;"
+						 " State: %s.", ctl->jnl_fn, ctl->reg->dyn.addr->fname,
+								  jnl_file_state_lit[ctl->file_state]);
+					if (JNL_FILE_OPEN == ctl->file_state)
+					{
+						csa = &FILE_INFO(ctl->reg)->s_addrs;
+						repl_log(gtmsource_log_fp, FALSE, FALSE, " "
+							"ctl->seqno = %llu [0x%llx]. [dskaddr = 0x%x,freeaddr = 0x%x]. "
+							"ctl->read_complete = %d\n",
+							ctl->seqno, ctl->seqno, csa->jnl->jnl_buff->dskaddr,
+							csa->jnl->jnl_buff->freeaddr, ctl->read_complete);
+					} else
+						repl_log(gtmsource_log_fp, FALSE, TRUE, "\n");
+				}
+				if (TREF(gtm_environment_init)
+					DEBUG_ONLY(&& (WBTEST_CLOSE_JNLFILE != gtm_white_box_test_case_number)))
+						gtm_fork_n_core();
+				rts_error(VARLSTCNT(4) ERR_SEQNUMSEARCHTIMEOUT, 2, &read_jnl_seqno, &read_jnl_seqno);
+			    }
+			}
 		}
 		read_len = read_regions(&buff, &buff_avail, pass > 1, &brkn_trans, read_jnl_seqno);
 		if (brkn_trans)
@@ -1340,14 +1390,21 @@ static	int read_regions(unsigned char **buff, int *buff_avail,
 	sgmnt_addrs		*csa;
 	jnlpool_ctl_ptr_t	jctl;
 	uint4			freeaddr;
+	DEBUG_ONLY(boolean_t	file_close;)
 
 	cumul_read = 0;
 	*brkn_trans = TRUE;
+	DEBUG_ONLY(file_close = FALSE;)
 	assert(repl_ctl_list->next != NULL);
 	jctl = jnlpool.jnlpool_ctl;
+	DEBUG_ONLY(GTM_WHITE_BOX_TEST(WBTEST_CLOSE_JNLFILE, file_close, TRUE);)
 	/* For each region */
 	for (ctl = repl_ctl_list->next, prev_ctl = repl_ctl_list; ctl != NULL && !trans_read; prev_ctl = ctl, ctl = ctl->next)
 	{
+#ifdef DEBUG
+		if (file_close)
+			ctl->file_state = JNL_FILE_CLOSED;
+#endif
 		found = TR_NOT_FOUND;
 		region = ctl->reg;
 		DEBUG_ONLY(loopcnt = 0;)
@@ -1361,7 +1418,7 @@ static	int read_regions(unsigned char **buff, int *buff_avail,
 				;
 			if (ctl == NULL || ctl->reg != region)
 			{	/* Hit the end of generation list for journal file */
-				if (!attempt_open_oldnew)
+				if (!attempt_open_oldnew DEBUG_ONLY( || file_close))
 				{	/* Reposition to skip prev_ctl */
 					REPL_DPRINT2("First pass...not opening newer gener file...skipping %s\n", prev_ctl->jnl_fn);
 					ctl = prev_ctl;
@@ -1621,12 +1678,12 @@ int gtmsource_readfiles(unsigned char *buff, int *data_len, int maxbufflen, bool
 	 * post-update value differ in their most significant 4-bytes. Since that is considered a virtually impossible
 	 * rare occurrence and since we want to avoid the overhead of doing a "grab_lock", we dont do that here.
 	 */
-	assert(buff == (unsigned char *)gtmsource_msgp + REPL_MSG_HDRLEN); /* else increasing buffer space will not work */
-	assert(maxbufflen == gtmsource_msgbufsiz - REPL_MSG_HDRLEN);
 	assert(REPL_MSG_HDRLEN == SIZEOF(jnldata_hdr_struct));
 	DEBUG_ONLY(loopcnt = 0;)
 	do
 	{
+		assert(buff == (unsigned char *)gtmsource_msgp + REPL_MSG_HDRLEN); /* else increasing buffer space will not work */
+		assert(maxbufflen == gtmsource_msgbufsiz - REPL_MSG_HDRLEN);
 		DEBUG_ONLY(loopcnt++);
 		file2pool = FALSE;
 		if (max_read_seqno > gtmsource_local->next_histinfo_seqno)
@@ -1637,6 +1694,7 @@ int gtmsource_readfiles(unsigned char *buff, int *data_len, int maxbufflen, bool
 		if (read_jnl_seqno == gtmsource_local->next_histinfo_seqno)
 		{	/* Request a REPL_HISTREC message be sent first before sending any more seqnos across */
 			gtmsource_state = gtmsource_local->gtmsource_state = GTMSOURCE_SEND_NEW_HISTINFO;
+			REPL_DPRINT1("REPL_HISTREC message first needs to be sent before any more seqnos can be sent across\n");
 			return 0;
 		}
 		read_addr = gtmsource_local->read_addr;
@@ -1711,6 +1769,11 @@ int gtmsource_readfiles(unsigned char *buff, int *data_len, int maxbufflen, bool
 			gtmsource_set_next_histinfo_seqno(TRUE);
 			if (GTMSOURCE_WAITING_FOR_CONNECTION == gtmsource_state)
 				return 0; /* Connection got reset in "gtmsource_set_next_histinfo_seqno" */
+			/* Since the buffer may have expanded, reposition buff to the beginning and set maxbufflen to the maximum
+			 * available size (as if this is the first time we came into the while loop)
+			 */
+			buff = (unsigned char *)gtmsource_msgp + REPL_MSG_HDRLEN;
+			maxbufflen = gtmsource_msgbufsiz - REPL_MSG_HDRLEN;
 		}
 	} while (TRUE);
 	if (file2pool)
@@ -1722,9 +1785,7 @@ int gtmsource_readfiles(unsigned char *buff, int *data_len, int maxbufflen, bool
 	gtmsource_local->read_addr = read_addr;
 	assert(read_jnl_seqno <= gtmsource_local->next_histinfo_seqno);
 	gtmsource_local->read_jnl_seqno = read_jnl_seqno;
-#ifdef GTMSOURCE_ALWAYS_READ_FILES
-	gtmsource_local->read_state = read_state = READ_FILE;
-#endif
+	GTMDBGFLAGS_NOFREQ_ONLY(GTMSOURCE_FORCE_READ_FILE_MODE, gtmsource_local->read_state = read_state = READ_FILE);
 	if (read_state == READ_POOL)
 	{
 		gtmsource_ctl_close(); /* no need to keep files open now that we are going to read from pool */
@@ -1883,7 +1944,7 @@ int gtmsource_update_zqgblmod_seqno_and_tn(seq_num resync_seqno)
 	assert(0 < max_zqgblmod_seqno);
 	assert(resync_seqno >= max_zqgblmod_seqno);
 	assert(!(FILE_INFO(jnlpool.jnlpool_dummy_reg)->s_addrs.now_crit));
-	GRAB_LOCK(jnlpool.jnlpool_dummy_reg, HANDLE_CONCUR_ONLINE_ROLLBACK);
+	grab_lock(jnlpool.jnlpool_dummy_reg, TRUE, HANDLE_CONCUR_ONLINE_ROLLBACK);
 	if (GTMSOURCE_HANDLE_ONLN_RLBK == gtmsource_state)
 	{
 		assert(process_id != jnlpool.gtmsource_local->gtmsource_srv_latch.u.parts.latch_pid);

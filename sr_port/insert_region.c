@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -54,7 +54,6 @@
 #include "dbfilop.h"
 #include "gtmmsg.h"
 #include "is_file_identical.h"
-#include "tp_grab_crit.h"
 #include "t_retry.h"
 #include "wcs_mm_recover.h"
 #include "gtmimagename.h"
@@ -205,7 +204,7 @@ tp_region	*insert_region(	gd_region	*reg,
 		 * 	tp_restart() (invoked through t_retry from gvcst_init) will open "reg" as well as get crit on it for us.
 		 */
 		DEBUG_ONLY(TREF(ok_to_call_wcs_recover) = TRUE;)
-		if (FALSE == tp_grab_crit(reg))		/* Attempt lockdown now */
+		if (FALSE == grab_crit_immediate(reg))		/* Attempt lockdown now */
 		{
 			DEBUG_ONLY(TREF(ok_to_call_wcs_recover) = FALSE;)
 			t_retry(cdb_sc_needcrit);	/* avoid deadlock -- restart transaction */
@@ -214,6 +213,17 @@ tp_region	*insert_region(	gd_region	*reg,
 		DEBUG_ONLY(TREF(ok_to_call_wcs_recover) = FALSE;)
 		assert(csa->now_crit);	/* ensure we have crit now */
 		CHECK_MM_DBFILEXT_REMAP_IF_NEEDED(csa, reg);
+#		ifdef UNIX
+		if (MISMATCH_ROOT_CYCLES(csa, csa->nl))
+		{	/* Going into this retry, we have already checked in tp_restart for moved root blocks in tp_reg_list.
+			 * Since we haven't yet checked this region, we check it here and reset clues for an globals in the
+			 * newly inserted region. We don't want to reset ALL gvt clues because the current retry may have made
+			 * use (and valid use at that) of clues for globals in other regions.
+			 */
+			RESET_ALL_GVT_CLUES_REG(csa);
+			csa->root_search_cycle = csa->nl->root_search_cycle;
+		}
+#		endif
 	}
 	DBG_CHECK_TP_REG_LIST_SORTING(*reg_list);
 	return tr_new;

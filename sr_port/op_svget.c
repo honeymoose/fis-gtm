@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -25,7 +25,7 @@
 #include "io.h"
 #include "iottdef.h"
 #include "jnl.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "stack_frame.h"
 #include "stringpool.h"
 #include "svnames.h"
@@ -49,7 +49,10 @@
 #include "get_reference.h"
 #include "dollar_quit.h"
 #ifdef UNIX
-#include "iormdef.h"
+#  include "iormdef.h"
+#  ifdef DEBUG
+#    include "wbox_test_init.h"
+#  endif
 #endif
 
 #define ESC_OFFSET		4
@@ -69,7 +72,6 @@ GBLREF mval		dollar_job;
 GBLREF uint4		dollar_zjob;
 GBLREF mval		dollar_zstatus;
 GBLREF mval		dollar_zstep;
-GBLREF int		dollar_zmaxtptime;
 GBLREF mval		dollar_zsource;
 GBLREF int4		dollar_zsystem;
 GBLREF int4		dollar_zeditor;
@@ -118,7 +120,7 @@ void op_svget(int varnum, mval *v)
 {
 	io_log_name	*tl;
 	int 		count;
-	unsigned int	ucount;
+	gtm_uint64_t	ucount;
 	char		*c1, *c2;
 	mval		*mvp;
 #	ifdef UNIX
@@ -127,6 +129,27 @@ void op_svget(int varnum, mval *v)
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
+#	if defined(UNIX) && defined(DEBUG)
+	if (gtm_white_box_test_case_enabled && (WBTEST_HUGE_ALLOC == gtm_white_box_test_case_number))
+	{
+		if (1 == gtm_white_box_test_case_count)
+			totalAlloc = totalAllocGta = totalRmalloc = totalRallocGta = totalUsed = totalUsedGta = 0xffff;
+		else if (2 == gtm_white_box_test_case_count)
+			totalAlloc = totalAllocGta = totalRmalloc = totalRallocGta = totalUsed = totalUsedGta = 0xfffffff;
+		else if (3 == gtm_white_box_test_case_count)
+		{
+#			ifdef GTM64
+			if (8 == SIZEOF(size_t))
+				totalAlloc = totalAllocGta = totalRmalloc = totalRallocGta
+					= totalUsed = totalUsedGta = 0xfffffffffffffff;
+			else
+#			endif
+				totalAlloc = totalAllocGta = totalRmalloc = totalRallocGta = totalUsed = totalUsedGta = 0xfffffff;
+		} else
+			totalAlloc = totalAllocGta = totalRmalloc = totalRallocGta = totalUsed
+				= totalUsedGta = GTM64_ONLY(SIZEOF(size_t)) NON_GTM64_ONLY(SIZEOF(size_t) > 4 ? 4 : SIZEOF(size_t));
+	}
+#	endif
 	switch (varnum)
 	{
 		case SV_HOROLOG:
@@ -282,7 +305,7 @@ void op_svget(int varnum, mval *v)
 			*v = TREF(dollar_zmode);
 			break;
 		case SV_ZMAXTPTIME:
-			i2mval(v, dollar_zmaxtptime);
+			i2mval(v, TREF(dollar_zmaxtptime));
 			break;
 		case SV_ZPOS:
 			getzposition(v);
@@ -385,16 +408,16 @@ void op_svget(int varnum, mval *v)
 			*v = dollar_ztexit;
 			break;
 		case SV_ZALLOCSTOR:
-			ucount = (unsigned int)(totalAlloc + totalAllocGta);
-			MV_FORCE_UMVAL(v, ucount);
+			ucount = (gtm_uint64_t)totalAlloc + (gtm_uint64_t)totalAllocGta;
+			ui82mval(v, ucount);
 			break;
 		case SV_ZREALSTOR:
-			ucount = (unsigned int)(totalRmalloc + totalRallocGta);
-			MV_FORCE_UMVAL(v, ucount);
+			ucount = (gtm_uint64_t)totalRmalloc + (gtm_uint64_t)totalRallocGta;
+			ui82mval(v, ucount);
 			break;
 		case SV_ZUSEDSTOR:
-			ucount = (unsigned int)(totalUsed + totalUsedGta);
-			MV_FORCE_UMVAL(v, ucount);
+			ucount = (gtm_uint64_t)totalUsed + (gtm_uint64_t)totalUsedGta;
+			ui82mval(v, ucount);
 			break;
 		case SV_ZCHSET:
 			v->mvtype = MV_STR;

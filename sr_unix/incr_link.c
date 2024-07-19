@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -113,14 +113,16 @@ bool incr_link (int file_desc, zro_ent *zro_entry)
 	pre_v5_mident	*pre_v5_routine_name;
 	urx_rtnref	urx_lcl_anchor;
 	int		order;
+	boolean_t	dynlits;
 	size_t		offset_correction;
 	unsigned char	*shdr, *rel_base;
 	mval		*curlit, *littop;
 	lab_tabent	*curlbe, *lbetop;
 	var_tabent	*curvar, *vartop;
 	char		name_buf[PATH_MAX+1];
-	int		name_buf_len;
+	int		name_buf_len, alloc_len;
 	char		marker[SIZEOF(JSB_MARKER) - 1];
+	char		*rw_rel_start;
 
 	AIX_ONLY(
 		FILHDR	  	hddr;
@@ -296,11 +298,13 @@ bool incr_link (int file_desc, zro_ent *zro_entry)
 	 *
 	 * Read-only releasable section
 	 */
+	dynlits = DYNAMIC_LITERALS_ENABLED(hdr);
+	rw_rel_start = RW_REL_START_ADR(hdr);	/* Marks end of R/O-release section and start of R/W-release section */
 	if (shlib)
 		rel_base = shdr;
 	else
 	{
-		sect_ro_rel_size = (unsigned int)((INTPTR_T)hdr->literal_adr - (INTPTR_T)hdr->ptext_adr);
+		sect_ro_rel_size = (unsigned int)((INTPTR_T)rw_rel_start - (INTPTR_T)hdr->ptext_adr);
 		sect_ro_rel = GTM_TEXT_ALLOC(sect_ro_rel_size);
 		/* It should be aligned well at this point but make a debug level check to verify */
 		assert((INTPTR_T)sect_ro_rel == ((INTPTR_T)sect_ro_rel & ~(LINKAGE_PSECT_BOUNDARY - 1)));
@@ -336,27 +340,32 @@ bool incr_link (int file_desc, zro_ent *zro_entry)
 	RELOCATE(hdr->ptext_end_adr, unsigned char *, rel_base);
 	RELOCATE(hdr->lnrtab_adr, lnr_tabent *, rel_base);
 	RELOCATE(hdr->literal_text_adr, unsigned char *, rel_base);
+	if (dynlits)
+		RELOCATE(hdr->literal_adr, mval *, rel_base);
 	/* Read-write releasable section */
-	sect_rw_rel_size = (int)((INTPTR_T)hdr->labtab_adr - (INTPTR_T)hdr->literal_adr);
+	sect_rw_rel_size = (int)((INTPTR_T)hdr->labtab_adr - (INTPTR_T)rw_rel_start);
 	sect_rw_rel = malloc(sect_rw_rel_size);
 	if (shlib)
-		memcpy(sect_rw_rel, shdr + (INTPTR_T)hdr->literal_adr, sect_rw_rel_size);
+		memcpy(sect_rw_rel, shdr + (INTPTR_T)rw_rel_start, sect_rw_rel_size);
 	else
 	{
 		DOREADRC_OBJFILE(file_desc, sect_rw_rel, sect_rw_rel_size, status);
 		if (0 != status)
 			zl_error(file_desc, zro_entry, ERR_INVOBJ, 0, 0, 0, 0);
 	}
-	offset_correction = (size_t)hdr->literal_adr;
+	offset_correction = (size_t)rw_rel_start;
 	rel_base = sect_rw_rel - offset_correction;
-	RELOCATE(hdr->literal_adr, mval *, rel_base);
+	if (!dynlits)
+		RELOCATE(hdr->literal_adr, mval *, rel_base);
 	RELOCATE(hdr->vartab_adr, var_tabent *, rel_base);
 	/* Also read-write releasable is the linkage section which had no initial value and was thus
 	 * not resident in the object. The values in this section will be setup later by addr_fix()
-	 * and/or auto-zlink.
+	 * and/or auto-zlink. Note we always allocate at least one element here just so we don't get
+	 * the potentially unaligned "null string" address provided by gtm_malloc() when a zero
+	 * length is requested.
 	 */
-	/* Allocate 1 extra, to align linkage_adr */
-	hdr->linkage_adr = (lnk_tabent *)malloc((hdr->linkage_len * SIZEOF(lnk_tabent)) + SIZEOF(lnk_tabent));
+	alloc_len = hdr->linkage_len * SIZEOF(lnk_tabent);
+	hdr->linkage_adr = (lnk_tabent *)malloc((0 != alloc_len) ? alloc_len : SIZEOF(lnk_tabent));
 	assert(PADLEN(hdr->linkage_adr, SIZEOF(lnk_tabent) == 0));
 	assert(((UINTPTR_T)hdr->linkage_adr % SIZEOF(lnk_tabent)) == 0);
 	memset((char *)hdr->linkage_adr, 0, (hdr->linkage_len * SIZEOF(lnk_tabent)));
@@ -364,9 +373,12 @@ bool incr_link (int file_desc, zro_ent *zro_entry)
 	 * variable table entries since they both point to the offsets from the beginning of the
 	 * literal text pool. The relocations for the linkage section is done in addr_fix()
 	 */
-	for (curlit = hdr->literal_adr, littop = curlit + hdr->literal_len; curlit < littop; ++curlit)
-		if (curlit->str.len)
-			RELOCATE(curlit->str.addr, char *, hdr->literal_text_adr);
+	if (!dynlits)
+	{
+		for (curlit = hdr->literal_adr, littop = curlit + hdr->literal_len; curlit < littop; ++curlit)
+			if (curlit->str.len)
+				RELOCATE(curlit->str.addr, char *, hdr->literal_text_adr);
+	}
 	for (curvar = hdr->vartab_adr, vartop = curvar + hdr->vartab_len; curvar < vartop; ++curvar)
 	{
 		assert(0 < curvar->var_name.len);
@@ -464,6 +476,8 @@ bool incr_link (int file_desc, zro_ent *zro_entry)
 		old_rhead->temp_size = hdr->temp_size;
 		old_rhead->linkage_adr = hdr->linkage_adr;
 		old_rhead->literal_adr = hdr->literal_adr;
+		old_rhead->literal_text_adr = hdr->literal_text_adr;
+		old_rhead->literal_len = hdr->literal_len;
 		old_rhead = (rhdtyp *)old_rhead->old_rhead_adr;
 	}
 	/* Add local unresolves to global chain freeing elements that already existed in the global chain */

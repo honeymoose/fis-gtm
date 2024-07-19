@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -30,14 +30,14 @@
 #include "gtm_ctype.h"
 #include "gtm_string.h"
 #include "error.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "stack_frame.h"
 #include "subscript.h"
 #include "svnames.h"
 #include "mprof.h"
 #include "outofband.h"
 #include "op.h"
-#include "lv_val.h"		/* needed for "callg.h" */
+#include "lv_val.h"		/* Needed for callg.h. */
 #include "callg.h"
 #include "gtmmsg.h"
 #include "str2gvargs.h"
@@ -46,50 +46,64 @@ GBLREF 	boolean_t		is_tracing_on;
 GBLREF 	stack_frame		*frame_pointer;
 GBLREF 	mval			dollar_job;
 GBLREF	uint4			process_id;
-GBLREF	int * volatile		var_on_cstack_ptr;		/* volatile so that nothing gets optimized out */
+GBLREF	int * volatile		var_on_cstack_ptr;		/* Volatile so that nothing gets optimized out. */
 GBLREF	int4			gtm_trigger_depth;
 
-STATICDEF boolean_t 		save_to_gbl = TRUE;		/* indicates whether profiling info is to be saved to db */
-STATICDEF boolean_t 		mdb_ch_set;			/* indicates whether we can rely on mdb_condition_handler and issue
-								 * an rts_error */
-STATICDEF gtm_uint64_t		child_system, child_user;	/* store system and user CPU time for child processes */
-STATICDEF gtm_uint64_t		process_system, process_user;	/* store system and user CPU time for current process */
-STATICDEF mstr			mprof_mstr;			/* area to hold global and subscripts */
-STATICDEF boolean_t 		use_realtime_flag = FALSE;	/* indicates whether clock_gettime is unable to use CLOCK_MONOTONIC
-								 * flag and so should use CLOCK_REALTIME instead */
+STATICDEF boolean_t 		save_to_gbl = TRUE;		/* Indicates whether profiling info is to be saved to db. */
+STATICDEF boolean_t 		mdb_ch_set;			/* Indicates whether we can rely on mdb_condition_handler and issue
+								 * an rts_error. */
+STATICDEF gtm_uint64_t		child_system, child_user;	/* Store system and user CPU time for child processes. */
+STATICDEF gtm_uint64_t		process_system, process_user;	/* Store system and user CPU time for current process. */
+STATICDEF mstr			mprof_mstr;			/* Area to hold global and subscripts. */
+STATICDEF boolean_t 		use_realtime_flag = FALSE;	/* Indicates whether clock_gettime is unable to use CLOCK_MONOTONIC
+								 * flag and so should use CLOCK_REALTIME instead. */
+#ifdef __osf__
+STATICDEF struct rusage		last_usage = {0, 0};		/* Contains the last value obtained via getrusage() on Tru64. */
+#endif
 
 LITDEF  MIDENT_CONST(above_routine, "*above*");
 
-#define CHILDREN_TIME		"*CHILDREN"	/* label to store CPU time for child processes */
-#define PROCESS_TIME		"*RUN"		/* label to store CPU time for current process */
+#ifdef DEBUG
+#  define RUNTIME_LIMIT		604800000000.0	/* Not a long because on 32-bit platforms longs are only 4 bytes. */
+#endif
+
+#define CHILDREN_TIME		"*CHILDREN"	/* Label to store CPU time for child processes. */
+#define PROCESS_TIME		"*RUN"		/* Label to store CPU time for current process. */
 #define MPROF_NULL_LABEL	"^"
 #define MPROF_FOR_LOOP		"FOR_LOOP"
 
-/* on VMS we do not record the child processes' time */
+/* On VMS we do not record the child processes' time. */
 #ifdef UNIX
 #  define TIMES			times_usec
 #  define CHILDREN_TIMES	children_times_usec
-#  define MPROF_RTS_ERROR(x)	rts_error x
+#  define MPROF_RTS_ERROR(x)	rts_error_csa x
 #elif defined(VMS)
 #  define TIMES			get_cputime
 #  define MPROF_RTS_ERROR(x)		\
 {					\
 	if (mdb_ch_set)			\
-		rts_error x;		\
+		rts_error_csa x;	\
 	else				\
 	{				\
-		gtm_putmsg x;		\
+		gtm_putmsg_csa x;	\
 		exit(EXIT_FAILURE);	\
 	}				\
 }
 #endif
 
-#define UPDATE_TIME(x)	x->e.usr_time += ((TREF(mprof_ptr))->tcurr.tms_utime - (TREF(mprof_ptr))->tprev.tms_utime);	\
-			x->e.sys_time += ((TREF(mprof_ptr))->tcurr.tms_stime - (TREF(mprof_ptr))->tprev.tms_stime);	\
-			x->e.elp_time += ((TREF(mprof_ptr))->tcurr.tms_etime - (TREF(mprof_ptr))->tprev.tms_etime);
+#define UPDATE_TIME(x)													\
+{															\
+	x->e.usr_time += ((TREF(mprof_ptr))->tcurr.tms_utime - (TREF(mprof_ptr))->tprev.tms_utime);			\
+	x->e.sys_time += ((TREF(mprof_ptr))->tcurr.tms_stime - (TREF(mprof_ptr))->tprev.tms_stime);			\
+	x->e.elp_time += ((TREF(mprof_ptr))->tcurr.tms_etime - (TREF(mprof_ptr))->tprev.tms_etime);			\
+	/* It should be a reasonable assumption that in debug no M process will use more than a week of either user,	\
+	 * system, or even absolute runtime.										\
+	 */														\
+	assert((x->e.usr_time < RUNTIME_LIMIT) && (x->e.sys_time < RUNTIME_LIMIT) && (x->e.elp_time < RUNTIME_LIMIT));	\
+}
 
-#define RTS_ERROR_VIEWNOTFOUND(x)	MPROF_RTS_ERROR((VARLSTCNT(8) ERR_VIEWNOTFOUND, 2, gvn->str.len, gvn->str.addr, \
-						ERR_TEXT, 2, RTS_ERROR_STRING(x)));
+#define RTS_ERROR_VIEWNOTFOUND(x)	MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_VIEWNOTFOUND, 2, gvn->str.len,	\
+						gvn->str.addr, ERR_TEXT, 2, RTS_ERROR_STRING(x)));
 
 
 /* do the MPROF initialization */
@@ -107,7 +121,7 @@ LITDEF  MIDENT_CONST(above_routine, "*above*");
 	(TREF(prof_fp))->rout_name = NULL;		\
 	(TREF(prof_fp))->label_name = NULL;
 
-/* monotonic flag for clock_gettime() is defined differently on every platform */
+/* Monotonic flag for clock_gettime() is defined differently on every platform. */
 #ifndef CLOCK_MONOTONIC
 #  ifdef __sparc
 #    define CLOCK_MONOTONIC CLOCK_HIGHRES
@@ -117,7 +131,6 @@ LITDEF  MIDENT_CONST(above_routine, "*above*");
 #endif
 
 error_def(ERR_MAXNRSUBSCRIPTS);
-error_def(ERR_MAXTRACELEVEL);
 error_def(ERR_NOTGBL);
 error_def(ERR_STRUNXEOR);
 error_def(ERR_SYSCALL);
@@ -128,16 +141,35 @@ error_def(ERR_VIEWNOTFOUND);
 #ifdef UNIX
 STATICFNDEF void times_usec(ext_tms *curr)
 {
-	int	res;
-	struct	rusage usage;
-        struct	timespec elp_time;
+	int		res;
+	struct rusage	usage;
+        struct timespec	elp_time;
 
 	res = getrusage(RUSAGE_SELF, &usage);
-	if (res == -1)
-		MPROF_RTS_ERROR((VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("getrusage"), CALLFROM, errno));
-	curr->tms_utime = (usage.ru_utime.tv_sec * 1000000) + usage.ru_utime.tv_usec;
-	curr->tms_stime = (usage.ru_stime.tv_sec * 1000000) + usage.ru_stime.tv_usec;
-	/* also start recording the elapsed time */
+	if (-1 == res)
+		MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("getrusage"), CALLFROM, errno));
+#	ifdef __osf__
+	/* On Tru64 getrusage sometimes fails to increment the seconds value when the microseconds wrap around at 1M. If we detect
+	 * this, we make a second call to getrusage if so. A more complete check would be to also verify whether the new seconds
+	 * value is less than the previous one, but we anyway have an assert in UPDATE_TIME that would catch that, and our testing
+	 * on Tru64 has not shown that type of faulty behavior.
+	 */
+	if (((usage.ru_utime.tv_sec == last_usage.ru_utime.tv_sec) && (usage.ru_utime.tv_usec < last_usage.ru_utime.tv_usec))
+	    || ((usage.ru_stime.tv_sec == last_usage.ru_stime.tv_sec) && (usage.ru_stime.tv_usec < last_usage.ru_stime.tv_usec)))
+	{
+		DEBUG_ONLY(last_usage = usage);
+		res = getrusage(RUSAGE_SELF, &usage);
+		if (-1 == res)
+			MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("getrusage"), CALLFROM, errno));
+		/* In debug also ensure that a subsequent call to getrusage restored the seconds value. */
+		assert((usage.ru_utime.tv_sec > last_usage.ru_utime.tv_sec)
+			|| (usage.ru_stime.tv_sec > last_usage.ru_stime.tv_sec));
+	}
+	last_usage = usage;
+#	endif
+	curr->tms_utime = (usage.ru_utime.tv_sec * (gtm_uint64_t)1000000) + usage.ru_utime.tv_usec;
+	curr->tms_stime = (usage.ru_stime.tv_sec * (gtm_uint64_t)1000000) + usage.ru_stime.tv_usec;
+	/* Also start recording the elapsed time. */
 	while (TRUE)
 	{
 		res = clock_gettime(use_realtime_flag ? CLOCK_REALTIME : CLOCK_MONOTONIC, &elp_time);
@@ -148,24 +180,25 @@ STATICFNDEF void times_usec(ext_tms *curr)
 				use_realtime_flag = TRUE;
 				continue;
 			} else
-				MPROF_RTS_ERROR((VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("clock_gettime"), CALLFROM, errno));
+				MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5,
+					LEN_AND_LIT("clock_gettime"), CALLFROM, errno));
 		}
 		break;
 	}
-	curr->tms_etime = (elp_time.tv_sec * 1000000) + (elp_time.tv_nsec / 1000);
+	curr->tms_etime = (elp_time.tv_sec * (gtm_uint64_t)1000000) + (elp_time.tv_nsec / 1000);
 	return;
 }
 
 STATICFNDEF void child_times_usec(void)
 {
-	int res;
-	struct rusage usage;
+	int		res;
+	struct rusage	usage;
 
 	res = getrusage(RUSAGE_CHILDREN, &usage);
 	if (res == -1)
-		MPROF_RTS_ERROR((VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("getrusage"), CALLFROM, errno));
-	child_user = (usage.ru_utime.tv_sec * 1000000) + usage.ru_utime.tv_usec;
-	child_system = (usage.ru_stime.tv_sec * 1000000) + usage.ru_stime.tv_usec;
+		MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("getrusage"), CALLFROM, errno));
+	child_user = (usage.ru_utime.tv_sec * (gtm_uint64_t)1000000) + usage.ru_utime.tv_usec;
+	child_system = (usage.ru_stime.tv_sec * (gtm_uint64_t)1000000) + usage.ru_stime.tv_usec;
 	return;
 }
 #else
@@ -176,63 +209,59 @@ STATICFNDEF void get_cputime (ext_tms *curr)
 	int	jpi_code = JPI$_CPUTIM;
 
 	if ((status = lib$getjpi(&jpi_code, &process_id, 0, &cpu_time_used, 0, 0)) != SS$_NORMAL)
-		MPROF_RTS_ERROR((VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("LIB$GETJPI"), CALLFROM, status));
+		MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(8) ERR_SYSCALL, 5, LEN_AND_LIT("LIB$GETJPI"), CALLFROM, status));
 	curr->tms_utime = cpu_time_used;
 	curr->tms_stime = 0;
 	return;
 }
 #endif
 
-/* Enables tracing and ensures that all critical structures are initialized */
+/* Enables tracing and ensures that all critical structures are initialized. */
 void turn_tracing_on(mval *gvn, boolean_t from_env, boolean_t save_gbl)
 {
-	ext_tms		curr;
 	trace_entry	tmp_trc_tbl_entry;
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
 	mdb_ch_set = !from_env;
-	/* if tracing is on explicitly, or if it is implicit with saving */
+	/* If tracing is on explicitly, or if it is implicit with saving. */
 	if (save_gbl || !from_env)
 	{
 		if (is_tracing_on)
 		{
-			gtm_putmsg(VARLSTCNT(1) ERR_TRACINGON);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_TRACINGON);
 			return;
 		}
 		if ((0 == gvn->str.len) || ('^' != gvn->str.addr[0]))
-			MPROF_RTS_ERROR((VARLSTCNT(4) ERR_NOTGBL, 2, gvn->str.len, gvn->str.addr));
+			MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(4) ERR_NOTGBL, 2, gvn->str.len, gvn->str.addr));
 	}
-	/* the following should only be a one-time operation */
+	/* The following should only be a one-time operation. */
 	if (!TREF(mprof_ptr))
 	{
 		TREF(mprof_ptr) = (mprof_wrapper *)malloc(SIZEOF(mprof_wrapper));
 		memset(TREF(mprof_ptr), 0, SIZEOF(mprof_wrapper));
 	}
-	/* only need to have the gvn if we are going to save the data */
+	/* Only need to have the gvn if we are going to save the data. */
 	if (save_gbl && (0 < gvn->str.len))
 	{
 		parse_gvn(gvn);
 		(TREF(mprof_ptr))->gbl_to_fill = *gvn;
-		(TREF(mprof_ptr))->gbl_to_fill.str.addr = (char *)malloc(gvn->str.len); /* len was already set up */
+		(TREF(mprof_ptr))->gbl_to_fill.str.addr = (char *)malloc(gvn->str.len); /* Since len was already set up. */
 		memcpy((TREF(mprof_ptr))->gbl_to_fill.str.addr, gvn->str.addr, gvn->str.len);
 	}
-	/* preallocate some space */
+	/* Preallocate some space. */
 	if (!(TREF(mprof_ptr))->pcavailbase)
 	{
 		(TREF(mprof_ptr))->pcavailbase = (char **)malloc(PROFCALLOC_DSBLKSIZE);
 		*(TREF(mprof_ptr))->pcavailbase = 0;
 	}
 	(TREF(mprof_ptr))->pcavailptr = (TREF(mprof_ptr))->pcavailbase;
-	(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - SIZEOF(char *);
+	(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - OFFSET_LEN;
 	memset((TREF(mprof_ptr))->pcavailptr + 1, 0, (TREF(mprof_ptr))->pcavail);
-	curr = (TREF(mprof_ptr))->tprev;
-	TIMES(&curr);
+	TIMES(&(TREF(mprof_ptr))->tprev);
 	UNIX_ONLY(child_times_usec();)
 	mprof_stack_init();
-	/* if tracing is started explicitly, we are in a good frame, so we can
-	 * initialize things and start counting time
-	 */
+	/* If tracing is started explicitly, we are in a good frame, so we can initialize things and start counting time. */
 	if (!from_env)
 	{
 		TREF(prof_fp) = mprof_stack_push();
@@ -240,22 +269,22 @@ void turn_tracing_on(mval *gvn, boolean_t from_env, boolean_t save_gbl)
 		tmp_trc_tbl_entry.rout_name = NULL;
 		tmp_trc_tbl_entry.label_name = NULL;
 		(TREF(mprof_ptr))->curr_tblnd = (TREF(mprof_ptr))->head_tblnd = NULL;
-		(TREF(prof_fp))->start.tms_stime = curr.tms_stime;
-		(TREF(prof_fp))->start.tms_utime = curr.tms_utime;
-		(TREF(prof_fp))->start.tms_etime = curr.tms_etime;
+		(TREF(prof_fp))->start.tms_stime = (TREF(mprof_ptr))->tprev.tms_stime;
+		(TREF(prof_fp))->start.tms_utime = (TREF(mprof_ptr))->tprev.tms_utime;
+		(TREF(prof_fp))->start.tms_etime = (TREF(mprof_ptr))->tprev.tms_etime;
 		(TREF(prof_fp))->carryover.tms_stime = 0;
 		(TREF(prof_fp))->carryover.tms_utime = 0;
 		(TREF(prof_fp))->carryover.tms_etime = 0;
 		(TREF(prof_fp))->dummy_stack_count = 0;
 		(TREF(prof_fp))->rout_name = (TREF(prof_fp))->label_name = NULL;
 	}
-	/* make necessary xfer_table substitutions before we begin */
+	/* Make necessary xfer_table substitutions before we begin. */
 	if (!is_tracing_on)
 	{
 		POPULATE_PROFILING_TABLE();
 		is_tracing_on = TRUE;
 	}
-	/* remember if we need to save results to a global at the end */
+	/* Remember if we need to save results to a global at the end. */
 	if (!save_gbl)
 		save_to_gbl = FALSE;
 	mdb_ch_set = TRUE;
@@ -263,7 +292,7 @@ void turn_tracing_on(mval *gvn, boolean_t from_env, boolean_t save_gbl)
 }
 
 /* Disables tracing and properly disposes of allocated resources; additionally,
- * saves data to the database if save_to_gbl was set to TRUE
+ * saves data to the database if save_to_gbl was set to TRUE.
  */
 void turn_tracing_off(mval *gvn)
 {
@@ -277,7 +306,7 @@ void turn_tracing_off(mval *gvn)
 	UNIX_ONLY(child_times_usec();)
 	process_system = (TREF(mprof_ptr))->tcurr.tms_stime;
 	process_user = (TREF(mprof_ptr))->tcurr.tms_utime;
-	/* update the time of previous M line if there was one */
+	/* Update the time of previous M line if there was one. */
 	if (NULL != (TREF(mprof_ptr))->curr_tblnd)
 	{
 		UPDATE_TIME((TREF(mprof_ptr))->curr_tblnd);
@@ -285,8 +314,8 @@ void turn_tracing_off(mval *gvn)
 	if (NULL != gvn)
 		parse_gvn(gvn);
 	assert(!save_to_gbl || (0 != (TREF(mprof_ptr))->gbl_to_fill.str.addr));
-	/* if tracing was initialized from an environment variable, and it had a proper global name, save results
-	 * to that global; otherwise, just toss the collected data
+	/* If tracing was initialized from an environment variable, and it had a proper global name, save results
+	 * to that global; otherwise, just toss the collected data.
 	 */
 	if (save_to_gbl)
 	{
@@ -302,8 +331,8 @@ void turn_tracing_off(mval *gvn)
 	is_tracing_on = (TREF(mprof_ptr))->is_tracing_ini = FALSE;
 	mprof_stack_free();
 	(TREF(mprof_ptr))->pcavailptr = (TREF(mprof_ptr))->pcavailbase;
-	(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - SIZEOF(char *);
-	CLEAR_PROFILING_TABLE();	/* restore the original xfer_table links */
+	(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - OFFSET_LEN;
+	CLEAR_PROFILING_TABLE();	/* Restore the original xfer_table links. */
 	TREF(prof_fp) = NULL;
 	return;
 }
@@ -320,7 +349,7 @@ void forchkhandler(char *return_address)
 
 	SETUP_THREADGBL_ACCESS;
         get_entryref_information(TRUE, &tmp_trc_tbl_entry);
-	/* starting tracing now; save the info about the current FOR loop */
+	/* Starting tracing now; save the info about the current FOR loop. */
 	if (FALSE == (TREF(mprof_ptr))->is_tracing_ini)
 	{
 		(TREF(mprof_ptr))->is_tracing_ini = TRUE;
@@ -335,24 +364,24 @@ void forchkhandler(char *return_address)
 	(TREF(mprof_ptr))->curr_tblnd =
 		(mprof_tree *)mprof_tree_insert(&((TREF(mprof_ptr))->head_tblnd), &tmp_trc_tbl_entry);
 	if (NULL == (TREF(mprof_ptr))->curr_tblnd->loop_link)
-	{	/* first FOR for this node */
+	{	/* First FOR for this node. */
 		for_node = (mprof_tree *)new_for_node(&tmp_trc_tbl_entry, return_address);
 		for_node->e.count = 1;
 		for_node->e.loop_level = 1;
 		(TREF(mprof_ptr))->curr_tblnd->loop_link = (mprof_tree *)for_node;
 		return;
 	}
-	/* some FORs have been already recorded for this line, so keep checking for more */
+	/* Some FORs have been already recorded for this line, so keep checking for more. */
 	for_link = (mprof_tree *)(TREF(mprof_ptr))->curr_tblnd->loop_link;
 	for_level_on_line = 1;
 	while (TRUE)
-	{	/* same FOR, so just update the count */
+	{	/* Same FOR, so just update the count. */
 		if (for_link->e.raddr == return_address)
 		{
 			for_link->e.count++;
 			break;
 		}
-		/* new FOR for this line */
+		/* New FOR for this line. */
 		if (NULL == for_link->loop_link)
 		{
 			for_node = (mprof_tree *)new_for_node(&tmp_trc_tbl_entry, return_address);
@@ -361,7 +390,7 @@ void forchkhandler(char *return_address)
 			for_link->loop_link = (mprof_tree *)for_node;
 			break;
 		} else
-		{	/* same FOR as last one, so increase the loop level for the line and keep searching */
+		{	/* Same FOR as last one, so increase the loop level for the line and keep searching. */
 			for_link = (mprof_tree *)for_link->loop_link;
 			for_level_on_line++;
 		}
@@ -369,9 +398,7 @@ void forchkhandler(char *return_address)
 	return;
 }
 
-/* Records the typical line-to-line deltas in CPU and absolute time.
- * Called on each linestart and linefetch.
- */
+/* Records the typical line-to-line deltas in CPU and absolute time. Called on each linestart and linefetch. */
 void pcurrpos(void)
 {
 	trace_entry	tmp_trc_tbl_entry;
@@ -384,8 +411,8 @@ void pcurrpos(void)
 	}
 	assert(TREF(mprof_ptr));
 	assert(TREF(prof_fp));
-	TIMES(&(TREF(mprof_ptr))->tcurr); /* remember the new time */
-	/* update the time of previous M line */
+	TIMES(&(TREF(mprof_ptr))->tcurr); /* Remember the new time. */
+	/* Update the time of previous M line. */
 	if (NULL != (TREF(mprof_ptr))->curr_tblnd)
 	{
 		UPDATE_TIME((TREF(mprof_ptr))->curr_tblnd);
@@ -444,9 +471,9 @@ void new_prof_frame(int real_frame)
 	}
 	assert(TREF(mprof_ptr));
 	assert(TREF(prof_fp));
-	/* a call to a routine, not IF or FOR with a DO */
+	/* A call to a routine, not IF or FOR with a DO. */
 	if (real_frame)
-	{	/* update the time of the line in the parent frame */
+	{	/* Update the time of the line in the parent frame. */
 		if (NULL != (TREF(mprof_ptr))->curr_tblnd)
 		{
 			TIMES(&(TREF(mprof_ptr))->tcurr);
@@ -454,7 +481,7 @@ void new_prof_frame(int real_frame)
 		}
 		(TREF(prof_fp))->curr_node = (TREF(mprof_ptr))->curr_tblnd;
 		(TREF(mprof_ptr))->curr_tblnd = NULL;
-		/* create a new frame on the stack */
+		/* Create a new frame on the stack. */
 		TREF(prof_fp) = mprof_stack_push();
 		(TREF(prof_fp))->rout_name = NULL;
 		(TREF(prof_fp))->label_name = NULL;
@@ -478,40 +505,40 @@ void unw_prof_frame(void)
 	mprof_tree	*t;
 	ext_tms		carryover;
 	stack_frame	*save_fp;
-	unsigned int    frame_usr_time, frame_sys_time, frame_elp_time;
+	gtm_uint64_t	frame_usr_time, frame_sys_time, frame_elp_time;
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
 	assert(TREF(mprof_ptr));
-	/* do not assert on prof_fp not being NULL, as it will be NULL in
-	 * case we quit from a function without ever disabling tracing
+	/* Do not assert on prof_fp not being NULL, as it will be NULL in
+	 * case we quit from a function without ever disabling tracing.
 	 */
 	if (NULL == TREF(prof_fp))
 		return;
-	/* we are leaving a real frame, not an IF or FOR with a DO */
+	/* We are leaving a real frame, not an IF or FOR with a DO. */
 	if (0 >= (TREF(prof_fp))->dummy_stack_count)
 	{
 		TIMES(&(TREF(mprof_ptr))->tcurr);
-		/* update the time of last line in this frame before returning */
+		/* Update the time of last line in this frame before returning. */
 		if (NULL != (TREF(mprof_ptr))->curr_tblnd)
 		{
 			UPDATE_TIME((TREF(mprof_ptr))->curr_tblnd);
 		}
 		get_entryref_information(TRUE, &tmp_trc_tbl_entry);
-		/* if prof_fp is NULL, it was set so in get_entryref_information, which means
+		/* If prof_fp is NULL, it was set so in get_entryref_information, which means
 		 * that we are not in a valid frame, so there is no point in recording timing for
-		 * some unreal label; besides, the line timing has already been updated
+		 * some unreal label; besides, the line timing has already been updated.
 		 */
 		if (NULL == TREF(prof_fp))
 			return;
 		if ((TREF(prof_fp))->rout_name == &above_routine)
-		{	/* it should have been filled in get_entryref_information */
+		{	/* It should have been filled in get_entryref_information. */
 			e.label_name = tmp_trc_tbl_entry.label_name;
 			e.rout_name = tmp_trc_tbl_entry.rout_name;
 		} else
-		{	/* note that this memory allocated for the label and routine names might need
+		{	/* Note that this memory allocated for the label and routine names might need
 			 * to be reclaimed, so set up the corresponding flag, reset the allocation count,
-			 * and the address of the current allocation bucket
+			 * and the address of the current allocation bucket.
 			 */
 			TREF(mprof_alloc_reclaim) = TRUE;
 			TREF(mprof_reclaim_addr) = (char *)(TREF(mprof_ptr))->pcavailptr;
@@ -524,16 +551,16 @@ void unw_prof_frame(void)
 			e.rout_name->len = (TREF(prof_fp))->rout_name->len;
 			e.rout_name->addr = pcalloc((unsigned int)e.rout_name->len);
 			memcpy(e.rout_name->addr, (TREF(prof_fp))->rout_name->addr, (TREF(prof_fp))->rout_name->len);
-			TREF(mprof_alloc_reclaim) = FALSE;	/* memory should not have to be reclaimed after this point,
-							 * so stop updating the count */
+			TREF(mprof_alloc_reclaim) = FALSE;	/* Memory should not have to be reclaimed after this point,
+							 	 * so stop updating the count. */
 		}
 		e.line_num = -1;
-		/* insert/find a frame entry into/in the MPROF tree, -1 indicating that it is not a
-		 * real line number, but rather an aggregation of several lines (comprising a label)
+		/* Insert/find a frame entry into/in the MPROF tree, -1 indicating that it is not a
+		 * real line number, but rather an aggregation of several lines (comprising a label).
 		 */
 		t = mprof_tree_insert(&((TREF(mprof_ptr))->head_tblnd), &e);
-		TREF(mprof_reclaim_cnt) = 0;	/* reset the memory allocation count */
-		/* update count and timing (from prof_fp) of frame I'm leaving */
+		TREF(mprof_reclaim_cnt) = 0;	/* Reset the memory allocation count. */
+		/* Update count and timing (from prof_fp) of frame I'm leaving. */
 		t->e.count++;
 		frame_usr_time = ((TREF(mprof_ptr))->tcurr.tms_utime
 			- (TREF(prof_fp))->start.tms_utime - (TREF(prof_fp))->carryover.tms_utime);
@@ -544,21 +571,21 @@ void unw_prof_frame(void)
 		t->e.usr_time += frame_usr_time;
 		t->e.sys_time += frame_sys_time;
 		t->e.elp_time += frame_elp_time;
-		/* not the first frame on the stack */
+		/* Not the first frame on the stack. */
 		if ((TREF(prof_fp))->prev)
 		{
 			carryover = (TREF(prof_fp))->carryover;
-			/* move back up to parent frame */
+			/* Move back up to parent frame. */
 			TREF(prof_fp) = mprof_stack_pop();
 			(TREF(prof_fp))->carryover.tms_utime += (frame_usr_time + carryover.tms_utime);
 			(TREF(prof_fp))->carryover.tms_stime += (frame_sys_time + carryover.tms_stime);
 			(TREF(prof_fp))->carryover.tms_etime += (frame_elp_time + carryover.tms_etime);
-			/* restore the context of the parent frame */
+			/* Restore the context of the parent frame. */
 			(TREF(mprof_ptr))->tprev = (TREF(mprof_ptr))->tcurr;
 			(TREF(mprof_ptr))->curr_tblnd = (TREF(prof_fp))->curr_node;
 			(TREF(prof_fp))->curr_node = NULL;
 		} else
-		{	/* This should only be true only if the View command is not at the top-most stack level, in which case
+		{	/* This should only be true only if the VIEW command is not at the top-most stack level, in which case
 			 * add profiling information for the current frame. To prevent stack underflow, add a new frame before
 			 * unwinding from this frame.
 			 */
@@ -569,15 +596,15 @@ void unw_prof_frame(void)
 			save_fp = frame_pointer;
 #			ifdef GTM_TRIGGER
 			if (frame_pointer->type & SFT_TRIGR)
-			{	/* in a trigger base frame, old_frame_pointer is NULL */
+			{	/* In a trigger base frame, old_frame_pointer is NULL. */
 				assert(NULL == frame_pointer->old_frame_pointer);
-				/* have a trigger baseframe, pick up stack continuation frame_pointer stored by base_frame() */
+				/* Have a trigger baseframe, pick up stack continuation frame_pointer stored by base_frame(). */
 				frame_pointer = *(stack_frame **)(frame_pointer + 1);
 			} else
 #			endif
 			frame_pointer = frame_pointer->old_frame_pointer;
-			/* if frame_pointer is NULL, we are likely dealing with call-ins, so there is no point trying to unwind
-			 * any further; just restore the frame_pointer and return
+			/* If frame_pointer is NULL, we are likely dealing with call-ins, so there is no point trying to unwind
+			 * any further; just restore the frame_pointer and return.
 			 */
 			if (!frame_pointer)
 			{
@@ -586,9 +613,9 @@ void unw_prof_frame(void)
 			}
 			get_entryref_information(FALSE, NULL);
 			frame_pointer = save_fp;
-			/* if for some reason we made it all the way here, but prof_fp was still set to NULL by
+			/* If for some reason we made it all the way here, but prof_fp was still set to NULL by
 			 * get_entryref_information(), then just silently quit out of this routine to prevent unwinding into some
-			 * nowhere land
+			 * nowhere land.
 			 */
 			if (NULL == TREF(prof_fp))
 				return;
@@ -596,7 +623,7 @@ void unw_prof_frame(void)
 			(TREF(prof_fp))->carryover.tms_utime = 0;
 			(TREF(prof_fp))->carryover.tms_stime = 0;
 			(TREF(prof_fp))->carryover.tms_etime = 0;
-			/* tag it, so that next time it picks up label/routine info from current loc */
+			/* Tag it, so that next time it picks up label/routine info from current loc. */
 			(TREF(prof_fp))->rout_name = (mident *)&above_routine;
 			(TREF(prof_fp))->label_name = NULL;
 			(TREF(prof_fp))->dummy_stack_count = 0;
@@ -606,15 +633,18 @@ void unw_prof_frame(void)
 	return;
 }
 
-/* Allocate storage for profiling information */
+/* Allocate storage for profiling information. */
 char *pcalloc(unsigned int n)
 {
 	char **x;
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
-	GTM64_ONLY(n = ((n + 7) & ~7);) 	/* same logic applied for alignment */
-	NON_GTM64_ONLY(n = ((n + 3) & ~3);) 	/* make sure that it is quad-word aliged */
+#	if defined (GTM64) || defined(__osf__) || defined(VMS)
+	n = ((n + 7) & ~7); 	/* Same logic applied for alignment. */
+#	else
+	n = ((n + 3) & ~3); 	/* Make sure that it is quad-word aligned. */
+#	endif
 	if (n > (TREF(mprof_ptr))->pcavail)
 	{
 		if (*(TREF(mprof_ptr))->pcavailptr)
@@ -626,14 +656,14 @@ char *pcalloc(unsigned int n)
 			(TREF(mprof_ptr))->pcavailptr = x;
 			*(TREF(mprof_ptr))->pcavailptr = NULL;
 		}
-		(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - SIZEOF(char *);
+		(TREF(mprof_ptr))->pcavail = PROFCALLOC_DSBLKSIZE - OFFSET_LEN;
 		memset((TREF(mprof_ptr))->pcavailptr + 1, 0, (TREF(mprof_ptr))->pcavail);
 	}
 	(TREF(mprof_ptr))->pcavail -= n;
 	if (TREF(mprof_alloc_reclaim))
-		(TREF(mprof_reclaim_cnt)) += n;	/* update the memory allocation count if needed */
+		(TREF(mprof_reclaim_cnt)) += n;	/* Update the memory allocation count if needed. */
 	assert((TREF(mprof_ptr))->pcavail >= 0);
-	return (char *)(TREF(mprof_ptr))->pcavailptr + (TREF(mprof_ptr))->pcavail + SIZEOF(char *);
+	return (char *)(TREF(mprof_ptr))->pcavailptr + (TREF(mprof_ptr))->pcavail + OFFSET_LEN;
 }
 
 /* Reclaim storage previously allocated by pcalloc(). */
@@ -643,13 +673,13 @@ void mprof_reclaim_slots(void)
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
-	if (0 < TREF(mprof_reclaim_cnt))	/* in case some memory needs to be reclaimed, do so */
+	if (0 < TREF(mprof_reclaim_cnt))	/* In case some memory needs to be reclaimed, do so. */
 	{
-		alloc_diff = (PROFCALLOC_DSBLKSIZE - (TREF(mprof_ptr))->pcavail - SIZEOF(char *));
-		if (alloc_diff >= TREF(mprof_reclaim_cnt)) /* allocation did not need a new bucket, we are good */
+		alloc_diff = (PROFCALLOC_DSBLKSIZE - (TREF(mprof_ptr))->pcavail - OFFSET_LEN);
+		if (alloc_diff >= TREF(mprof_reclaim_cnt)) /* Allocation did not need a new bucket, we are good. */
 			(TREF(mprof_ptr))->pcavail += TREF(mprof_reclaim_cnt);
 		else
-		{	/* go back to the previous allocation bucket and set the pcavail accordingly for the older bucket */
+		{	/* Go back to the previous allocation bucket and set the pcavail accordingly for the older bucket. */
 			(TREF(mprof_ptr))->pcavailptr = (char **)TREF(mprof_reclaim_addr);
 			(TREF(mprof_ptr))->pcavail = (TREF(mprof_reclaim_cnt) - alloc_diff);
 		}
@@ -663,9 +693,9 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 	int		count, arg_index, subsc_len, tmp_str_len;
 	INTPTR_T	start_point;
 	mval		data;
-	char		dataval[96];		/* big enough for data value */
-	unsigned char	subsval[12];		/* see i2asc + 1 for null char */
-	unsigned char	asc_line_num[12];	/* to hold the ascii equivalent of the line_num */
+	char		dataval[96];		/* Big enough for data value. */
+	unsigned char	subsval[12];		/* See i2asc + 1 for null char. */
+	unsigned char	asc_line_num[12];	/* To hold the ascii equivalent of the line_num. */
 	unsigned char	*tmpnum, *end;
 	mval		*spt;
 	DCL_THREADGBL_ACCESS;
@@ -675,7 +705,7 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 		return;
 	count = (int)(TREF(mprof_ptr))->gvargs.count;
 	spt = &(TREF(mprof_ptr))->subsc[count];
-	/* global name --> ^PREFIX(<OPTIONAL ARGUMENTS>, "rout-name", "label-name", "line-num", "forloop") */
+	/* Global name --> ^PREFIX(<OPTIONAL ARGUMENTS>, "rout-name", "label-name", "line-num", "forloop"). */
 	spt->mvtype = MV_STR;
 	spt->str.len = p->e.rout_name->len;
 	spt->str.addr = (char *)pcalloc((unsigned int)spt->str.len);
@@ -688,7 +718,7 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 		spt->str.addr = (char *)pcalloc((unsigned int)spt->str.len);
 		memcpy(spt->str.addr, p->e.label_name->addr, spt->str.len);
 	} else
-	{	/* place holder before first label */
+	{	/* Place holder before first label. */
 		spt->str.len = SIZEOF(MPROF_NULL_LABEL) - 1;
 		spt->str.addr = (char *)pcalloc((unsigned int)spt->str.len);
 		memcpy(spt->str.addr, MPROF_NULL_LABEL, spt->str.len);
@@ -705,7 +735,7 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 		count++;
 		spt++;
 	}
-	/* for FOR loops */
+	/* For FOR loops. */
 	if (is_for)
 	{
 		spt->mvtype = MV_STR;
@@ -713,7 +743,7 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 		spt->str.addr = (char *)pcalloc(SIZEOF(MPROF_FOR_LOOP) - 1);
 		memcpy(spt->str.addr, MPROF_FOR_LOOP, spt->str.len);
 		(TREF(mprof_ptr))->gvargs.args[count++] = spt++;
-		/* write for level into the subscript as well */
+		/* Write for level into the subscript as well. */
 		spt->mvtype = MV_STR;
 		tmpnum = i2asc(subsval, p->e.loop_level);
 		spt->str.len = INTCAST(tmpnum - subsval);
@@ -724,31 +754,31 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 	(TREF(mprof_ptr))->gvargs.count = count;
 	callg((INTPTR_T(*)(intszofptr_t count_arg, ...))op_gvname, (gparam_list *)&(TREF(mprof_ptr))->gvargs);
 	(TREF(mprof_ptr))->gvargs.count = (TREF(mprof_ptr))->curr_num_subscripts;
-	/* data --> "count:cpu-time in user mode:cpu-time in sys mode:cpu-time total" */
+	/* Data --> 'count:cpu-time in user mode:cpu-time in sys mode:cpu-time total'. */
 	start_point = (INTPTR_T)&dataval[0];
 	/* get count */
 	tmpnum = (unsigned char *)&dataval[0];
 	end = i2asc(tmpnum, p->e.count);
 	tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
-	/* for non-FOR stuff get CPU time as well */
+	/* For non-FOR stuff get CPU time as well. */
 	if (!is_for)
 	{
 		*tmpnum = ':';
 		tmpnum++;
-		end = i2asc(tmpnum, p->e.usr_time);
+		end = i2ascl(tmpnum, p->e.usr_time);
 		tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 #		ifndef VMS
 		*tmpnum = ':';
 		tmpnum++;
-		end = i2asc(tmpnum, p->e.sys_time);
+		end = i2ascl(tmpnum, p->e.sys_time);
 		tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 		*tmpnum = ':';
 		tmpnum++;
-		end = i2asc(tmpnum, p->e.sys_time + p->e.usr_time);
+		end = i2ascl(tmpnum, p->e.sys_time + p->e.usr_time);
 		tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 		*tmpnum = ':';
 		tmpnum++;
-		end = i2asc(tmpnum, p->e.elp_time);
+		end = i2ascl(tmpnum, p->e.elp_time);
 		tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 #		endif
 	}
@@ -761,13 +791,13 @@ void crt_gbl(mprof_tree *p, boolean_t is_for)
 	return;
 }
 
-/* Save total CPU times for the current and all child processes */
+/* Save total CPU times for the current and all child processes. */
 STATICFNDEF void insert_total_times(boolean_t for_process)
 {
 	int		count;
 	INTPTR_T	start_point;
 	mval		data;
-	char		dataval[96];		/* big enough for data value */
+	char		dataval[96];		/* Big enough for data value. */
 	unsigned char	*tmpnum, *end;
 	mval		*spt;
 	DCL_THREADGBL_ACCESS;
@@ -794,23 +824,23 @@ STATICFNDEF void insert_total_times(boolean_t for_process)
 	start_point = (INTPTR_T)&dataval[0];
 	tmpnum = (unsigned char *)&dataval[0];
 	if (for_process)
-		end = i2asc(tmpnum, process_user);
+		end = i2ascl(tmpnum, process_user);
 	else
-		end = i2asc(tmpnum, child_user);
+		end = i2ascl(tmpnum, child_user);
 	tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 	*tmpnum = ':';
 	tmpnum++;
 	if (for_process)
-		end = i2asc(tmpnum, process_system);
+		end = i2ascl(tmpnum, process_system);
 	else
-		end = i2asc(tmpnum, child_system);
+		end = i2ascl(tmpnum, child_system);
 	tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 	*tmpnum = ':';
 	tmpnum++;
 	if (for_process)
-		end = i2asc(tmpnum, process_user + process_system);
+		end = i2ascl(tmpnum, process_user + process_system);
 	else
-		end = i2asc(tmpnum, child_user + child_system);
+		end = i2ascl(tmpnum, child_user + child_system);
 	tmpnum += ((end - tmpnum) > 0) ? (end - tmpnum) : (tmpnum - end);
 	data.mvtype = MV_STR;
 	data.str.len = (((INTPTR_T)tmpnum - start_point) > 0)
@@ -830,7 +860,6 @@ STATICFNDEF void get_entryref_information(boolean_t line, trace_entry *tmp_trc_t
 	stack_frame	*fp;
 	int		status;
 	unsigned char	*addr, *out_addr;
-	unsigned char	temp[OFFSET_LEN];
 	int4		*line_table, *last_line, len, ct;
 	int4		offset, in_addr_offset;
 	unsigned long	user_time, system_time;
@@ -844,7 +873,7 @@ STATICFNDEF void get_entryref_information(boolean_t line, trace_entry *tmp_trc_t
 		if (fp->type & SFT_TRIGR)
 		{
 			assert(NULL == fp->old_frame_pointer);
-			/* have a trigger baseframe, pick up stack continuation frame_pointer stored by base_frame() */
+			/* Have a trigger baseframe, pick up stack continuation frame_pointer stored by base_frame(). */
 			fp = *(stack_frame **)(fp + 1);
 		}
 #		endif
@@ -906,21 +935,21 @@ STATICFNDEF void get_entryref_information(boolean_t line, trace_entry *tmp_trc_t
 	return;
 }
 
-/* Parses the global variable name that the information will be dumped into, to make sure it is a valid gvn */
+/* Parses the global variable name that the information will be dumped into, to make sure it is a valid gvn. */
 STATICFNDEF void parse_gvn(mval *gvn)
 {
 	boolean_t 		dot_seen;
 	mval			*spt;
 	char			*c_top, *c_ref, ch;
 	unsigned int		count = 0;
-	char			*mpsp;		/* pointer into mprof_mstr area */
+	char			*mpsp;		/* Pointer into mprof_mstr area. */
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
 	c_ref = gvn->str.addr;
 	c_top = c_ref + gvn->str.len;
 	if (!gvn->str.len || ('^' != *c_ref++))
-		MPROF_RTS_ERROR((VARLSTCNT(4) ERR_NOTGBL, 2, gvn->str.len, gvn->str.addr));
+		MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(4) ERR_NOTGBL, 2, gvn->str.len, gvn->str.addr));
 	if (mprof_mstr.len < 4 * gvn->str.len)
 	{	/* We are going to return an array of mvals pointing to global-name and subscript. We should
 		 * never be needing more than 4 * gvn->str.len since the only expandable entity that can be
@@ -936,7 +965,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 		mprof_mstr.addr = (char *)malloc(mprof_mstr.len);
 	}
 	mpsp = mprof_mstr.addr;
-	/* parse the global variable passed to insert the information */
+	/* Parse the global variable passed to insert the information. */
 	spt = &(TREF(mprof_ptr))->subsc[0];
 	spt->mvtype = MV_STR;
 	spt->str.addr = mpsp;
@@ -952,7 +981,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 	spt->str.len = INTCAST(mpsp - spt->str.addr);
 	(TREF(mprof_ptr))->gvargs.args[count++] = spt++;
 	spt->str.addr = (char *)mpsp;
-	/* process subscripts, if any */
+	/* Process subscripts, if any. */
 	if (c_ref++ < c_top)
 	{
 		for ( ; c_ref < c_top; )
@@ -981,7 +1010,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 					RTS_ERROR_VIEWNOTFOUND("Intrinsic value is incomplete");
 				if (*c_ref != 'J' && *c_ref != 'j')
 					RTS_ERROR_VIEWNOTFOUND("Intrinsic value passed is not $j");
-				c_ref++; 	/* past 'J' */
+				c_ref++; 	/* Past 'J'. */
 				if ((c_ref < c_top) && (ISALPHA_ASCII(*c_ref)))
 				{
 					ch = *c_ref;
@@ -995,7 +1024,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 					} else
 						RTS_ERROR_VIEWNOTFOUND("Intrinsic value is incomplete");
 				}
-				assert(10 > dollar_job.str.len);	/* to take care of 4 * gvn->str.len allocation above */
+				assert(10 > dollar_job.str.len);	/* To take care of 4 * gvn->str.len allocation above. */
 				memcpy(mpsp, dollar_job.str.addr, dollar_job.str.len);
 				mpsp += dollar_job.str.len;
 			} else
@@ -1031,7 +1060,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 			}
 			spt->str.len = INTCAST(mpsp - spt->str.addr);
 			if (MAX_GVSUBSCRIPTS <= count)
-				MPROF_RTS_ERROR((VARLSTCNT(1) ERR_MAXNRSUBSCRIPTS));
+				MPROF_RTS_ERROR((CSA_ARG(NULL) VARLSTCNT(1) ERR_MAXNRSUBSCRIPTS));
 			(TREF(mprof_ptr))->gvargs.args[count++] = spt++;
 			if (',' != *c_ref)
 				break;
@@ -1046,7 +1075,7 @@ STATICFNDEF void parse_gvn(mval *gvn)
 		if (++c_ref < c_top)
 			RTS_ERROR_VIEWNOTFOUND("There are trailing characters after the global name");
 	}
-	assert((char *)mpsp <= mprof_mstr.addr + mprof_mstr.len);	/* ensure we haven't overrun the malloced buffer */
+	assert((char *)mpsp <= mprof_mstr.addr + mprof_mstr.len);	/* Ensure we haven't overrun the malloced buffer. */
 	(TREF(mprof_ptr))->gvargs.count = count;
 	(TREF(mprof_ptr))->curr_num_subscripts = (int)(TREF(mprof_ptr))->gvargs.count;
 	return;
@@ -1065,10 +1094,10 @@ void stack_leak_check(void)
 	if (NULL == var_on_cstack_ptr)
 		var_on_cstack_ptr = &var_on_cstack;
 	if ((&var_on_cstack != var_on_cstack_ptr)
-#	    ifdef	__i386	/* for 32-bit Linux allow a two pointer variation to accommodate ZHELP */
-	    && ((SIZEOF(var_on_cstack) * 2) < ABS(&var_on_cstack - var_on_cstack_ptr))
-#	    endif
-	    )
-		GTMASSERT;
+#	     ifdef __i386	/* For 32-bit Linux allow a two pointer variation to accommodate ZHELP. */
+	     && ((SIZEOF(var_on_cstack) * 2) < ABS(&var_on_cstack - var_on_cstack_ptr))
+#	     endif
+	     )
+	     	assertpro(FALSE);
 	return;
 }

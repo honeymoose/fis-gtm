@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2005, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2005, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -36,7 +36,8 @@ enum db_ver
 {
 	GDSNOVER = -1,
 	GDSV4 = 0,
-	GDSV5,
+	GDSV5 = 1,
+	GDSV6 = 1, /*GDSV5 and GDSV6 have same value because block format is same for these two version*/
 	GDSVLAST
 };
 #define GDSVCURR ((enum db_ver)(GDSVLAST - 1))
@@ -65,6 +66,9 @@ enum mdb_ver
 			 * New fields(before_trunc_total_blks, after_trunc_total_blks, before_trunc_free_blocks
 			 *	before_trunc_file_size) for fixing interrupted MUPIP REORG -TRUNCATE.
 			 */
+	GDSMV60000,	/* New freeze_on_fail field for anticipatory freeze; the wc_blocked field moved to shared memory */
+	GDSMV60001,
+	GDSMV60002,	/* New field mutex_spin_parms.mutex_que_entry_space_size for configurable mutex queue size */
 	GDSMVLAST
 };
 #define GDSMVCURR ((enum mdb_ver)(GDSMVLAST - 1))

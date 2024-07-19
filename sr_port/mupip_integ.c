@@ -94,6 +94,7 @@
 GBLDEF unsigned char		mu_int_root_level;
 GBLDEF int4			mu_int_adj[MAX_BT_DEPTH + 1];
 GBLDEF uint4			mu_int_errknt;
+GBLDEF uint4			mu_int_skipreg_cnt=0;
 GBLDEF uint4			mu_int_blks[MAX_BT_DEPTH + 1];
 GBLDEF uint4			mu_int_offset[MAX_BT_DEPTH + 1];
 GBLDEF uint4			mu_int_recs[MAX_BT_DEPTH + 1];
@@ -122,12 +123,12 @@ GBLDEF sgmnt_data		mu_int_data;
 GBLDEF unsigned char		*mu_int_master;
 GBLDEF trans_num		largest_tn;
 GBLDEF int4			mu_int_blks_to_upgrd;
+GBLDEF span_node_integ		*sndata;
 /* The following global variable is used to store the encryption information for the current database. The
  * variable is initialized in mu_int_init(mupip integ -file <file.dat>) and mu_int_reg(mupip integ -reg <reg_name>). */
 GTMCRYPT_ONLY(
 	GBLDEF	gtmcrypt_key_t	mu_int_encrypt_key_handle;
 )
-
 GBLREF bool			mu_ctrly_occurred;
 GBLREF bool			mu_ctrlc_occurred;
 GBLREF bool			error_mupip;
@@ -162,7 +163,10 @@ error_def(ERR_DBTNRESET);
 error_def(ERR_INTEGERRS);
 error_def(ERR_MUNOACTION);
 error_def(ERR_MUNOFINISH);
+error_def(ERR_MUNOTALLINTEG);
 error_def(ERR_MUPCLIERR);
+error_def(ERR_DBSPANGLOINCMP);
+error_def(ERR_DBSPANCHUNKORD);
 
 void mupip_integ(void)
 {
@@ -187,7 +191,12 @@ void mupip_integ(void)
 		unsigned short	ss_file_len = GTM_PATH_MAX;
 	)
 	sgmnt_data_ptr_t	csd;
+	span_node_integ		span_node_data;
 
+	sndata = &span_node_data;
+	sndata->sn_cnt = 0;
+	sndata->sn_blk_cnt = 0;
+	sndata->sn_type = SN_NOT;
 	error_mupip = FALSE;
 	if (NULL == gv_target)
 		gv_target = (gv_namehead *)targ_alloc(DUMMY_GLOBAL_VARIABLE_LEN, NULL, NULL);
@@ -265,9 +274,8 @@ void mupip_integ(void)
                 if (!grlist)
                 {
 			error_mupip = TRUE;
-			mu_int_errknt++;
-			mu_int_err(ERR_DBNOREGION, 0, 0, 0, 0, 0, 0, 0);
-                        mupip_exit(ERR_MUNOACTION);
+			gtm_putmsg(VARLSTCNT(1) ERR_DBNOREGION);
+			mupip_exit(ERR_MUNOACTION);
                 }
 		rptr = grlist;
 	} else
@@ -324,7 +332,7 @@ void mupip_integ(void)
 			assert(NULL != rptr);
 			if (!mupfndfil(rptr->reg, NULL))
 			{
-				mu_int_errknt++;
+				mu_int_skipreg_cnt++;
 				rptr = rptr->fPtr;
 				if (NULL == rptr)
 					break;
@@ -454,9 +462,9 @@ void mupip_integ(void)
  			gv_target->act = trees->act;
  			gv_target->ver = trees->ver;
  			gv_altkey->prev = 0;
- 			gv_altkey->top = MAX_KEY_SZ;
 			assert(trees->keysize == strlen(trees->key));
  			gv_altkey->end = trees->keysize;
+			assert(gv_altkey->end + 2 <= gv_altkey->top);
  			memcpy(gv_altkey->base, trees->key, gv_altkey->end);
  			gv_altkey->base[gv_altkey->end++] = '\0';
  			gv_altkey->base[gv_altkey->end] = '\0';
@@ -464,6 +472,30 @@ void mupip_integ(void)
  				act_in_gvt();
 			if (mu_int_blk(trees->root, MAX_BT_DEPTH, TRUE, gv_altkey->base, gv_altkey->end, &dummy, 0, 0))
 			{
+				/* We are done with the INTEG CHECK for the current GVT, but if the spanning node INTEG
+				 * check is not finished, either of the following two are occurred.
+				 */
+				if (SPAN_NODE == sndata->sn_type)
+				{ /* ERROR 1: There is discontinuity in the spanning node blocks;
+				   * adjacent spanning block is missing.
+				   */
+					mu_int_plen = mu_int_root_level + 1;
+					mu_int_err(ERR_DBSPANGLOINCMP, TRUE, FALSE, sndata->span_node_buf, sndata->key_len,
+							&dummy, 0, 0);
+					sndata->sn_blk_cnt += sndata->span_blk_cnt;
+					mu_int_plen = 0;
+					sndata->sn_type = SN_NOT;
+				}
+				if (2 == sndata->sn_type)
+				{ /* ERROR 2: Spanning-node-block occurred in the middle of non-spanning block */
+					mu_int_plen = mu_int_root_level + 1;
+					mu_int_err(ERR_DBSPANCHUNKORD, TRUE, FALSE, sndata->span_node_buf, sndata->key_len,
+							&dummy, 0, 0);
+					sndata->sn_blk_cnt += sndata->span_blk_cnt;
+					mu_int_plen = 0;
+					mu_int_plen = 0;
+					sndata->sn_type = SN_NOT;
+				}
 				if (full)
 				{
 					if (trees->root == dir_root)
@@ -627,6 +659,11 @@ void mupip_integ(void)
 				(mu_int_data.trans_hist.total_blks + mu_int_data.bplmap - 1) / mu_int_data.bplmap,
 				mu_dir_recs + mu_index_recs + mu_data_recs, mu_data_adj + mu_index_adj);
 		}
+		if(sndata->sn_cnt)
+		{
+			util_out_print("[Spanning Nodes:!UL ; Blocks:!UL]", TRUE, sndata->sn_cnt, sndata->sn_blk_cnt);
+			/*[span_node:<no of span-node in DB>; blks: <total number of spanning blocks used by all span-node>]*/
+		}
 		if (largest_tn)
 		{
 			mu_int_err(ERR_DBTNLTCTN, 0, 0, 0, 0, 0, 0, 0);
@@ -671,6 +708,8 @@ void mupip_integ(void)
 					if (mu_int_blks_to_upgrd != csd->blks_to_upgrd)
 						csd->blks_to_upgrd = mu_int_blks_to_upgrd;
 				}
+				csd->span_node_absent = (sndata->sn_cnt) ? FALSE : TRUE;
+				csd->maxkeysz_assured = (maxkey_errors) ? FALSE : TRUE;
 				region_freeze(gv_cur_region, FALSE, FALSE, FALSE);
 				fc = gv_cur_region->dyn.addr->file_cntl;
 				fc->op = FC_WRITE;
@@ -687,10 +726,10 @@ void mupip_integ(void)
 #			ifdef GTM_SNAPSHOT
 			else
 			{
-				assert(cs_addrs->snapshot_in_prog);
+				assert(SNAPSHOTS_IN_PROG(cs_addrs));
 				assert(NULL != cs_addrs->ss_ctx);
 				ss_release(&cs_addrs->ss_ctx);
-				cs_addrs->snapshot_in_prog = FALSE;
+				CLEAR_SNAPSHOTS_IN_PROG(cs_addrs);
 			}
 #			endif
 			rptr = rptr->fPtr;
@@ -776,5 +815,7 @@ void mupip_integ(void)
 	}
 	if (0 != total_errors)
 		mupip_exit(ERR_INTEGERRS);
+	if (0 != mu_int_skipreg_cnt)
+		mupip_exit(ERR_MUNOTALLINTEG);
 	mupip_exit(SS_NORMAL);
 }

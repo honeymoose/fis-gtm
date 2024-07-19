@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -45,6 +45,7 @@ GBLREF	unsigned char		rdfail_detail;
 GBLREF	inctn_opcode_t		inctn_opcode;
 
 error_def(ERR_GVKILLFAIL);
+error_def(ERR_IGNBMPMRKFREE);
 
 void	gvcst_expand_free_subtree(kill_set *ks_head)
 {
@@ -66,6 +67,7 @@ void	gvcst_expand_free_subtree(kill_set *ks_head)
 	trans_num		ret_tn;
 	inctn_opcode_t		save_inctn_opcode;
 	bt_rec_ptr_t		bt;
+	unsigned int		level;
 
 	csa = cs_addrs;
 	csd = cs_data;
@@ -89,6 +91,9 @@ void	gvcst_expand_free_subtree(kill_set *ks_head)
 					 * and the restart logic will handle it appropriately.
 					 */
 					free(temp_buff);
+					rel_crit(gv_cur_region);
+					send_msg_csa(CSA_ARG(csa) VARLSTCNT(6) ERR_IGNBMPMRKFREE, 4, REG_LEN_STR(gv_cur_region),
+							DB_LEN_STR(gv_cur_region));
 					return;
 				}
 #				endif
@@ -104,7 +109,7 @@ void	gvcst_expand_free_subtree(kill_set *ks_head)
 				if (!(bp = (blk_hdr_ptr_t)t_qread(blk, (sm_int_ptr_t)&cycle, &cr)))
 				{	/* This should have worked because t_qread was done in crit */
 					free(temp_buff);
-					rts_error(VARLSTCNT(4) ERR_GVKILLFAIL, 2, 1, &rdfail_detail);
+					rts_error_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_GVKILLFAIL, 2, 1, &rdfail_detail);
 				}
 				if (NULL != cr)
 				{	/* It is possible that t_qread returned a buffer from first_tp_srch_status.
@@ -138,7 +143,7 @@ void	gvcst_expand_free_subtree(kill_set *ks_head)
 						assert(FALSE);
 						kill_error = cdb_sc_rmisalign;
 						free(temp_buff);
-						rts_error(VARLSTCNT(4) ERR_GVKILLFAIL, 2, 1, &kill_error);
+						rts_error_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_GVKILLFAIL, 2, 1, &kill_error);
 					}
 					GET_LONG(temp_long, (block_id_ptr_t)((sm_uc_ptr_t)rp1 - SIZEOF(block_id)));
 					if (dollar_tlevel)
@@ -151,8 +156,9 @@ void	gvcst_expand_free_subtree(kill_set *ks_head)
 						}
 						assert(chain.flag || temp_long < csa->ti->total_blks);
 					}
-					gvcst_delete_blk(temp_long, ksb->level - 1, TRUE);
-					if ((1 == ksb->level) && !dollar_tlevel && cs_data->dsid && !flush_cache)
+					level = ((blk_hdr_ptr_t)temp_buff)->levl;
+					gvcst_delete_blk(temp_long, level - 1, TRUE);
+					if ((1 == level) && !dollar_tlevel && cs_data->dsid && !flush_cache)
 						rc_cpt_entry(temp_long);	/* Invalidate single block */
 				}
 				ksb->level = 0;

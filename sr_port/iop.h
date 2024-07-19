@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2009 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -207,4 +207,11 @@ IOP_DESC(189, iop_command, IOP_VAR_SIZE, IOP_OPEN_OK, IOP_SRC_STR),
 IOP_DESC(190, iop_stderr, IOP_VAR_SIZE, IOP_OPEN_OK, IOP_SRC_STR),
 IOP_DESC(191, iop_independent, 0, IOP_OPEN_OK, 0),
 IOP_DESC(192, iop_parse, 0, IOP_OPEN_OK, 0),
-IOP_DESC(193, n_iops, 0, 0, 0)
+IOP_DESC(193, iop_destroy, 0, IOP_CLOSE_OK, 0),
+IOP_DESC(194, iop_nodestroy, 0, IOP_CLOSE_OK, 0),
+IOP_DESC(195, iop_rundown, 0, IOP_CLOSE_OK, 0),
+IOP_DESC(196, iop_follow, 0, IOP_OPEN_OK|IOP_USE_OK, 0),
+IOP_DESC(197, iop_nofollow, 0, IOP_OPEN_OK|IOP_USE_OK, 0),
+IOP_DESC(198, iop_empterm, 0, IOP_OPEN_OK|IOP_USE_OK, 0),
+IOP_DESC(199, iop_noempterm, 0, IOP_OPEN_OK|IOP_USE_OK, 0),
+IOP_DESC(200, n_iops, 0, 0, 0)

@@ -17,7 +17,7 @@
  */
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/omi_prc_stat.c,v 1.6 2013/10/23 03:49:32 tuskentower Exp $";
 #endif
 
 #include "mdef.h"

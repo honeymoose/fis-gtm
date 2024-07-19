@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -46,7 +46,6 @@ GBLREF srch_hist	dummy_hist;
 GBLREF gd_addr		*gd_header;
 GBLREF block_id		patch_curr_blk;
 GBLREF cw_set_element   cw_set[];
-GBLREF unsigned char    *non_tp_jfb_buff_ptr;
 
 void dse_adstar(void)
 {
@@ -55,6 +54,7 @@ void dse_adstar(void)
 	blk_segment	*bs1, *bs_ptr;
 	int4		blk_seg_cnt, blk_size;
 	short		rsize;
+	int		tmp_cmpc;
 	srch_blk_status	blkhist;
 
 	error_def(ERR_DBRDONLY);
@@ -112,7 +112,7 @@ void dse_adstar(void)
 	}
 	rsize = SIZEOF(rec_hdr) + SIZEOF(block_id);
 	PUT_SHORT(&((rec_hdr_ptr_t)b_top)->rsiz, rsize);
-	((rec_hdr_ptr_t) b_top)->cmpc = 0;
+	SET_CMPC((rec_hdr_ptr_t)b_top, 0);
 	PUT_LONG((block_id_ptr_t)(b_top + SIZEOF(rec_hdr)), blk);
 	((blk_hdr_ptr_t)lbp)->bsiz += (unsigned int)(SIZEOF(rec_hdr) + SIZEOF(block_id));
 
@@ -126,7 +126,7 @@ void dse_adstar(void)
 		return;
 	}
 	t_write(&blkhist, (unsigned char *)bs1, 0, 0, ((blk_hdr_ptr_t)lbp)->levl, TRUE, FALSE, GDS_WRITE_KILLTN);
-	BUILD_AIMG_IF_JNL_ENABLED(cs_data, non_tp_jfb_buff_ptr, cs_addrs->ti->curr_tn);
+	BUILD_AIMG_IF_JNL_ENABLED(cs_data, cs_addrs->ti->curr_tn);
 	t_end(&dummy_hist, NULL, TN_NOT_SPECIFIED);
 
 	free(lbp);

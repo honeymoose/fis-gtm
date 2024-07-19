@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -33,27 +33,28 @@
 #include "have_crit.h"
 #include "min_max.h"
 #ifdef GTM_TRIGGER
-#include "rtnhdr.h"
-#include "gv_trigger.h"		/* for INVALIDATE_TRIGGER_CYCLES_IF_NEEDED macro */
+#include <rtnhdr.h>
+#include "gv_trigger.h"		/* for TP_INVALIDATE_TRIGGER_CYCLES_IF_NEEDED macro */
 #endif
 
-GBLREF	jnl_fence_control	jnl_fence_ctl;
-GBLREF	sgm_info		*sgm_info_ptr, *first_sgm_info;
-GBLREF	sgm_info		*first_tp_si_by_ftok; /* List of participating regions in the TP transaction sorted on ftok order */
-GBLREF	ua_list			*curr_ua, *first_ua;
-GBLREF	char			*update_array, *update_array_ptr;
-GBLREF	block_id		tp_allocation_clue;
-GBLREF	uint4			update_array_size, cumul_update_array_size;
-GBLREF	gd_region		*gv_cur_region;
-GBLREF	sgmnt_addrs		*cs_addrs;
-GBLREF	gv_namehead		*gv_target_list, *gvt_tp_list;
-GBLREF	trans_num		local_tn;
 GBLREF	sgmnt_data_ptr_t	cs_data;
-GBLREF	buddy_list		*global_tlvl_info_list;
-GBLREF	global_tlvl_info	*global_tlvl_info_head;
+GBLREF	sgmnt_addrs		*cs_addrs;
+GBLREF	ua_list			*curr_ua, *first_ua;
+GBLREF	uint4			dollar_trestart;
+GBLREF	sgm_info		*first_tp_si_by_ftok; /* List of participating regions in the TP transaction sorted on ftok order */
 GBLREF	jnl_gbls_t		jgbl;
-GBLREF	int			process_exiting;
+GBLREF	jnl_fence_control	jnl_fence_ctl;
+GBLREF	trans_num		local_tn;
+GBLREF	global_tlvl_info	*global_tlvl_info_head;
+GBLREF	buddy_list		*global_tlvl_info_list;
 GBLREF	block_id		gtm_tp_allocation_clue;	/* block# hint to start allocation for created blocks in TP */
+GBLREF	gd_region		*gv_cur_region;
+GBLREF	gv_namehead		*gv_target_list, *gvt_tp_list;
+GBLREF	sgm_info		*sgm_info_ptr, *first_sgm_info;
+GBLREF	int			process_exiting;
+GBLREF	block_id		tp_allocation_clue;
+GBLREF	char			*update_array, *update_array_ptr;
+GBLREF	uint4			update_array_size, cumul_update_array_size;
 #ifdef VMS
 GBLREF	boolean_t		tp_has_kill_t_cse; /* cse->mode of kill_t_write or kill_t_create got created in this transaction */
 #endif
@@ -160,7 +161,7 @@ void	tp_clean_up(boolean_t rollback_flag)
 				/* Cleanup any block-split info (of created block #) in gvtarget histories */
 				TP_CLEANUP_GVNH_SPLIT_IF_NEEDED(gvnh, 0);
 			}
-			GTMTRIG_ONLY(INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(FALSE, FALSE));
+			GTMTRIG_ONLY(TP_INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(FALSE, FALSE));
 #			ifdef DEBUG
 			if (!process_exiting)
 			{	/* Ensure that we did not miss out on resetting clue for any gvtarget.
@@ -179,11 +180,17 @@ void	tp_clean_up(boolean_t rollback_flag)
 			}
 #			endif
 			local_tn++;	/* to effectively invalidate first_tp_srch_status of all gv_targets */
+			tp_allocation_clue = gtm_tp_allocation_clue;	/* Reset clue to what it was at beginning of transaction */
 		} else
 		{
-			GTMTRIG_ONLY(INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(FALSE, TRUE));
+			GTMTRIG_ONLY(TP_INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(FALSE, TRUE));
+			gtm_tp_allocation_clue = tp_allocation_clue;	/* Update tp allocation clue for next transaction to skip
+									 * past values used in this transaction now that this one
+									 * is successfully committed.
+									 */
 		}
-		GTMTRIG_ONLY(ASSERT_ZTRIGGER_CYCLE_RESET;) /* for all regions, we better have csa->db_dztrigger_cycle = 0*/
+		GTMTRIG_ONLY(assert(!TREF(gvt_triggers_read_this_tn));)
+		GTMTRIG_ONLY(TP_ASSERT_ZTRIGGER_CYCLE_RESET;) /* for all regions, we better have csa->db_dztrigger_cycle = 0*/
 		for (si = first_sgm_info;  si != NULL;  si = next_si)
 		{
 			TP_TEND_CHANGE_REG(si);
@@ -192,7 +199,7 @@ void	tp_clean_up(boolean_t rollback_flag)
 			{
 				if (NULL != (ks = si->kill_set_head))
 				{
-					FREE_KILL_SET(si, ks);
+					FREE_KILL_SET(ks);
 					si->kill_set_tail = NULL;
 					si->kill_set_head = NULL;
 				}
@@ -287,7 +294,7 @@ void	tp_clean_up(boolean_t rollback_flag)
 								}
 							} else
 							{
-								t1->buffaddr = cs_addrs->acc_meth.mm.base_addr
+								t1->buffaddr = MM_BASE_ADDR(cs_addrs)
 											+ (sm_off_t)cs_data->blk_size * cseblk;
 								assert(NULL == t1->cr);
 							}
@@ -304,8 +311,7 @@ void	tp_clean_up(boolean_t rollback_flag)
 										blk_target->root = cseblk;
 									t1->blk_num = cseblk;
 									if (is_mm)
-										t1->buffaddr =
-											cs_addrs->acc_meth.mm.base_addr
+										t1->buffaddr = MM_BASE_ADDR(cs_addrs)
 											+ (sm_off_t)cs_data->blk_size * cseblk;
 									else
 									{
@@ -389,7 +395,7 @@ void	tp_clean_up(boolean_t rollback_flag)
 				{	/* check that gv_target->root falls within total blocks range */
 					csa = gvnh->gd_csa;
 					assert(NULL != csa);
-					assert(gvnh->root < csa->ti->total_blks);
+					NON_GTM_TRUNCATE_ONLY(assert(gvnh->root < csa->ti->total_blks));
 					assert(!IS_BITMAP_BLK(gvnh->root));
 				}
 				if (gvnh->clue.end)
@@ -423,7 +429,6 @@ void	tp_clean_up(boolean_t rollback_flag)
 		CWS_RESET; /* reinitialize the hashtable before restarting/committing the TP transaction */
 	}	/* if (any database work in the transaction) */
 	VMS_ONLY(tp_has_kill_t_cse = FALSE;)
-	tp_allocation_clue = gtm_tp_allocation_clue + 1;
 	sgm_info_ptr = NULL;
 	first_sgm_info = NULL;
 	/* ensure that we don't have crit on any region at the end of a TP transaction (be it GT.M or MUPIP). The only exception

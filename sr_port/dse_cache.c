@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2003, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2003, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -29,6 +29,9 @@
 #include "op.h"				/* for op_fnzdate and op_horolog prototype */
 #include "wcs_recover.h"		/* for wcs_recover prototype */
 #include "wcs_phase2_commit_wait.h"
+#include "sleep_cnt.h"			/* for SIGNAL_WRITERS_TO_STOP/RESUME and WAIT_FOR_WRITERS_TO_STOP macro */
+#include "memcoherency.h"		/* for SIGNAL_WRITERS_TO_STOP/RESUME and WAIT_FOR_WRITERS_TO_STOP macro */
+#include "wcs_sleep.h"			/* for SIGNAL_WRITERS_TO_STOP/RESUME and WAIT_FOR_WRITERS_TO_STOP macro */
 
 GBLREF gd_region	*gv_cur_region;
 GBLREF gd_addr		*original_header;
@@ -42,6 +45,8 @@ error_def(ERR_SIZENOTVALID4);
 #define	RECOVER_DONE			"recovery complete (see operator log for details)"
 #define	RECOVER_NOT_APPLIC		"recovery not applicable with MM access method"
 
+error_def(ERR_SIZENOTVALID4);
+
 void dse_cache(void)
 {
 	boolean_t	all_present, change_present, recover_present, show_present, verify_present, was_crit, is_clean;
@@ -50,13 +55,12 @@ void dse_cache(void)
 	sgmnt_addrs	*csa;
 	mval		dollarh_mval, zdate_mval;
 	int4		size;
-	uint4		offset, value, old_value;
+	uint4		offset, value, old_value, lcnt;
 	char		dollarh_buffer[MAXNUMLEN], zdate_buffer[SIZEOF(DSE_DMP_TIME_FMT)];
 	char		temp_str[256], temp_str1[256];
 	sm_uc_ptr_t	chng_ptr;
 	cache_rec_ptr_t	cr_que_lo;
-	mmblk_rec_ptr_t	mr_que_lo;
-	boolean_t	is_mm, was_hold_onto_crit;
+	boolean_t	is_mm, was_hold_onto_crit, wc_blocked_ok;
 
 	all_present = (CLI_PRESENT == cli_present("ALL"));
 
@@ -78,7 +82,7 @@ void dse_cache(void)
 		if (!cli_get_int("SIZE",   &size))
 			return;
 		if (!((SIZEOF(char) == size) || (SIZEOF(short) == size) || (SIZEOF(int4) == size)))
-			rts_error(VARLSTCNT(1) ERR_SIZENOTVALID4);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_SIZENOTVALID4);
 	}
 	if (value_present  && !cli_get_hex("VALUE",  &value))
 		return;
@@ -98,23 +102,33 @@ void dse_cache(void)
 		{
 			GET_CURR_TIME_IN_DOLLARH_AND_ZDATE(dollarh_mval, dollarh_buffer, zdate_mval, zdate_buffer);
 			if (verify_present)
-			{	/* Before invoking wcs_verify, wait for any pending phase2 commits to finish.
-				 * Need to wait as otherwise ongoing phase2 commits can result in cache verification
-				 * returning FALSE (e.g. due to DBCRERR message indicating that cr->in_tend is non-zero).
+			{	/* Before invoking wcs_verify, wait for any pending phase2 commits to finish. Need to wait as
+				 * otherwise ongoing phase2 commits can result in cache verification returning FALSE (e.g. due to
+				 * DBCRERR message indicating that cr->in_tend is non-zero).
+				 * Also, need to wait for concurrent writers to stop to avoid wcs_verify from incorrectly concluding
+				 * that there is a problem with the active queue.
 				 */
+				wc_blocked_ok = UNIX_ONLY(TRUE) VMS_ONLY(!is_mm); /* MM on VMS doesn't support wcs_recvoer */
+				if (wc_blocked_ok)
+					SIGNAL_WRITERS_TO_STOP(csa->nl); /* done sooner to avoid any new writers starting up */
 				if (csa->nl->wcs_phase2_commit_pidcnt && !is_mm)
 				{	/* No need to check return value since even if it fails, we want to do cache verification */
 					wcs_phase2_commit_wait(csa, NULL);
 				}
-				is_clean = wcs_verify(reg, TRUE, FALSE); /* expect_damage is TRUE, caller_is_wcs_recover is FALSE */
+				if (wc_blocked_ok)
+					WAIT_FOR_WRITERS_TO_STOP(csa->nl, lcnt, MAXWTSTARTWAIT / 4); /* reduced wait time for DSE */
+				is_clean = wcs_verify(reg, FALSE, FALSE); /* expect_damage is FALSE, caller_is_wcs_recover is
+									   * FALSE */
+				if (wc_blocked_ok)
+					SIGNAL_WRITERS_TO_RESUME(csa->nl);
 			} else
 			{
 				if (UNIX_ONLY(TRUE)VMS_ONLY(!is_mm))
 				{
-					SET_TRACEABLE_VAR(csa->hdr->wc_blocked, TRUE);
+					SET_TRACEABLE_VAR(csa->nl->wc_blocked, TRUE);
 					/* No need to invoke function "wcs_phase2_commit_wait" as "wcs_recover" does that anyways */
 					wcs_recover(reg);
-					assert(FALSE == csa->hdr->wc_blocked);	/* wcs_recover() should have cleared this */
+					assert(FALSE == csa->nl->wc_blocked);	/* wcs_recover() should have cleared this */
 				}
 			}
 			assert(20 == STR_LIT_LEN(DSE_DMP_TIME_FMT)); /* if they are not the same, the !20AD below should change */
@@ -212,14 +226,6 @@ void dse_cache(void)
 					TRUE, REG_LEN_STR(reg), csa->nl->sec_size VMS_ONLY(* OS_PAGELET_SIZE));
 			} else
 			{
-				util_out_print("Region !AD :  mmblk_state        = 0x!XJ",
-					TRUE, REG_LEN_STR(reg), DB_ABS2REL(csa->acc_meth.mm.mmblk_state));
-				mr_que_lo = &csa->acc_meth.mm.mmblk_state->mmblk_array[0];
-				util_out_print("Region !AD :  mmblk_que_header   = 0x!XJ : Numelems = 0x!XL : Elemsize = 0x!XL",
-					TRUE, REG_LEN_STR(reg), DB_ABS2REL(mr_que_lo), csa->hdr->bt_buckets, SIZEOF(mmblk_rec));
-				util_out_print("Region !AD :  mm_cache_record    = 0x!XJ : Numelems = 0x!XL : Elemsize = 0x!XL",
-					TRUE, REG_LEN_STR(reg), DB_ABS2REL(mr_que_lo + csa->hdr->bt_buckets), csa->hdr->n_bts,
-					SIZEOF(mmblk_rec));
 				util_out_print("Region !AD :  shared_memory_size = 0x!XL",
 					TRUE, REG_LEN_STR(reg), csa->nl->sec_size VMS_ONLY(* OS_PAGELET_SIZE));
 				util_out_print("Region !AD :  db_file_header     = 0x!XJ", TRUE, REG_LEN_STR(reg), csa->hdr);

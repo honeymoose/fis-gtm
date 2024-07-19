@@ -1,7 +1,7 @@
 #!/bin/sh
 #################################################################
 #								#
-#	Copyright 2009, 2012 Fidelity Information Services, Inc #
+#	Copyright 2009, 2013 Fidelity Information Services, Inc #
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -15,6 +15,10 @@
 # Path to the correct echo program
 if [ $arch = "sun"  -o  $arch = "solaris" ]; then
 	echo=/usr/5bin/echo
+	# Solaris 11 does not have /usr/5bin/echo
+	if [ ! -f $echo ]; then
+		echo=/usr/bin/echo
+	fi
 elif [ $arch = "linux" ]; then
 	echo="/bin/echo -e"
 else
@@ -92,7 +96,7 @@ if [ $deliver_gtcm_gnp = "yes" ]; then
 fi
 
 # Other files
-hlpfiles="gdehelp.dat gtmhelp.dat *.h"
+hlpfiles="*help.dat *help.gld *.h"
 if [ $arch = "sco" ]; then
 	ofiles="$hlpfiles esnecil"
 elif [ $arch = "sun"  -o  $arch = "solaris" ]; then
@@ -118,7 +122,7 @@ if [ "`./geteuid`" != "root" ] ; then
 fi
 
 $echo "                     GT.M Configuration Script"
-$echo "Copyright 2009, 2012 Fidelity Information Services, Inc. Use of this"
+$echo "Copyright 2009, 2013 Fidelity Information Services, Inc. Use of this"
 $echo "software is restricted by the provisions of your license agreement."
 $echo ""
 
@@ -128,10 +132,10 @@ if [ $arch = "zos" ]; then
 	# use uid 0 for super user and group
 	defowner=0
 	rootuser=0
-	binuser=0
+	bingroup=0
 else
 	rootuser=root
-	binuser=bin
+	bingroup=bin
 	defowner=bin
 fi
 
@@ -152,15 +156,15 @@ if [ 0 != "$?" ] ; then
 	exit
 fi
 
-$echo "What group should own the files? ($binuser) \c"
+$echo "What group should own the files? ($bingroup) \c"
 read resp
 if [ "$resp" != "" ] ; then
-	binuser=$resp
+	bingroup=$resp
 fi
 
-chgrp $binuser tmp_owngrp 2> /dev/null
+chgrp $bingroup tmp_owngrp 2> /dev/null
 if [ 0 != "$?" ] ; then
-	$echo $binuser is not a valid group name - exiting!
+	$echo $bingroup is not a valid group name - exiting!
 	rm tmp_owngrp
 	exit 1
 fi
@@ -168,7 +172,7 @@ fi
 $echo "Should execution of GT.M be restricted to this group? (y or n) \c"
 read resp
 if [ "$resp" = "Y" -o "$resp" = "y" ] ; then
-	group=$binuser
+	group=$bingroup
 fi
 
 rm tmp_owngrp
@@ -191,7 +195,7 @@ if [ -d $gtmdist ]; then
 	if [ "$resp" = "Y" -o "$resp" = "y" ] ; then
 		chmod 0755 $gtmdist
 		chown $owner $gtmdist
-		chgrp $binuser $gtmdist
+		chgrp $bingroup $gtmdist
 	else
 		exit
 	fi
@@ -205,7 +209,7 @@ else
 		mkdir -p $gtmdist/plugin/r $gtmdist/plugin/o
 		chmod 0755 $gtmdist
 		chown $owner $gtmdist
-		chgrp $binuser $gtmdist
+		chgrp $bingroup $gtmdist
 	else
 		exit
 	fi
@@ -238,8 +242,9 @@ if [ -d "utf8" ]; then
 	else
 		is64bit_gtm=`file mumps | grep "64-bit" | wc -l`
 	fi
+# please keep in sync with sr_unix/set_library_path.csh
 	if [ $is64bit_gtm -eq 1 ] ; then
-		library_path="/usr/local/lib64 /usr/local/lib /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu /lib64 /lib /usr/local/ssl/lib"
+		library_path="/usr/local/lib64 /usr/local/lib /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu /lib64 /lib /usr/local/ssl/lib"  #BYPASSOK line length
 	else
 		library_path="/usr/local/lib32 /usr/local/lib /usr/lib32 /usr/lib /usr/lib/i386-linux-gnu /lib32 /lib"
 	fi
@@ -346,7 +351,7 @@ if [ -d "utf8" ]; then
 			fi
 		fi
 		# Look for locale
-		utflocale=`locale -a | grep -i .utf | sed 's/.lp64$//' | grep '8$' | head -n1`
+		utflocale=`locale -a | grep -i .utf | sed 's/.lp64$//' | grep '8$' | head -n 1`
 		if [ "$utflocale" = "" ] ; then
 			$echo "WARNING: UTF8 locale not found. Not installing UTF-8 support."
 		fi
@@ -423,6 +428,14 @@ if [ -f $file ]; then
 	fi
 fi
 
+# Install custom_errors_sample.txt if it is applicable
+file=custom_errors_sample.txt
+if [ -f $file ]; then
+	cp $file $gtmdist
+	if [ "$doutf8" -ne 0 ]; then
+		ln -s ../$file $gtmdist/utf8/$file
+	fi
+fi
 # Install the .cshrc and .profile files
 cp gdedefaults gtmprofile gtmprofile_preV54000 gtm gtmcshrc $gtmdist
 chmod 0444 $gtmdist/gdedefaults
@@ -456,17 +469,17 @@ done
 for i in $binaries
 do
 	if [ $arch = "sun" -o $arch = "linux" ]; then
-		install -g $binuser -o $owner -m 644 $i $gtmdist
+		install -g $bingroup -o $owner -m 644 $i $gtmdist
 	elif [ $arch = "ibm" ]; then
-		/usr/bin/install -f $gtmdist -M 644 -O $owner -G $binuser $i
+		/usr/bin/install -f $gtmdist -M 644 -O $owner -G $bingroup $i
 	elif [ -x /usr/sbin/install ]; then
-		/usr/sbin/install -f $gtmdist -m 644 -u $owner -g $binuser $i $gtmdist
+		/usr/sbin/install -f $gtmdist -m 644 -u $owner -g $bingroup $i $gtmdist
 	elif [ $arch = "zos" ]; then
 		cp $i $gtmdist/
 		chmod 644 $gtmdist/$i
-		chown $user:$binuser $gtmdist/$i
+		chown $user:$bingroup $gtmdist/$i
 	else
-		install -f $gtmdist -m 644 -u $owner -g $binuser $i $gtmdist
+		install -f $gtmdist -m 644 -u $owner -g $bingroup $i $gtmdist
 	fi
 #		strip $gtmdist/$i >/dev/null 2>&1
 done
@@ -501,17 +514,18 @@ gtmcryptbldfiles="install.sh build.sh"
 gtmcryptbinaries="maskpass"
 
 # Gtmcrypt shared library
-gtmcryptsharedlib="libgtmcrypt$ext"
+gtmcryptsharedlibs="libgtmcrypt_openssl_BLOWFISHCFB$ext libgtmcrypt_openssl_AES256CFB$ext"
+gtmcryptsharedlibs="$gtmcryptsharedlibs libgtmcrypt_gcrypt_AES256CFB$ext libgtmcrypt$ext"
 
 # Gtmcrypt scripts
 gtmcryptscripts="add_db_key.sh gen_sym_key.sh encrypt_sign_db_key.sh gen_keypair.sh pinentry-gtm.sh"
-gtmcryptscripts="$gtmcryptscripts import_and_sign_key.sh gen_sym_hash.sh"
+gtmcryptscripts="$gtmcryptscripts import_and_sign_key.sh gen_sym_hash.sh show_install_config.sh"
 
 # Gtmcrypt related M file
 gtmcryptmfile="pinentry.m"
 
 # Gtmcrypt source files
-gtmcryptsrcfiles="gtmcrypt_ref.c gtmcrypt_ref.h gtmcrypt_interface.h gtmxc_types.h maskpass.c"
+gtmcryptsrcfiles="gtmcrypt_ref.c gtmcrypt_ref.h gtmcrypt_interface.h maskpass.c"
 gtmcryptsrcfiles="$gtmcryptsrcfiles gtmcrypt_dbk_ref.c gtmcrypt_dbk_ref.h gtmcrypt_pk_ref.c gtmcrypt_pk_ref.h"
 gtmcryptsrcfiles="$gtmcryptsrcfiles gtmcrypt_sym_ref.h $gtmcryptbldfiles $gtmcryptmfile"
 
@@ -525,10 +539,10 @@ if [ -d "$plugin_gtmcrypt" ]; then
 	mkdir -p $gtmdist/plugin/gtmcrypt
 	chmod 0755 $gtmdist/plugin
 	chown $owner $gtmdist/plugin
-	chgrp $binuser $gtmdist/plugin
+	chgrp $bingroup $gtmdist/plugin
 	chmod 0755 $gtmdist/plugin/gtmcrypt
 	chown $owner $gtmdist/plugin/gtmcrypt/
-	chgrp $binuser $gtmdist/plugin/gtmcrypt
+	chgrp $bingroup $gtmdist/plugin/gtmcrypt
 
 
 	#Install the plugin related scripts
@@ -537,49 +551,62 @@ if [ -d "$plugin_gtmcrypt" ]; then
 		cp $plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt/$i
 		chmod 0755 $gtmdist/$plugin_gtmcrypt/$i
 		chown $owner $gtmdist/$plugin_gtmcrypt/$i
-		chgrp $binuser $gtmdist/$plugin_gtmcrypt/$i
+		chgrp $bingroup $gtmdist/$plugin_gtmcrypt/$i
 	done
 
 	# Install the plugin binaries
 	for i in $gtmcryptbinaries
 	do
 		if [ $arch = "sun" -o $arch = "linux" ]; then
-			install -g $binuser -o $owner -m 755 $plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
+			install -g $bingroup -o $owner -m 755 $plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
 		elif [ $arch = "ibm" ]; then
-			/usr/bin/install -f $gtmdist/$plugin_gtmcrypt -M 755 -O $owner -G $binuser $plugin_gtmcrypt/$i
+			/usr/bin/install -f $gtmdist/$plugin_gtmcrypt -M 755 -O $owner -G $bingroup $plugin_gtmcrypt/$i
 		elif [ $arch = "zos" ]; then
 			cp $plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
 			chmod 755 $gtmdist/$plugin_gtmcrypt/$i
-			chown $user:$binuser $gtmdist/$plugin_gtmcrypt/$i
+			chown $user:$bingroup $gtmdist/$plugin_gtmcrypt/$i
 		elif [ -x /usr/sbin/install ]; then
-			/usr/sbin/install -f $gtmdist/$plugin_gtmcrypt -m 755 -u $owner -g $binuser \
+			/usr/sbin/install -f $gtmdist/$plugin_gtmcrypt -m 755 -u $owner -g $bingroup \
 				$plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
 		else
-			install -f $gtmdist/$plugin_gtmcrypt -m 755 -u $owner -g $binuser \
+			install -f $gtmdist/$plugin_gtmcrypt -m 755 -u $owner -g $bingroup \
 				$plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
 		fi
 	done
 
-	# Install the plugin shared library
-	if [ $arch = "sun" -o $arch = "linux" ]; then
-		install -g $binuser -o $owner -m 755 $plugin/$gtmcryptsharedlib $gtmdist/$plugin
-	elif [ $arch = "ibm" ]; then
-		/usr/bin/install -f $gtmdist/$plugin -M 755 -O $owner -G $binuser $plugin/$gtmcryptsharedlib
-	elif [ $arch = "zos" ]; then
-		cp $plugin/$gtmcryptsharedlib $gtmdist/$plugin
-		chmod 755 $gtmdist/$plugin/$gtmcryptsharedlib
-		chown $user:$binuser $gtmdist/$plugin/$gtmcryptsharedlib
-	elif [ -x /usr/sbin/install ]; then
-		/usr/sbin/install -f $gtmdist/$plugin -m 755 -u $owner -g $binuser $plugin/$gtmcryptsharedlib $gtmdist/$plugin
-	else
-		install -f $gtmdist/$plugin -m 755 -u $owner -g $binuser $plugin/$gtmcryptsharedlib $gtmdist/$plugin
+	# Install the different flavors of encryption plugin (OpenSSL and Gcrypt)
+	for i in $gtmcryptsharedlibs
+	do
+		# Install only files (and not symlinks) that exist
+		#   CMake builds generate only one library - GCRYPT with AES256CFB
+		if [ -L $plugin/$i -o ! -f $plugin/$i ]; then
+			continue
+		elif [ $arch = "sun" -o $arch = "linux" ]; then
+			install -g $bingroup -o $owner -m 755 $plugin/$i $gtmdist/$plugin
+		elif [ $arch = "ibm" ]; then
+			/usr/bin/install -f $gtmdist/$plugin -M 755 -O $owner -G $bingroup $plugin/$i
+		elif [ $arch = "zos" ]; then
+			cp $plugin/$i $gtmdist/$plugin
+			chmod 755 $gtmdist/$plugin/$i
+			chown $user:$bingroup $gtmdist/$plugin/$i
+		elif [ -x /usr/sbin/install ]; then
+			/usr/sbin/install -f $gtmdist/$plugin -m 755 -u $owner -g $bingroup $plugin/$i $gtmdist/$plugin
+		else
+			install -f $gtmdist/$plugin -m 755 -u $owner -g $bingroup $plugin/$i $gtmdist/$plugin
+		fi
+	done
+
+	# Install the Symbolic link only if one exists (tarball has it, CMake builds do not)
+	if [ -L $plugin/libgtmcrypt$ext ]; then
+		currentlink=`ls -l $plugin/libgtmcrypt$ext | awk '{print $NF}'`
+		ln -s $currentlink $gtmdist/$plugin/libgtmcrypt$ext
 	fi
 
-        # Install the plugin related M file
-        cp $plugin_gtmcrypt/$gtmcryptmfile $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
-        chmod 0644 $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
-        chown $owner $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
-        chgrp $binuser $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
+	# Install the plugin related M file
+	cp $plugin_gtmcrypt/$gtmcryptmfile $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
+	chmod 0644 $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
+	chown $owner $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
+	chgrp $bingroup $gtmdist/$plugin_gtmcrypt/$gtmcryptmfile
 
 	# Install other plugin files
 	for i in $gtmcryptofiles
@@ -587,7 +614,7 @@ if [ -d "$plugin_gtmcrypt" ]; then
 		cp $plugin_gtmcrypt/$i $gtmdist/$plugin_gtmcrypt
 		chmod 0644 $gtmdist/$plugin_gtmcrypt/$i
 		chown $owner $gtmdist/$plugin_gtmcrypt/$i
-		chgrp $binuser $gtmdist/$plugin_gtmcrypt/$i
+		chgrp $bingroup $gtmdist/$plugin_gtmcrypt/$i
 	done
 
 	# Install gpgagent.tab
@@ -596,10 +623,10 @@ if [ -d "$plugin_gtmcrypt" ]; then
 	cat $plugin/gpgagent.tab | sed 1d >> $gtmdist/$plugin/gpgagent.tab
 
 	# Tar the source files
-	(cd $plugin_gtmcrypt; chmod 0644 $gtmcryptsrcfiles; chown $owner $gtmcryptsrcfiles; chgrp $binuser $gtmcryptsrcfiles)
-	(cd $plugin_gtmcrypt; chmod 0555 $gtmcryptbldfiles; chown $owner $gtmcryptbldfiles; chgrp $binuser $gtmcryptbldfiles)
+	(cd $plugin_gtmcrypt; chmod 0644 $gtmcryptsrcfiles; chown $owner $gtmcryptsrcfiles; chgrp $bingroup $gtmcryptsrcfiles)
+	(cd $plugin_gtmcrypt; chmod 0555 $gtmcryptbldfiles; chown $owner $gtmcryptbldfiles; chgrp $bingroup $gtmcryptbldfiles)
 	(cd $plugin_gtmcrypt; tar -cvf source.tar $gtmcryptsrcfiles >/dev/null 2>&1; mv source.tar $gtmdist/$plugin_gtmcrypt)
-	(cd $gtmdist/$plugin_gtmcrypt; chmod 0644 source.tar; chown $owner source.tar; chgrp $binuser source.tar)
+	(cd $gtmdist/$plugin_gtmcrypt; chmod 0644 source.tar; chown $owner source.tar; chgrp $bingroup source.tar)
 fi
 
 # Install GDE, GTMHELP, and all the percent routines
@@ -612,6 +639,10 @@ if [ "$doutf8" -ne 0 ]; then
 	do
 		# Skip directories
 		if [ -d $file ]; then
+			continue
+		fi
+		# Skip gtmsecshr/dir
+		if [ "$file" = "gtmsecshr" -o "$file" = "gtmsecshrdir" ]; then
 			continue
 		fi
 		# Install .o files
@@ -673,38 +704,39 @@ export gtm_chset
 
 # Now work on UTF-8 mode
 if [ "$doutf8" -ne 0 ]; then
+	# Enclose UTF-8 operations inside a subshell. This avoids changing the current M mode execution
 	(
-	# Ensure we ARE in UTF-8 mode
-	utflocale=`locale -a | grep -i en_us | grep -i utf | grep '8$'`
-	if [ $arch = "zos" ]; then
-		utflocale=`locale -a | grep -i en_us | grep -i utf | sed 's/.lp64$//' | grep '8$' | head -n1`
-	fi
+		# Ensure we ARE in UTF-8 mode
+		utflocale=`locale -a | grep -i en_us | grep -i utf | grep '8$' | head -n 1`
+		if [ $arch = "zos" ]; then
+			utflocale=`locale -a | grep -i en_us | grep -i utf | sed 's/.lp64$//' | grep '8$' | head -n 1`
+		fi
 
-	if [ $utflocale = "" ]; then
-		utflocale="C"
-	fi
-	if [ $arch != "zos" ]; then
-		# don't set LC_CTYPE to avoid random error messages from EBCDIC utilities
-		LC_CTYPE=$utflocale
-		export LC_CTYPE
-	else
-		gtm_chset_locale=$utflocale
-		export gtm_chset_locale
-	fi
-	unset LC_ALL
-	gtm_chset="UTF-8"
-	export gtm_chset
-	if [ $arch = "ibm" ]; then
-		export LIBPATH=$save_icu_libpath
-	elif [ $arch = "zos" ]; then
-		# on z/OS LIBPATH is the only library search path so we should preserve it
-		export LIBPATH=${save_icu_libpath}:${LIBPATH}
-	else
-		LD_LIBRARY_PATH=$save_icu_libpath
-		export LD_LIBRARY_PATH
-	fi
-	(gtm_dist=$gtmdist/utf8; export gtm_dist; cd $gtm_dist; ./mumps -noignore *.m; $echo $?>>$gtmdist/compstat; \
-	if [ $is64bit_gtm -eq 1 -o "linux" != $arch ] ; then $ldcmd $ldflags -o libgtmutil$ext *.o ; fi )
+		if [ $utflocale = "" ]; then
+			utflocale="C"
+		fi
+		if [ $arch != "zos" ]; then
+			# don't set LC_CTYPE to avoid random error messages from EBCDIC utilities
+			LC_CTYPE=$utflocale
+			export LC_CTYPE
+		else
+			gtm_chset_locale=$utflocale
+			export gtm_chset_locale
+		fi
+		unset LC_ALL
+		gtm_chset="UTF-8"
+		export gtm_chset
+		if [ $arch = "ibm" ]; then
+			export LIBPATH=$save_icu_libpath
+		elif [ $arch = "zos" ]; then
+			# on z/OS LIBPATH is the only library search path so we should preserve it
+			export LIBPATH=${save_icu_libpath}:${LIBPATH}
+		else
+			LD_LIBRARY_PATH=$save_icu_libpath
+			export LD_LIBRARY_PATH
+		fi
+		(gtm_dist=$gtmdist/utf8; export gtm_dist; cd $gtm_dist; ./mumps -noignore *.m; $echo $?>>$gtmdist/compstat; \
+		if [ $is64bit_gtm -eq 1 -o "linux" != $arch ] ; then $ldcmd $ldflags -o libgtmutil$ext *.o ; fi )
 	)
 fi
 
@@ -718,8 +750,10 @@ chmod 0644 $gtmdist/*.m
 chmod 0644 $gtmdist/*.o
 chown $owner $gtmdist/*.m
 chown $owner $gtmdist/*.o
-chgrp $binuser $gtmdist/*.m
-chgrp $binuser $gtmdist/*.o
+chown $owner $gtmdist/*.txt
+chgrp $bingroup $gtmdist/*.m
+chgrp $bingroup $gtmdist/*.o
+chgrp $bingroup $gtmdist/*.txt
 
 if [ "$doutf8" -ne 0 ]; then
 	chmod 0644 $gtmdist/utf8/*.m
@@ -727,14 +761,16 @@ if [ "$doutf8" -ne 0 ]; then
 	chown $owner $gtmdist/utf8
 	chown $owner $gtmdist/utf8/*.m
 	chown $owner $gtmdist/utf8/*.o
-	chgrp $binuser $gtmdist/utf8/*.m
-	chgrp $binuser $gtmdist/utf8/*.o
+	chown $owner $gtmdist/utf8/*.txt
+	chgrp $bingroup $gtmdist/utf8/*.m
+	chgrp $bingroup $gtmdist/utf8/*.o
+	chgrp $bingroup $gtmdist/utf8/*.txt
 fi
 
 if [ "$dogtmcrypt" -ne 0 ]; then
 	chmod 0644 $gtmdist/plugin/gtmcrypt/*.m
 	chown $owner $gtmdist/plugin/gtmcrypt/*.m
-	chgrp $binuser $gtmdist/plugin/gtmcrypt/*.m
+	chgrp $bingroup $gtmdist/plugin/gtmcrypt/*.m
 fi
 
 gtm_dist=$gtmdist
@@ -747,38 +783,11 @@ else
 fi
 export gtmroutines
 
-# Create the global directories for the help databases.
-
-gtmgbldir=$gtmdist/gtmhelp.gld
-export gtmgbldir
-
-cat <<GDE.in1 | $gtmdist/mumps -direct
-Do ^GDE
-Change -segment DEFAULT	-block=2048	-file=\$gtm_dist/gtmhelp.dat
-Change -region DEFAULT	-record=1020	-key=255
-Exit
-GDE.in1
-
-gtmgbldir=$gtmdist/gdehelp.gld
-export gtmgbldir
-
-cat <<GDE.in2 | $gtmdist/mumps -direct
-Do ^GDE
-Change -segment DEFAULT	-block=2048	-file=\$gtm_dist/gdehelp.dat
-Change -region DEFAULT	-record=1020	-key=255
-Exit
-GDE.in2
-
 other_object_files="CHK2LEV.o CHKOP.o GENDASH.o GENOUT.o GETNEAR.o GTMHLPLD.o LOAD.o LOADOP.o"
 other_object_files="$other_object_files LOADVX.o MSG.o TTTGEN.o TTTSCAN.o UNLOAD.o GTMDefinedTypesInit.o"
 csh_script_files=""
 if [ $arch = "zos" ]; then
 	other_object_files="$other_object_files GENEXPORT.o"
-fi
-
-if [ "$doutf8" -ne 0 ]; then
-	# make symbolic links to gtmhelp.gld and gdehelp.gld
-	(cd $gtmdist/utf8; ln -s ../gtmhelp.gld gtmhelp.gld; ln -s ../gdehelp.gld gdehelp.gld)
 fi
 
 # make database files read only
@@ -800,12 +809,16 @@ cd $savedir
 
 # Optionally remove .o files if they are in a shared library
 if [ -f $gtm_dist/libgtmutil$ext ] ; then
-    $echo ""
-    $echo "Object files of M routines placed in shared library $gtm_dist/libgtmutil$ext"
-    $echo "Keep original .o object files (y or n)? \c"
-    read resp
-    if [ "n" = $resp -o "N" = $resp ] ; then rm -f $gtm_dist/*.o $gtm_dist/utf8/*.o ; fi
-    $echo ""
+	chown ${owner}:${bingroup} $gtm_dist/libgtmutil$ext
+	$echo ""
+	$echo "Object files of M routines placed in shared library $gtm_dist/libgtmutil$ext"
+	$echo "Keep original .o object files (y or n)? \c"
+	read resp
+	if [ "n" = $resp -o "N" = $resp ] ; then rm -f $gtm_dist/*.o $gtm_dist/utf8/*.o ; fi
+	$echo ""
+	if [ -f $gtm_dist/utf8/libgtmutil$ext ] ; then
+		chown ${owner}:${bingroup} $gtm_dist/utf8/libgtmutil$ext
+	fi
 fi
 
 # change group ownership of all files if group restricted
@@ -818,42 +831,58 @@ if [ "$group" != "" ] ; then
 		chmod -R o-rwx $gtmdist
 	fi
 else
-	chgrp -R $binuser $gtmdist
+	chgrp -R $bingroup $gtmdist
 fi
 
 # Install real gtmsecshr with special permissions in $gtmdist/gtmsecshrdir
 tgtmsecshrdir=$gtmdist/gtmsecshrdir
 mkdir $tgtmsecshrdir
 chmod 700 $tgtmsecshrdir
-chgrp $binuser $tgtmsecshrdir
+chgrp $bingroup $tgtmsecshrdir
 
 # Install gtmsecshr and the wrapper with special permissions
 if [ $arch = "sun" -o $arch = "linux" ]; then
-	install -m 4555 -o root -g $binuser gtmsecshr $gtmdist
-	install -m 4500 -o root -g $binuser gtmsecshrdir/gtmsecshr $tgtmsecshrdir/gtmsecshr
+	install -m 4555 -o root -g $bingroup gtmsecshr $gtmdist
+	install -m 4500 -o root -g $bingroup gtmsecshrdir/gtmsecshr $tgtmsecshrdir/gtmsecshr
 elif [ $arch = "ibm" ]; then
-	/usr/bin/install -f $gtmdist -M 4555 -O root -G $binuser gtmsecshr
-	/usr/bin/install -f $tgtmsecshrdir -M 4500 -O root -G $binuser gtmsecshrdir/gtmsecshr
+	/usr/bin/install -f $gtmdist -M 4555 -O root -G $bingroup gtmsecshr
+	/usr/bin/install -f $tgtmsecshrdir -M 4500 -O root -G $bingroup gtmsecshrdir/gtmsecshr
 elif [ -x /usr/sbin/install ]; then
-	/usr/sbin/install -f $gtmdist -m 4555 -u root -g $binuser gtmsecshr $gtmdist
-	/usr/sbin/install -f $tgtmsecshrdir -m 4500 -u root -g $binuser gtmsecshrdir/gtmsecshr $tgtmsecshrdir
+	/usr/sbin/install -f $gtmdist -m 4555 -u root -g $bingroup gtmsecshr $gtmdist
+	/usr/sbin/install -f $tgtmsecshrdir -m 4500 -u root -g $bingroup gtmsecshrdir/gtmsecshr $tgtmsecshrdir
 elif [ $arch = "zos" ]; then
 	cp gtmsecshr $gtmdist/gtmsecshr
 	cp gtmsecshrdir/gtmsecshr $tgtmsecshrdir/gtmsecshr
-	chown $rootuser:$binuser $gtmdist/gtmsecshr $tgtmsecshrdir/gtmsecshr
+	chown $rootuser:$bingroup $gtmdist/gtmsecshr $tgtmsecshrdir/gtmsecshr
 	chmod 4555 $gtmdist/gtmsecshr
 	chmod 4500 $tgtmsecshrdir/gtmsecshr
 else
-	install -f $gtmdist -m 4555 -u root -g $binuser gtmsecshr $gtmdist
-	install -f $tgtmsecshrdir -m 4500 -u root -g $binuser gtmsecshrdir/gtmsecshr $tgtmsecshrdir
-fi
-
-if [ -d $gtmdist/utf8 ]; then
-	(cd $gtmdist/utf8; ln -s ../gtmsecshrdir gtmsecshrdir; ln -s ../gtmsecshr gtmsecshr)
+	install -f $gtmdist -m 4555 -u root -g $bingroup gtmsecshr $gtmdist
+	install -f $tgtmsecshrdir -m 4500 -u root -g $bingroup gtmsecshrdir/gtmsecshr $tgtmsecshrdir
 fi
 
 strip $gtmdist/gtmsecshr > /dev/null 2>&1
 strip $tgtmsecshrdir/gtmsecshr > /dev/null 2>&1
+
+if [ -d $gtmdist/utf8 ]; then
+
+	# Delete the gtmsecshr symlink
+	if [ -f $gtmdist/utf8/gtmsecshr -o -h $gtmdist/utf8/gtmsecshr ]; then
+		rm -f $gtmdist/utf8/gtmsecshr
+	fi
+	ln $gtmdist/gtmsecshr $gtmdist/utf8/gtmsecshr || \
+		echo ln $gtmdist/gtmsecshr $gtmdist/utf8/gtmsecshr
+
+	# Delete the gtmsecshrdir symlink
+	if [ -f $gtmdist/utf8/gtmsecshrdir -o -h $gtmdist/utf8/gtmsecshrdir ]; then
+		rm -f $gtmdist/utf8/gtmsecshrdir
+	fi
+	mkdir -p $gtmdist/utf8/gtmsecshrdir
+	chmod 0500 $gtmdist/utf8/gtmsecshrdir
+	ln $gtmdist/gtmsecshrdir/gtmsecshr $gtmdist/utf8/gtmsecshrdir/gtmsecshr || \
+		echo ln $gtmdist/gtmsecshrdir/gtmsecshr $gtmdist/utf8/gtmsecshrdir/gtmsecshr
+
+fi
 
 # change group ownership of wrapper if group restricted
 # also remove user privileges for wrapper if group changed
@@ -900,8 +929,8 @@ read resp
 if [ "$resp" = "Y" -o "$resp" = "y" ] ; then
 	\rm -rf $binaries $pathmods $rscripts $nscripts $dirs configure \
 		*.gtc gtm* gde* GDE*.o _*.m _*.o mumps.dat mumps.gld geteuid $other_object_files $csh_script_files lowerc_cp\
-		esnecil *.hlp core *.h libgtmrpc.a *.m gdehelp.* COPYING README.txt
-	\rm -rf GETPASS.o plugin PINENTRY.o GTMHELP.o
+		esnecil *.hlp core *.h libgtmrpc.a *.m *help.dat *help.gld COPYING README.txt
+	\rm -rf GETPASS.o plugin PINENTRY.o GTMHELP.o custom_errors_sample.txt
 	if [ -d utf8 ]; then
 		\rm -rf utf8
 	fi

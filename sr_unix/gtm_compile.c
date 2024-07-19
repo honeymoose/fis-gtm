@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -39,8 +39,11 @@
 #include "gdsbt.h"
 #include "gdsfhead.h"
 #include "alias.h"
+#include "gt_timers_add_safe_hndlrs.h"
+#include "zco_init.h"
 
 GBLREF command_qualifier	glb_cmd_qlf, cmd_qlf;
+GBLREF IN_PARMS			*cli_lex_in_ptr;
 GBLREF stack_frame	 	*frame_pointer;
 GBLREF unsigned char 		*stackbase,*stacktop,*stackwarn,*msp;
 GBLREF mv_stent			*mv_chain;
@@ -50,12 +53,14 @@ GBLREF spdesc			rts_stringpool, stringpool;
 
 int	gtm_compile (void)
 {
-	int		status;
-	unsigned short	len;
-	char		source_file_string[MAX_FBUFF + 1];
-	char		obj_file[MAX_FBUFF + 1], list_file[MAX_FBUFF + 1], ceprep_file[MAX_FBUFF + 1];
-	unsigned char	*mstack_ptr;
-	void 		gtm_ret_code();
+	int			status;
+	unsigned short		len;
+	char			source_file_string[MAX_FBUFF + 1];
+	char			obj_file[MAX_FBUFF + 1], list_file[MAX_FBUFF + 1], ceprep_file[MAX_FBUFF + 1];
+	unsigned char		*mstack_ptr;
+	void 			gtm_ret_code();
+	command_qualifier	save_qlf;
+	mstr			orig_cmdstr;
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
@@ -65,7 +70,6 @@ int	gtm_compile (void)
 	io_init(TRUE);
 	getjobnum();
 	getzdir();
-	prealloc_gt_timers();
 	run_time = FALSE;
 	TREF(compile_time) = TRUE;
 	mstack_ptr = (unsigned char *)malloc(USER_STACK_SIZE);
@@ -90,15 +94,25 @@ int	gtm_compile (void)
 	LVVAL_INIT((TREF(zsearch_dir1)), curr_symval);
 	LVVAL_INIT((TREF(zsearch_dir2)), curr_symval);
 	/* command qualifier processing stuff */
-	cmd_qlf.object_file.str.addr = obj_file;
-	cmd_qlf.object_file.str.len = MAX_FBUFF;
-	cmd_qlf.list_file.str.addr = list_file;
-	cmd_qlf.list_file.str.len = MAX_FBUFF;
-	cmd_qlf.ceprep_file.str.addr = ceprep_file;
-	cmd_qlf.ceprep_file.str.len = MAX_FBUFF;
-	get_cmd_qlf(&cmd_qlf);
+	zco_init();
+	assert(cli_lex_in_ptr);
+	save_qlf = glb_cmd_qlf;
+	/* Save the original MUMPS command line qualifers. These are processed after, and take precedence over, $ZCOMPILE. */
+	orig_cmdstr.len = strlen(cli_lex_in_ptr->in_str) - strlen("MUMPS ");
+	orig_cmdstr.addr = (char *)malloc(orig_cmdstr.len);
+	memcpy(orig_cmdstr.addr, cli_lex_in_ptr->in_str + strlen("MUMPS "), orig_cmdstr.len);
+	INIT_CMD_QLF_STRINGS(cmd_qlf, obj_file, list_file, ceprep_file, MAX_FBUFF);
+	zl_cmd_qlf(&(TREF(dollar_zcompile)), &cmd_qlf);	/* Initialize $ZCOMPILE as default command qualifiers */
+	glb_cmd_qlf = cmd_qlf;
+	INIT_CMD_QLF_STRINGS(cmd_qlf, obj_file, list_file, ceprep_file, MAX_FBUFF);
+	zl_cmd_qlf(&orig_cmdstr, &cmd_qlf);		/* Next, process MUMPS command line qualifers */
+	free(orig_cmdstr.addr);
+	glb_cmd_qlf = save_qlf;
+	/* end command qualifier processing stuff */
 	initialize_pattern_table();
 	ce_init();	/* initialize compiler escape processing */
+	prealloc_gt_timers();
+	gt_timers_add_safe_hndlrs();	/* Not sure why compiler needs timers but .. */
 	TREF(dollar_zcstatus) = SS_NORMAL;
 	len = MAX_FBUFF;
 	for (status = cli_get_str("INFILE", source_file_string, &len);
@@ -109,6 +123,7 @@ int	gtm_compile (void)
 		len = MAX_FBUFF;
 	}
 	print_exit_stats();
+	SET_PROCESS_EXITING_TRUE;	/* needed by remove_rms($principal) to avoid closing that */
 	io_rundown(NORMAL_RUNDOWN);
-	return (SS_NORMAL == TREF(dollar_zcstatus)) ? SS_NORMAL : -1;
+	return (SS_NORMAL == TREF(dollar_zcstatus)) ? SS_NORMAL : 1;
 }

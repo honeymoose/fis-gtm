@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2006, 2011 Fidelity Information Services, Inc.*
+ *	Copyright 2006, 2013 Fidelity Information Services, Inc.*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -17,7 +17,7 @@
 #include "gtm_inet.h"
 #include "gtm_string.h"
 #include "gtm_ctype.h"
-#if !defined(__MVS__) && !defined(VMS) && !defined(__CYGWIN__)
+#if !defined(__MVS__) && !defined(VMS) && !defined(__CYGWIN__) && (!defined(__GNUC__) && defined(__hpux))
 #include <sys/socketvar.h>
 #endif
 #ifdef VMS
@@ -56,9 +56,11 @@
 
 GBLREF	gtmsource_options_t	gtmsource_options;
 
+error_def(ERR_GETADDRINFO);
 error_def(ERR_LOGTOOLONG);
 error_def(ERR_REPLINSTSECLEN);
 error_def(ERR_REPLINSTSECUNDF);
+error_def(ERR_TEXT);
 
 int gtmsource_get_opt(void)
 {
@@ -66,13 +68,19 @@ int gtmsource_get_opt(void)
 	char		*connect_parm_token_str, *connect_parm;
 	char		*connect_parms_str, tmp_connect_parms_str[GTMSOURCE_CONN_PARMS_LEN + 1];
 	char		secondary_sys[MAX_SECONDARY_LEN], *c, inst_name[MAX_FN_LEN + 1];
-	char		statslog_val[4]; /* "ON" or "OFF" */
+	char		statslog_val[SIZEOF("OFF")]; /* "ON" or "OFF" */
 	char		update_val[SIZEOF("DISABLE")]; /* "ENABLE" or "DISABLE" */
+	char		freeze_val[SIZEOF("OFF")]; /* "ON" or "OFF" */
+	char		freeze_comment[SIZEOF(gtmsource_options.freeze_comment)];
 	int		tries, index = 0, timeout_status, connect_parms_index, status;
 	mstr		log_nam, trans_name;
 	struct hostent	*sec_hostentry;
 	unsigned short	log_file_len, filter_cmd_len;
 	unsigned short	secondary_len, inst_name_len, statslog_val_len, update_val_len, connect_parms_str_len;
+	unsigned short	freeze_val_len, freeze_comment_len;
+	int		errcode;
+	int		port_len;
+	char		*ip_end;
 
 	memset((char *)&gtmsource_options, 0, SIZEOF(gtmsource_options));
 	gtmsource_options.start = (CLI_PRESENT == cli_present("START"));
@@ -134,9 +142,9 @@ int gtmsource_get_opt(void)
 			} else if (!gtmsource_options.checkhealth && !gtmsource_options.showbacklog && !gtmsource_options.shut_down)
 			{
 				if (SS_LOG2LONG == status)
-					gtm_putmsg(VARLSTCNT(5) ERR_LOGTOOLONG, 3, log_nam.len, log_nam.addr,
+					gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_LOGTOOLONG, 3, log_nam.len, log_nam.addr,
 						SIZEOF(inst_name) - 1);
-				gtm_putmsg(VARLSTCNT(1) ERR_REPLINSTSECUNDF);
+				gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_REPLINSTSECUNDF);
 				return (-1);
 			}
 		}
@@ -146,7 +154,7 @@ int gtmsource_get_opt(void)
 		inst_name[inst_name_len] = '\0';
 		if ((MAX_INSTNAME_LEN <= inst_name_len) || (0 == inst_name_len))
 		{
-			gtm_putmsg(VARLSTCNT(4) ERR_REPLINSTSECLEN, 2, inst_name_len, inst_name);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_REPLINSTSECLEN, 2, inst_name_len, inst_name);
 			return (-1);
 		}
 		assert((inst_name_len + 1) <= MAX_INSTNAME_LEN);
@@ -166,49 +174,36 @@ int gtmsource_get_opt(void)
 			 * and secondary_port */
 			c = secondary_sys;
 			dotted_notation = TRUE;
-			while(*c && *c != ':')
+			if ('[' == *c)
 			{
-				if ('.' != *c && !ISDIGIT_ASCII(*c))
-					dotted_notation = FALSE;
-				gtmsource_options.secondary_host[index++] = *c++;
+				ip_end = strchr(++c, ']');
+				if (NULL == ip_end || 0 == (index = ip_end - c))
+				{
+					util_out_print("Invalid IP address !AD", TRUE,
+						LEN_AND_STR(secondary_sys));
+					return(-1);
+				}
+				memcpy(gtmsource_options.secondary_host, c, index);
+				gtmsource_options.secondary_host[index] = '\0';
+				c = ip_end + 1;
+			} else
+			{
+				while(*c && (':' != *c))
+					gtmsource_options.secondary_host[index++] = *c++;
+				gtmsource_options.secondary_host[index] = '\0';
 			}
-			gtmsource_options.secondary_host[index] = '\0';
 			if (':' != *c)
 			{
 				util_out_print("Secondary port number should be specified", TRUE);
 				return(-1);
 			}
+			port_len = strlen(++c);
 			errno = 0;
-			if (((0 == (gtmsource_options.secondary_port = ATOI(++c))) && (0 != errno))
+			if (((0 == (gtmsource_options.secondary_port = ATOI(c))) && (0 != errno))
 				|| (0 >= gtmsource_options.secondary_port))
 			{
 				util_out_print("Error parsing secondary port number !AD", TRUE, LEN_AND_STR(c));
 				return(-1);
-			}
-			/* Validate the specified secondary host name */
-			if (dotted_notation)
-			{
-				if ((in_addr_t)-1 ==
-					(gtmsource_options.sec_inet_addr = INET_ADDR(gtmsource_options.secondary_host)))
-				{
-					util_out_print("Invalid IP address !AD", TRUE,
-						LEN_AND_STR(gtmsource_options.secondary_host));
-					return(-1);
-				}
-			} else
-			{
-				for (tries = 0;
-		     	     	     tries < MAX_GETHOST_TRIES &&
-		     	     	     !(sec_hostentry = GETHOSTBYNAME(gtmsource_options.secondary_host)) &&
-		     	     	     h_errno == TRY_AGAIN;
-		     	     	     tries++);
-				if (NULL == sec_hostentry)
-				{
-					util_out_print("Could not find IP address for !AD", TRUE,
-						LEN_AND_STR(gtmsource_options.secondary_host));
-					return(-1);
-				}
-				gtmsource_options.sec_inet_addr = ((struct in_addr *)sec_hostentry->h_addr_list[0])->s_addr;
 			}
 		}
 		if (CLI_PRESENT == cli_present("CONNECTPARAMS"))
@@ -382,9 +377,58 @@ int gtmsource_get_opt(void)
 			gtmsource_options.statslog = FALSE;
 		else
 		{
-			util_out_print("Invalid value for STATSLOG qualifier, should be either ON or OFF", TRUE);
+			util_out_print("Invalid value for STATSLOG qualifier, must be either ON or OFF", TRUE);
 			return(-1);
 		}
+	}
+	if (cli_present("FREEZE") == CLI_PRESENT)
+	{
+		freeze_val_len = SIZEOF(freeze_val);
+		if (cli_get_str("FREEZE", freeze_val, &freeze_val_len))
+		{
+			gtmsource_options.setfreeze = TRUE;
+			cli_strupper(freeze_val);
+			if (0 == STRCMP(freeze_val, "ON"))
+				gtmsource_options.freezeval = TRUE;
+			else if (0 == STRCMP(freeze_val, "OFF"))
+				gtmsource_options.freezeval = FALSE;
+			else
+			{
+				util_out_print("Invalid value for FREEZE qualifier, must be either ON or OFF", TRUE);
+				return -1;
+			}
+			if (cli_present("COMMENT") == CLI_PRESENT)
+			{
+				if (!gtmsource_options.freezeval)
+				{
+					util_out_print("Invalid qualifier combination, cannot specify FREEZE=OFF with COMMENT",
+							TRUE);
+					return -1;
+				}
+				freeze_comment_len = SIZEOF(freeze_comment);
+				if (!cli_get_str("COMMENT", freeze_comment, &freeze_comment_len))
+				{
+					util_out_print("Error parsing COMMENT qualifier", TRUE);
+					return -1;
+				}
+				gtmsource_options.setcomment = TRUE;
+				STRNCPY_STR(gtmsource_options.freeze_comment, freeze_comment,
+					SIZEOF(gtmsource_options.freeze_comment) - 1);
+				gtmsource_options.freeze_comment[SIZEOF(gtmsource_options.freeze_comment) - 1] = '\0';
+			}
+			else if (cli_present("COMMENT") == CLI_NEGATED)
+			{
+				gtmsource_options.setcomment = TRUE;
+				gtmsource_options.freeze_comment[0] = '\0';
+			}
+			else if (gtmsource_options.freezeval)
+			{
+				util_out_print("Missing qualifier, must specify either COMMENT or NOCOMMENT with FREEZE=ON", TRUE);
+				return -1;
+			}
+		}
+		else
+			gtmsource_options.showfreeze = TRUE;
 	}
 	return(0);
 }

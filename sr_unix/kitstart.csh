@@ -1,7 +1,7 @@
 #!/usr/local/bin/tcsh
 #################################################################
 #								#
-#	Copyright 2011, 2012 Fidelity Information Services, Inc       #
+#	Copyright 2011, 2013 Fidelity Information Services, Inc       #
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -9,12 +9,15 @@
 #	the license, please stop and do not read further.	#
 #								#
 #################################################################
-# kitstart.csh creates distribution kits for pro and dbg.
+# kitstart.csh creates distribution kits for pro and dbg and bta.
 # In order to test any configure.csh changes, copy a modified version into /usr/library/Vxxx/pro/configure
 # and /usr/library/Vxxx/dbg/configure.  Then execute $gtm_tools/kitstart.csh -ti Vxxx and check output log.
 # If changes are made to the configure script, such as removing files or changing permissions in the install
 # directory there may need to be changes made to files used by kitstart.csh to execute
 # $gtm_tools/gtm_compare_dist.csh.
+#
+# set echo
+# set verbose
 #
 # Make sure don't start in utf-8 mode
 if ($?gtm_chset) then
@@ -23,6 +26,15 @@ if ($?gtm_chset) then
 		echo '$gtm_chset'" = $gtm_chset, so change to M mode and also check "$longline
 		exit
 	endif
+endif
+
+# This script needs root privileges to
+# - test install GT.M
+# - set file ownership to 40535
+set euser = `$gtm_dist/geteuid`
+if ("$euser" != "root") then
+	echo "You must have root privileges to run kitstart"
+	exit -1
 endif
 
 if (-e /etc/csh.cshrc) then
@@ -35,61 +47,44 @@ endif
 source $cms_tools/cms_cshrc.csh
 
 source $cms_tools/server_list
-if ("$distrib_servers_unix" !~ *${HOST:r:r:r}*) then
-	echo "This is not a distribution server. Exiting."
-	exit
-endif
 
 setenv PATH "/usr/local/bin:/usr/sbin:/usr/ccs/bin:/usr/bin:/bin"
 
 # get the osname and arch type from the tables in server_list
 
-set servers      = `echo $distrib_servers_unix`
-set platformarch = `echo $distrib_unix_platformarch`
+set servers      = ( $distrib_servers_unix )
+set platformarch = ( $distrib_unix_platformarch )
 
-@ index = 0
-while ($index < $#servers)
-	@ index = $index + 1
-	if ("$servers[$index]" =~ *${HOST:r:r:r}*) then
+foreach server ( $servers )
+	@ index++
+	if ("$server" =~ *${HOST:r:r:r}*) then
+		set os_arch=$platformarch[$index]		# contortion alert! get the OS_ARCH value from the list
+		set os_arch="${os_arch:s/_/ /}"			# and spilt OS_ARCH into "OS ARCH" and
+		set os_arch=( ${os_arch:s/_/ /} )		# enclose it inside parenthesis to force conversion to an array
 		break
 	endif
 end
-set osname = `echo $platformarch[$index] | awk -F_ '{print $1}'`
-set arch = `echo $platformarch[$index] | awk -F_ '{print $2}'`
 
-# create a README.txt which has the current year in it
-setenv readme_txt ${gtm_com}/README.txt
-set year = `date | tail -c5`
-cat $cms_tools/license_README_txt | sed "s/#YEAR#/$year/" > $readme_txt
+# if not found in distribution servers then try from uname in case -allow entered
+if (! $?os_arch) then
+	# make a directory in /tmp to use to run unamearch.m
+	setenv randstr `$gtm_dist/mumps -r %XCMD 'do ^%RANDSTR'`
+	set tempdir = /tmp/kit_unamearch_${randstr}
+	mkdir $tempdir
+	cp $cms_tools/unamearch.m $tempdir
+	set os_arch=`(cd $tempdir; $gtm_dist/mumps -r unamearch $distrib_unix_platformarch%$uname_platformarch)`
+	if ("" == "$os_arch") then
+		echo "Problem getting platform and arch from uname -a"
+		rm -rf $tempdir
+		exit 1
+	endif
+	set os_arch="${os_arch:s/_/ /}"			# and spilt OS_ARCH into "OS ARCH" and
+	set os_arch=( ${os_arch:s/_/ /} )		# enclose it inside parenthesis to force conversion to an array
+	rm -rf $tempdir
+endif
 
-# Set the open source flag and set lib_specific to the platform specific directories that needs to
-# be copied as a part of open source distribution (down the script)
-set open_source = 0
-set GNU_COPYING_license = ""
-set OPENSOURCE_build_README = ""
-if ("$osname" == "linux" && "$arch" == "i686") then
-	set open_source = 1
-	# set lib_specific to be the union of s_linux and s_linux64 so we get the linux sources for
-	# x86 and x86_64
-	set lib_specific = `echo $s_linux $s_linux64 | awk '{for(x=1;x<=NF;x++) array[$x]++ ; for (i in array) print i}'`
-	/bin/cp -pf $cms_tools/opensource_COPYING ${gtm_com}/COPYING
-	# create README with current year in it
-	cat $cms_tools/opensource_README | sed "s/#YEAR#/$year/" > ${gtm_com}/README
-	set GNU_COPYING_license = "${gtm_com}/COPYING"
-	set OPENSOURCE_build_README = "${gtm_com}/README"
-endif
-if ("linux" == "$osname" && "x8664" == "$arch") then
-	# sources already included in i686 above
-	/bin/cp -pf $cms_tools/opensource_COPYING ${gtm_com}/COPYING
-	set GNU_COPYING_license = "${gtm_com}/COPYING"
-endif
-if ("$osname" == "osf1" && "$arch" == "alpha") then
-	set open_source = 1
-	set lib_specific = "$s_dux"
-	/bin/cp -pf $cms_tools/opensource_COPYING ${gtm_com}/COPYING
-	set GNU_COPYING_license = "${gtm_com}/COPYING"
-	set OPENSOURCE_build_README = ""
-endif
+set osname = $os_arch[1]
+set arch = $os_arch[2]
 
 set package = "tar cf"
 set repackage = "tar rf"
@@ -106,31 +101,54 @@ if ($#argv < 1) then
 	set syntaxerr = 1
 else
 	set testinstall = 0
+	set leavedir = 0
+	# when present, do not fire off a background kitstart
 	if ("$1" == "logfile") then
 		set logfile = 1
 		shift
 	endif
+	# perform a test installation
 	if ("$1" == "-ti") then
 		set testinstall = 1
 		shift
 	endif
-	if ("$1" == "" || "$2" != "" && "$2" != "pro" && "$2" != "dbg") then
+	# build a kit on a non-dist server
+	set allow = 0
+	if ("$1" == "-allow") then
+		set allow = 1
+		shift
+	endif
+	# Test the test install
+	if ("$1" == "-tti") then
+		set testinstall = 1
+		set leavedir = 1
+		set allow = 1
+		shift
+	endif
+	if ("$1" == "" || "$2" != "" && "$2" != "pro" && "$2" != "dbg" && "$2" != "bta") then
 		set syntaxerr = 1
 	endif
 endif
 
 if ($syntaxerr) then
 	echo ""
-	echo "Usage : `basename $0` [-ti] <ver> [pro | dbg]"
+	echo "Usage : $0 [-ti] [-allow] [-tti] <ver> [pro | dbg | bta]"
 	echo ""
 	echo "<ver>       : Version with no punctuations; create distribution of this GT.M version (must be in $gtm_root)"
 	echo "-ti         : Test installation"
-	echo "[pro | dbg] : Create distribution of this image; both if not specified"
+	echo "-allow      : allow kit to be built on a non-distribution server"
+	echo "-tti        : Test the test installation, implies -allow and always leaves dist, tmp_dist, install directories"
+	echo "[pro | dbg | bta] : Create distribution of this image; or pro and dbg if not specified"
 	echo ""
 	exit 1
 endif
 
-set version = `echo $1 | tr "[a-z]" "[A-Z]"`
+if (! $allow && ("$distrib_servers_unix" !~ *${HOST:r:r:r}*)) then
+	echo "This is not a distribution server. Exiting."
+	exit
+endif
+
+set version = "${1:au}"		# ':au' - 'a' means apply to the whole string and 'u' means uppercase everything
 
 set imagetype = "pro dbg"
 if ($2 != "") then
@@ -162,7 +180,25 @@ if (! $?logfile) then
 endif
 ########################################################################################
 
-version $version p
+version $version p  # Set the current version so that relative paths work
+cmsver $version	    # Set appropriate path to locate $version sources in CMS, the default is V990
+set releasever = `$gtm_dist/mumps -run %XCMD 'write $piece($zversion," ",2),!'`
+
+# create a README.txt which has the current year in it
+setenv readme_txt ${gtm_com}/README.txt
+set year = `date +%Y`
+sed "s/#YEAR#/$year/" $cms_tools/license_README_txt > $readme_txt
+chmod 444 $readme_txt
+
+# Set the open source flag and set lib_specific to the platform specific directories that needs to
+# be copied as a part of open source distribution (down the script)
+set open_source = 0
+set GNU_COPYING_license = "${gtm_com}/COPYING"
+if (("$osname" == "linux" && ( "$arch" == "i686" || "x8664" == "$arch" )) || ("$osname" == "osf1" && "$arch" == "alpha")) then
+	set open_source = 1
+	/bin/cp -pf $cms_tools/opensource_COPYING $GNU_COPYING_license
+	chmod 444 $GNU_COPYING_license
+endif
 
 set product = "gtm"
 set dist = "$gtm_ver/dist"
@@ -179,18 +215,8 @@ if (-d $dist || -d $tmp_dist || -d $install) then
 endif
 
 echo ""
-if ("$GNU_COPYING_license" != "") then
-	if (! -r "$GNU_COPYING_license") then
-		echo "Could not locate GNU Copying license at $GNU_COPYING_license. Exiting..."
-		exit 4
-	endif
-	if ("$OPENSOURCE_build_README" != "") then
-		if (! -r $OPENSOURCE_build_README) then
-			echo "Could not locate Open Source Build README at $OPENSOURCE_build_README. Exiting..."
-			exit 4
-		endif
-	endif
-	set opensource_dist = "${dist}/opensource"
+set opensource_dist = "${dist}/opensource"
+if (1 == $open_source) then
 	echo "Creating $dist (for non open source customers) and $opensource_dist (for open source)"
 	mkdir -p $opensource_dist || exit 4
 else
@@ -198,22 +224,6 @@ else
 	mkdir $dist || exit 4
 endif
 
-if ("$GNU_COPYING_license" != "") then
-	if (! -e ${dist}/README) then
-		cat > ${dist}/README << OPENSOURCE_EOF
-For paying customers, distribute files in ${dist}
-For non paying customers (Sourceforge) who use the Open Source version,
-distribute files in ${opensource_dist}
-The Open Source binary distribution includes the GNU License (file $GNU_COPYING_license:t)
-The Open Source source distribution includes the GNU License (file $GNU_COPYING_license:t)
-OPENSOURCE_EOF
-		if ("$OPENSOURCE_build_README" != "") then
-			cat >> ${dist}/README << OPENSOURCE_EOF
-and the build procedure documentation (file $OPENSOURCE_build_README:t)
-OPENSOURCE_EOF
-		endif
-	endif
-endif
 foreach image ($imagetype)
 	echo ""
 	echo "Creating ${tmp_dist}/${image}"
@@ -238,6 +248,8 @@ foreach image ($imagetype)
 	endif
 	# add the README.txt file
 	cp $readme_txt README.txt || exit 9
+	# add the custom_errors_sample.txt file
+	cp $gtm_tools/custom_errors_sample.txt . || exit 9
 	if (-e gtmsecshrdir) then
 		$gtm_com/IGS gtmsecshr "UNHIDE"	# make root-owned gtmsecshrdir world-readable
 		chmod u+w gtmsecshrdir
@@ -249,7 +261,7 @@ foreach image ($imagetype)
 		$package $dist_file README.txt dbcertify V5CBSU.m || exit 10
 		echo "Gzipping $dist_file"
 		gzip $dist_file || exit 11
-		if ("$GNU_COPYING_license" != "") then
+		if (1 == $open_source) then
 			echo ""
 			echo "Creating dbcertify distribution for open source (includes GNU License)"
 			echo ""
@@ -282,7 +294,7 @@ foreach image ($imagetype)
 		$package $dist_file README.txt GTMDefinedTypesInit.m || exit 10
 		echo "Gzipping $dist_file"
 		gzip $dist_file || exit 11
-		if ("$GNU_COPYING_license" != "") then
+		if (1 == $open_source) then
 			echo ""
 			echo "Creating GTMDefinedTypesInit distribution for open source (includes GNU License)"
 			echo ""
@@ -331,12 +343,13 @@ foreach image ($imagetype)
 	echo ""
 	echo "Gzipping $dist_file"
 	gzip $dist_file || exit 11
-	if ("$GNU_COPYING_license" != "") then
+	if (1 == $open_source) then
 		echo ""
 		echo "Creating distribution for open source (includes GNU License)"
 		echo ""
 		echo "Copying $GNU_COPYING_license to $cwd"
 		/bin/cp $GNU_COPYING_license . || exit 8
+		chown 40535:40535 COPYING
 		set dist_file="${opensource_dist}/${dist_prefix}_${image}.${package_ext}"
 		echo ""
 		echo "Creating $dist_file"
@@ -349,55 +362,6 @@ foreach image ($imagetype)
 end
 echo ""
 
-# sources for 32 and 64 bit linux done for linux i686 so don't do it for 64 bit linux
-if ("linux" == "$osname" && "x8664" == "$arch") then
-	set GNU_COPYING_license = ""
-endif
-
-# create src tar only for linux and tru64
-if ("$GNU_COPYING_license" != "") then
-	cmsver $version	# Set appropriate path to locate $version sources in CMS mirror
-	if ("$OPENSOURCE_build_README" != "") then
-		echo "Creating source distribution for Opensource including $GNU_COPYING_license:t and $OPENSOURCE_build_README:t"
-	else
-		echo "Creating source distribution for Opensource including $GNU_COPYING_license:t"
-	endif
-	echo ""
-	set liblist = ""
-	foreach libdir ($lib_specific)
-		set liblist = "$liblist $libdir:t"
-	end
-	echo ""
-	set src_tar="${opensource_dist}/${dist_prefix}_src.${package_ext}"
-	echo "Creating $src_tar"
-	cd $cms_root/$version || exit 10
-	$package $src_tar $liblist || exit 10
-	cd $gtm_com || exit 10
-	if ("$OPENSOURCE_build_README" != "") then
-		$repackage $src_tar $GNU_COPYING_license:t $OPENSOURCE_build_README:t || exit 10
-	else
-		$repackage $src_tar $GNU_COPYING_license:t $readme_txt:t || exit 10
-	endif
-	echo ""
-	echo "Gzipping $src_tar"
-	gzip $src_tar || exit 11
-	echo ""
-	if ("$OPENSOURCE_build_README" != "") then
-		cat << EOF_MK
-############################################################################
-!!!!! TEST THE MAKEFILE !!!!!
-First untar the opensource files in a directory:
-mkdir ${opensource_dist}/build
-cd ${opensource_dist}/build
-tar zxvf $src_tar
-Then follow the instructions from $gtm_com/README:
-----------------------------------------------------------------------------
-`cat $gtm_com/README`
-############################################################################
-EOF_MK
-	endif
-endif
-
 find $dist -type f -exec chmod 444 {} \;
 find $dist -type d -exec chmod 755 {} \;
 chown -R library:gtc $dist
@@ -405,8 +369,7 @@ echo "Files in $dist"
 /bin/ls -lR $dist
 echo ""
 
-set leavedir = 0
-set kitver = `echo $gtm_ver:t | cut -c 2-6`
+set kitver = ${gtm_ver:t:s/V//}
 
 if ($testinstall) then
 	echo ""
@@ -470,15 +433,10 @@ n
 CONFIGURE_EOF
 		endif
 
-		# We need for root to be a member of the restricted group.  It is a member of the "root" group
-		# for all linux OS and it is a member of "lp" for all others except osf1 where it is "vboxusers"
-		if("$osname" == "linux") then
-			setenv rootgroup "root"
-		else if ("$osname" != "osf1") then
-			setenv rootgroup "lp"
-		else
-			setenv rootgroup "vboxusers"
-		endif
+		# We need for root to be a member of the restricted group so that it can run tests. root is a
+		# member of the gtmsec NIS group.
+		setenv rootgroup gtmsec
+
 		# V54002 now asks for an installation group before the restricted group question so response is
 		# reversed from V54000
 		# V54003 now asks whether or not to retain .o files if libgtmutil.so is created
@@ -541,12 +499,13 @@ CONFIGURE_EOF
 		if ("pro" == ${image}) then
 			# create the build.dir.  Only have to do it once
 			cd $gtm_ver || exit 14
+			# insert "pro:" for non Linux/Solaris
 			if ((${osname} != linux) && (${osname} != solaris)) echo pro: > ${tmp_dist}/build.dir
 			ls -lR pro >> ${tmp_dist}/build.dir
 			if (aix == ${osname}) then
-				cat ${tmp_dist}/build.dir | \
-awk '$0 == "pro/gtmsecshrdir:" {printf "\n%s\n", $0} $0 != "pro/gtmsecshrdir:" {printf "%s\n", $0}' > ${tmp_dist}/tbuild.dir
-				mv ${tmp_dist}/tbuild.dir ${tmp_dist}/build.dir
+				# insert a newline before "pro/gtmsecshrdir:" on AIX
+				mv ${tmp_dist}/build.dir ${tmp_dist}/tbuild.dir
+				awk '/^pro.gtmsecshrdir:$/{print ""}{print $0}' ${tmp_dist}/tbuild.dir > ${tmp_dist}/build.dir
 			endif
 
 			# make a defgroup directory under ${tmp_dist} and copy in the build.dir for use in
@@ -559,36 +518,38 @@ awk '$0 == "pro/gtmsecshrdir:" {printf "\n%s\n", $0} $0 != "pro/gtmsecshrdir:" {
 			while (2 > $both)
 				# create the install.dir from both installations
 				cd ${install}/$defgroup
+				# insert "pro:" for non Linux/Solaris
 				if ((${osname} != linux) && (${osname} != solaris)) echo pro: > ${tmp_dist}/$defgroup/install.dir
 				ls -lR pro >> ${tmp_dist}/$defgroup/install.dir
 				if (aix == ${osname}) then
-					cat ${tmp_dist}/$defgroup/install.dir | \
-awk '$0 == "pro/gtmsecshrdir:" {printf "\n%s\n", $0} $0 != "pro/gtmsecshrdir:" {printf "%s\n", $0}' > \
-${tmp_dist}/$defgroup/tinstall.dir
-					mv ${tmp_dist}/$defgroup/tinstall.dir ${tmp_dist}/$defgroup/install.dir
+					# insert a newline before "pro/gtmsecshrdir:" on AIX
+					mv ${tmp_dist}/$defgroup/install.dir ${tmp_dist}/$defgroup/tinstall.dir
+					awk '/^pro.gtmsecshrdir:$/{print ""}{print $0}' ${tmp_dist}/$defgroup/tinstall.dir \
+						 > ${tmp_dist}/$defgroup/install.dir
 				endif
 				cd ${tmp_dist}/${image}
 				set comp="$gtm_tools/gtm_compare_dir.csh ${install} ${tmp_dist}/$defgroup $gtm_tools/bdelete.txt"
+				set adddir=$gtm_tools/badd.txt
+				set deldir=$gtm_tools/bdeldir.txt
 				if (("linux" == ${osname}) && ("i686" == ${arch})) then
-					$comp $gtm_tools/linuxi686_badd.txt $gtm_tools/bdeldir.txt ${osname}
-					set teststat = $status
+					set adddir=$gtm_tools/linuxi686_badd.txt
 				else if (("hpux" == ${osname}) && ("parisc" == ${arch})) then
-					$comp $gtm_tools/hpuxparisc_badd.txt $gtm_tools/hpuxparisc_bdeldir.txt ${osname}
-					set teststat = $status
+					set adddir=$gtm_tools/hpuxparisc_badd.txt
+					set deldir=$gtm_tools/hpuxparisc_bdeldir.txt
 				else if (("hpux" == ${osname}) && ("ia64" == ${arch})) then
-					$comp $gtm_tools/hpuxia64_badd.txt $gtm_tools/bdeldir.txt ${osname}
-					set teststat = $status
+					set adddir=$gtm_tools/hpuxia64_badd.txt
 				else if (("osf1" == ${osname}) && ("alpha" == ${arch})) then
-					$comp $gtm_tools/osf1alpha_badd.txt $gtm_tools/hpuxparisc_bdeldir.txt ${osname}
-					set teststat = $status
-				else
-					$comp $gtm_tools/badd.txt $gtm_tools/bdeldir.txt ${osname}
-					set teststat = $status
+					set adddir=$gtm_tools/osf1alpha_badd.txt
+					set deldir=$gtm_tools/hpuxparisc_bdeldir.txt
 				endif
+				$comp $adddir $deldir ${osname}
+				set teststat = $status
 				if ($teststat) then
 					echo ""
 					echo "Comparison of build and install directories failed."
 					echo "Look in ${tmp_dist}/$defgroup/dircompare/diff.out"
+					echo "$comp $adddir $deldir ${osname}"
+					chmod -R ugo+rwx ${tmp_dist}/$defgroup/dircompare
 					exit 16
 				endif
 				# to simplify the code to do the gtm_compare_dir.csh for both restricted and unrestricted group

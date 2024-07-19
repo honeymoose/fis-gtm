@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2005, 2011 Fidelity Information Services, Inc.	*
+ *	Copyright 2005, 2013 Fidelity Information Services, Inc.	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -79,7 +79,7 @@
 #endif
 
 #ifdef GTM_TRIGGER
-#include "rtnhdr.h"			/* for rtn_tabent in gv_trigger.h */
+#include <rtnhdr.h>			/* for rtn_tabent in gv_trigger.h */
 #include "gv_trigger.h"
 #include "tp_set_sgm.h"
 #endif
@@ -107,6 +107,9 @@ GBLREF  uint4                   image_count;
 GBLREF boolean_t		disk_blk_read;
 LITREF	mval			literal_hasht;
 static	uint4			last_pre_read_offset;
+
+error_def(ERR_DBCCERR);
+error_def(ERR_ERRCALL);
 
 int updhelper_reader(void)
 {
@@ -168,9 +171,9 @@ boolean_t updproc_preread(void)
 	unsigned char 		buff[MAX_ZWR_KEY_SZ], *end;
 	uint4			write, write_wrap;
 #endif
+	DCL_THREADGBL_ACCESS;
 
-	error_def(ERR_DBCCERR);
-	error_def(ERR_ERRCALL);
+	SETUP_THREADGBL_ACCESS;
 	maxspins = num_additional_processors ? MAX_LOCK_SPINS(LOCK_SPINS, num_additional_processors) : 1;
 	upd_proc_local = recvpool.upd_proc_local;
 	recvpool_ctl = recvpool.recvpool_ctl;
@@ -218,7 +221,8 @@ boolean_t updproc_preread(void)
 		}
 		if (0 == retries)
 		{
-			gtm_putmsg(VARLSTCNT(9) ERR_DBCCERR, 2, LIT_AND_LEN("Pre-reader"), ERR_ERRCALL, 3, CALLFROM);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(9) ERR_DBCCERR, 2, LIT_AND_LEN("Pre-reader"),
+					ERR_ERRCALL, 3, CALLFROM);
 			return FALSE;
 		}
 #ifdef REPL_DEBUG
@@ -335,6 +339,7 @@ boolean_t updproc_preread(void)
 						&& (key_len == keystr->length))	/* If the shared copy changed underneath us, what
 										   we copied over is potentially a bad record */
 					{
+						TREF(tqread_nowait) = FALSE;	/* don't screw up gvcst_root_search */
 						UPD_GV_BIND_NAME_APPROPRIATE(gd_header, mname, lcl_key, key_len); /* if ^#t do
 													       special processing */
 						/* the above would have set gv_target and gv_cur_region appropriately */
@@ -355,7 +360,11 @@ boolean_t updproc_preread(void)
 							gv_currkey->end = key_len;
 							disk_blk_read = FALSE;
 							DEBUG_ONLY(num_helped++);
+							TREF(tqread_nowait) = TRUE;
+							assert(!csa->now_crit);
 							status = gvcst_search(gv_currkey, NULL);
+							assert(!csa->now_crit);
+							TREF(tqread_nowait) = FALSE;	/* reset as soon as possible */
 							if (cdb_sc_normal != status)
 							{	/* If gvcst_search returns abnormal status, no need to retry since
 								 * we are a pre-reader but we need to reset clue to avoid fast-path
@@ -365,11 +374,11 @@ boolean_t updproc_preread(void)
 								 * non-NULL. But this is not necessarily guaranteed for example if
 								 * gvcst_search returns abnormal status due to t_qread returning
 								 * NULL (due in turn to the function "wcs_phase2_commit_wait"
-								 * detecting csd->wc_blocked is TRUE and deciding to restart). In
-								 * this case buffaddr will be set to NULL while cr will be non-NULL
-								 * causing srch_status to be inconsistent. Resetting the clue would
-								 * cause this to be freshly initialized next time gvcst_search for
-								 * this gv_target is called.
+								 * detecting csa->nl->wc_blocked is TRUE and deciding to restart).
+								 * In this case buffaddr will be set to NULL while cr will be
+								 * non-NULL causing srch_status to be inconsistent. Resetting the
+								 * clue would cause this to be freshly initialized next time
+								 * gvcst_search for this gv_target is called.
 								 */
 								gv_target->clue.end = 0;
 							}

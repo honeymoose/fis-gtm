@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -23,12 +23,14 @@
 #endif
 
 #include "gt_timer.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "stack_frame.h"
 #include "mv_stent.h"
 #ifdef __MVS__
 #include "gtm_zos_io.h"
 #endif
+
+error_def(ERR_BADCHSET);
 
 #define INSERT			TRUE
 #define NO_INSERT		FALSE
@@ -38,6 +40,7 @@
 #define MAX_DEVCTL_LENGTH	256
 #define IO_ESC			0x1b
 #define MAX_DEV_TYPE_LEN	7
+#define DD_BUFLEN		80
 
 #define CHAR_FILTER 128
 #define ESC1 1
@@ -123,6 +126,8 @@ typedef struct io_desc_struct
 		unsigned short	zeof;
 		unsigned short	za;
 		unsigned char	zb[ESC_LEN];
+ 		char		key[DD_BUFLEN];
+ 		char		device[DD_BUFLEN];
 	}dollar;
 	unsigned char			esc_state;
 	void				*dev_sp;
@@ -261,6 +266,7 @@ ioxx_open(ff);
 #ifdef UNIX
 ioxx_open(pi);
 xxdlr(iopi);	/* we need iopi_iocontrol(), iopi_dlr_device() and iopi_dlr_key() */
+xxdlr(iott);	/* we need iott_iocontrol(), iott_dlr_device() and iott_dlr_key() */
 #endif
 ioxx_wttab(us);
 /* iott_ prototypes */
@@ -295,7 +301,6 @@ boolean_t iosocket_wait(io_desc *iod, int4 timepar);
 void iosocket_poolinit(void);
 
 /* iotcp_ prototypes */
-char *iotcp_name2ip(char *name);
 int iotcp_fillroutine(void);
 int iotcp_getlsock(io_log_name *dev);
 void iotcp_rmlsock(io_desc *iod);
@@ -334,6 +339,7 @@ void get_dlr_key(mval *v);
 void flush_pio(void);
 
 void remove_rms(io_desc *ciod);
+void iosocket_destroy(io_desc *ciod);
 
 dev_dispatch_struct *io_get_fgn_driver(mstr *s);
 
@@ -397,14 +403,13 @@ LITREF unsigned char ebcdic_spaces_block[];
 #define SET_ENCODING(CHSET, CHSET_MSTR)												\
 {																\
 	int 	chset_idx;													\
-	error_def(ERR_BADCHSET);												\
 																\
 	chset_idx = verify_chset(CHSET_MSTR);											\
 		;														\
 	if (0 <= chset_idx)													\
 		(CHSET) = (gtm_chset_t)chset_idx;										\
 	else															\
-		rts_error(VARLSTCNT(4) ERR_BADCHSET, 2, (CHSET_MSTR)->len, (CHSET_MSTR)->addr);					\
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_BADCHSET, 2, (CHSET_MSTR)->len, (CHSET_MSTR)->addr);		\
 }
 
 #endif /* IO_H */

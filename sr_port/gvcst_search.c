@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -64,6 +64,7 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 	register srch_blk_status *pCurr;
 	register srch_blk_status *pNonStar;
 	register srch_hist	*pTargHist;
+	int			tmp_cmpc;
 	block_id		nBlkId;
 	cache_rec_ptr_t		cr;
 	int			cycle;
@@ -75,9 +76,11 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 	boolean_t		already_built, is_mm;
 	ht_ent_int4		*tabent;
 	sm_uc_ptr_t		buffaddr;
-	trans_num		blkhdrtn;
+	trans_num		blkhdrtn, oldest_hist_tn;
 	int			hist_size;
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	pTarg = gv_target;
 	assert(NULL != pTarg);
 	assert(pTarg->root);
@@ -149,15 +152,13 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 			 * gv_target in this TP transaction and if so we need to reset the out-of-date field.
 			 */
 			if (pTarg->read_local_tn != local_tn)
-			{
-				for (srch_status = &pTarg->hist.h[0]; HIST_TERMINATOR != srch_status->blk_num; srch_status++)
-					srch_status->first_tp_srch_status = NULL;
-			}
+				GVT_CLEAR_FIRST_TP_SRCH_STATUS(pTarg);
 			/* TP & going to use clue. check if clue path contains a leaf block with a corresponding unbuilt
 			 * cse from the previous traversal. If so build it first before gvcst_search_blk/gvcst_search_tail.
 			 */
 			tp_srch_status = NULL;
 			leaf_blk_hist = &pTarg->hist.h[0];
+			assert(leaf_blk_hist->blk_target == pTarg);
 			assert(0 == leaf_blk_hist->level);
 			chain1 = *(off_chain *)&leaf_blk_hist->blk_num;
 			if (chain1.flag == 1)
@@ -181,7 +182,7 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 				cse = (NULL != tp_srch_status) ? tp_srch_status->cse : NULL;
 			}
 			assert(!cse || !cse->high_tlevel);
-			if ((NULL == tp_srch_status) || (tp_srch_status->blk_target == leaf_blk_hist->blk_target))
+			if ((NULL == tp_srch_status) || (tp_srch_status->blk_target == pTarg))
 			{	/* Either the leaf level block in clue is not already present in the current TP transaction's
 				 * hashtable OR it is already present and the corresponding globals match. If they dont match
 				 * we know for sure the clue is out-of-date (i.e. using it will lead to a transaction restart)
@@ -237,19 +238,33 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 						leaf_blk_hist->cycle = CYCLE_PVT_COPY;
 						leaf_blk_hist->buffaddr = cse->new_buff;
 					} else
-					{	/* Keep leaf_blk_hist->buffaddr and cse->new_buff in sync. Dont know how they
-						 * cannot be the same but it seems possible if the gvcst_blk_build happened as
-						 * part of a t_qread call (which does not have enough information to update the
-						 * search history buffer address) without going through gvcst_search. Since the
-						 * consequences of these two not being in sync are database damage, we fix them
-						 * in pro just in case they are different.
+					{	/* Keep leaf_blk_hist->buffaddr and cse->new_buff in sync. If a TP transaction
+						 * updates two different globals and the second update invoked t_qread for a leaf
+						 * block corresponding to the first global and ended up constructing a private block
+						 * then leaf_blk_hist->buffaddr of the first global will be out-of-sync with the
+						 * cse->new_buff. However, the transaction validation done in tp_hist/tp_tend
+						 * should detect this and restart. Set donot_commit to verify that a restart happens
 						 */
-						assert(leaf_blk_hist->buffaddr == cse->new_buff);
-						leaf_blk_hist->buffaddr = cse->new_buff;
+#						ifdef DEBUG
+						if (leaf_blk_hist->buffaddr != cse->new_buff)
+							TREF(donot_commit) |= DONOTCOMMIT_GVCST_SEARCH_LEAF_BUFFADR_NOTSYNC;
+#						endif
+						leaf_blk_hist->buffaddr = cse->new_buff; /* sync the buffers in pro, just in case */
 					}
 				}
 			} else
-				status = cdb_sc_lostcr;	/* two different gv_targets point to same block; discard out-of-date clue */
+			{	/* Two different gv_targets point to same block; discard out-of-date clue. */
+#				ifdef DEBUG
+				if ((pTarg->read_local_tn >= local_tn) && (NULL != leaf_blk_hist->first_tp_srch_status))
+				{	/* Since the clue was used in *this* transaction, it cannot successfully complete. Set
+					 * donot_commit to verify that a restart happens (either in tp_hist or tp_tend)
+					 */
+					assert(pTarg->read_local_tn == local_tn);
+					TREF(donot_commit) |= DONOTCOMMIT_GVCST_SEARCH_BLKTARGET_MISMATCH;
+				}
+#				endif
+				status = cdb_sc_lostcr;
+			}
 		}
 		/* Validate EVERY level in the clue before using it for ALL retries. This way we avoid unnecessary restarts.
 		 * This is NECESSARY for the final retry (e.g. in a TP transaction that does LOTS of reads of different globals,
@@ -257,9 +272,11 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 		 * performance reasons) in the other tries. The cost of a restart (particularly in TP) is very high that it is
 		 * considered okay to take the hit of validating the entire clue before using it even if it is not the final retry.
 		 */
-		DEBUG_ONLY(is_mm = (dba_mm == cs_data->acc_meth);)
 		if (cdb_sc_normal == status)
 		{
+			is_mm = (dba_mm == cs_data->acc_meth);
+			if (!is_mm)
+				oldest_hist_tn = OLDEST_HIST_TN(cs_addrs);
 			for (srch_status = &pTargHist->h[0]; HIST_TERMINATOR != srch_status->blk_num; srch_status++)
 			{
 				assert(srch_status->level == srch_status - &pTargHist->h[0]);
@@ -279,8 +296,17 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 						status = cdb_sc_lostcr;
 						break;
 					}
-					if (CDB_STAGNATE <= t_tries || mu_reorg_process)
+					if ((CDB_STAGNATE <= t_tries) || mu_reorg_process)
+					{
 						CWS_INSERT(cr->blk);
+						if ((CDB_STAGNATE <= t_tries) && (srch_status->tn <= oldest_hist_tn))
+						{	/* The tn at which the history was last validated is before the earliest
+							 * transaction in the BT. The clue can no longer be relied upon.
+							 */
+							status = cdb_sc_losthist;
+							break;
+						}
+					}
 					cr->refer = TRUE;
 				}
 			}
@@ -457,12 +483,13 @@ enum cdb_sc 	gvcst_search(gv_key *pKey,		/* Key to search for */
 				assert(CDB_STAGNATE > t_tries);
 				return cdb_sc_rmisalign;
 			}
-			if (pNonStar->curr_rec.match < ((rec_hdr_ptr_t)pRec)->cmpc)
+			EVAL_CMPC2((rec_hdr_ptr_t)pRec, n1);
+			if (pNonStar->curr_rec.match < n1)
 			{
 				assert(CDB_STAGNATE > t_tries);
 			 	return cdb_sc_rmisalign;
 			}
-			if ((n1 = ((rec_hdr_ptr_t)pRec)->cmpc) > (int)(pTarg->last_rec->top))
+			if (n1 > (int)(pTarg->last_rec->top))
 			{
 				assert(CDB_STAGNATE > t_tries);
 				return cdb_sc_keyoflow;

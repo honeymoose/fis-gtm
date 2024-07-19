@@ -1,6 +1,6 @@
 #################################################################
 #                                                               #
-#       Copyright 2010, 2012 Fidelity Information Services, Inc.#
+#       Copyright 2010, 2013 Fidelity Information Services, Inc.#
 #                                                               #
 #       This source code contains the intellectual property     #
 #       of its copyright holder(s), and is made available       #
@@ -89,7 +89,7 @@ if [ $gtm_dist != "$old_gtm_dist" ] ; then
     # Note that if UTF-8 mode cannot be properly set, GT.M remains configured for M mode
     if [ "zos" = $arch ] ; then
 	# for z/OS make sure the en_US.UTF-8 locale is available and set $gtm_chset_locale if it is
-	utflocale=`locale -a | grep -i en_us | grep -i utf | sed 's/.lp64$//' | grep '8$' | head -n1`
+	utflocale=`locale -a | grep -i en_us | grep -i utf | sed 's/.lp64$//' | grep '8$' | head -n 1`
 	if [ "`echo $gtm_chset|tr utf UTF`" = "UTF-8" -a -d $gtm_dist/utf8 -a $utflocale = en_US.UTF-8 ] ; then
 		gtm_chset_locale=$utflocale; export gtm_chset_locale
 		if [ "`echo Halt | gtm_prompt='GTM>' $gtm_dist/utf8/mumps -dir | tail -n 1`" = 'GTM>' ] ; then
@@ -239,12 +239,16 @@ if [ $gtm_dist != "$old_gtm_dist" ] ; then
 
     # Other useful environment variables
     # System administrators - add, delete or modify GT.M environment variables here as appropriate for your installation
+    if [ -z "$gtm_etrap" ] ; then
+        gtm_etrap='Write:(0=$STACK) "Error occurred: ",$ZStatus,!' ; export gtm_etrap
+    fi
     if [ -z "$gtm_principal_editing" ] ; then
         gtm_principal_editing="EDITING" ; export gtm_principal_editing
     fi
     if [ -z "$gtm_repl_instance" ] ; then
         gtm_repl_instance=$gtmdir/$gtmver/g/gtm.repl ; export gtm_repl_instance
-    else gtm_repl_instance=`echo $gtm_repl_instance | sed "s;$old_gtmver;$gtmver;"`
+    elif [ -n "$old_gtmver" ] ; then
+	gtm_repl_instance=`echo $gtm_repl_instance | sed "s;$old_gtmver;$gtmver;"`
     fi
     if [ -z "$gtm_retention" ] ; then
         gtm_retention=42 ; export gtm_retention

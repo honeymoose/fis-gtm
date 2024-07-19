@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2005, 2006 Fidelity Information Services, Inc.	*
+ *	Copyright 2005, 2012 Fidelity Information Services, Inc.*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -93,6 +93,14 @@ GBLREF	recvpool_addrs		recvpool;
 GBLREF	upd_helper_entry_ptr_t	helper_entry;
 GBLREF	uint4			process_id;
 GBLREF	boolean_t		is_updhelper;
+#ifdef UNIX
+GBLREF	boolean_t		jnlpool_init_needed;
+#endif
+
+error_def(ERR_NOTALLDBOPN);
+error_def(ERR_RECVPOOLSETUP);
+error_def(ERR_REPLWARN);
+error_def(ERR_TEXT);
 
 void updhelper_init(recvpool_user who)
 {
@@ -103,11 +111,6 @@ void updhelper_init(recvpool_user who)
 	char			proc_name[PROC_NAME_MAXLEN + 1], *proc_prefix;
 	struct dsc$descriptor_s proc_name_desc;
 #endif
-	error_def(ERR_RECVPOOLSETUP);
-	error_def(ERR_TEXT);
-	error_def(ERR_NOTALLDBOPN);
-	error_def(ERR_REPLWARN);
-
 	is_updhelper = TRUE;
 	getjobnum();
 	VMS_ONLY(recvpool_init(UPD_HELPER_READER, FALSE, FALSE);)
@@ -134,6 +137,7 @@ void updhelper_init(recvpool_user who)
 			break;
 		}
 	}
+	OPERATOR_LOG_MSG;
 	if (helper == helper_top)
 	{ /* did not find my entry possibly due to startup directly from command line as opposed to the desired via-rcvr server */
 		rts_error(VARLSTCNT(6) ERR_RECVPOOLSETUP, 0, ERR_TEXT, 2,
@@ -142,6 +146,7 @@ void updhelper_init(recvpool_user who)
 	helper_entry = helper;
 
 	gvinit();
+	UNIX_ONLY(jnlpool_init_needed = TRUE);
 	if (!region_init(FALSE))
 		gtm_putmsg(VARLSTCNT(1) ERR_NOTALLDBOPN);
 	return;

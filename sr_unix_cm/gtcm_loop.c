@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc *
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc *
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -46,9 +46,11 @@
 #include "error.h"
 #include "gtmio.h"
 #include "have_crit.h"
+#include "gtm_time.h"
+#include "fork_init.h"
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/gtcm_loop.c,v 1.8 2013/10/23 03:49:31 tuskentower Exp $";
 #endif
 
 GBLREF int		psock;
@@ -240,7 +242,7 @@ void gcore_server(void)
 		dump_rc_hist();
 	}
 
-	pid=fork();	/* BYPASSOK: we are dumping a core, so no FORK_CLEAN needed */
+	FORK(pid);	/* BYPASSOK: we are dumping a core, so no FORK_CLEAN needed */
 	if (pid < 0)	/* fork error */
 	{
 		OMI_DBG((omi_debug,

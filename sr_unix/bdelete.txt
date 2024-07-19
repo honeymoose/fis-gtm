@@ -1,6 +1,6 @@
 #################################################################
 #								#
-#	Copyright 2011 Fidelity Information Services, Inc       #
+#	Copyright 2011, 2013 Fidelity Information Services, Inc       #
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -16,7 +16,6 @@ GENDASH.o
 GENOUT.o
 GTMDefinedTypesInit.m
 GTMDefinedTypesInit.o
-GTMHELP.o
 GTMHLPLD.o
 LOADOP.o
 LOADVX.o
@@ -51,7 +50,6 @@ gtmcrypt_interface.h
 gtmcrypt_pk_ref.h
 gtmcrypt_ref.h
 gtmcrypt_sym_ref.h
-gtmxc_types.h
 install.sh
 ld_verbose.out
 libgtmcrypt.dll
@@ -69,7 +67,6 @@ GENDASH.o
 GENOUT.o
 GTMDefinedTypesInit.m -> ../GTMDefinedTypesInit.m
 GTMDefinedTypesInit.o
-GTMHELP.o
 GTMHLPLD.o
 LOADOP.o
 LOADVX.o
@@ -83,6 +80,8 @@ configure -> ../configure
 dbcertify -> ../dbcertify
 gtmhelp.dmp -> ../gtmhelp.dmp
 gtminstall -> ../gtminstall
+gtmsecshr -> ../gtmsecshr
+gtmsecshrdir -> ../gtmsecshrdir
 lowerc_cp -> ../lowerc_cp
 map -> ../map
 mumps.gld -> ../mumps.gld

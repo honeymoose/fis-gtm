@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -28,8 +28,8 @@
 #include "longset.h"		/* also needed for cws_insert.h */
 #include "cws_insert.h"		/* for cw_stagnate_reinitialized */
 #ifdef GTM_TRIGGER
-#include "rtnhdr.h"
-#include "gv_trigger.h"		/* for INVALIDATE_TRIGGER_CYCLES_IF_NEEDED macro */
+#include <rtnhdr.h>
+#include "gv_trigger.h"		/* for TP_INVALIDATE_TRIGGER_CYCLES_IF_NEEDED macro */
 #endif
 
 GBLREF	sgm_info		*first_sgm_info;
@@ -203,9 +203,7 @@ void tp_incr_clean_up(uint4 newlevel)
 		}
 		DEBUG_ONLY(if (!si->update_trans) DBG_CHECK_SI_BUDDY_LIST_IS_REINITIALIZED(si);)
 	}
-	GTMTRIG_ONLY(
-		INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(TRUE, FALSE);
-	)
+	GTMTRIG_ONLY(TP_INVALIDATE_TRIGGER_CYCLES_IF_NEEDED(TRUE, FALSE);)
 	/* After an incremental rollback, it is possible that some gv_targets now have a block-split history that reflects
 	 * a created block number that is no longer relevant due to the rollback. Fix those as needed.
 	 */
@@ -370,12 +368,12 @@ void rollbk_sgm_tlvl_info(uint4 newlevel, sgm_info *si)
 			ks->used = tli->tlvl_kill_used;
 			si->kill_set_tail = ks;
 			temp_kill_set = ks->next_kill_set;
-			FREE_KILL_SET(si, temp_kill_set);
+			FREE_KILL_SET(temp_kill_set);
 			ks->next_kill_set = NULL;
 		} else
 		{
 			temp_kill_set = si->kill_set_head;
-			FREE_KILL_SET(si, temp_kill_set);
+			FREE_KILL_SET(temp_kill_set);
 			si->kill_set_head = si->kill_set_tail = NULL;
 		}
 		FREE_JFB_INFO_IF_NEEDED(csa, si, tli, FALSE);
@@ -411,7 +409,7 @@ void rollbk_sgm_tlvl_info(uint4 newlevel, sgm_info *si)
 	{	/* there was nothing at the beginning of transaction level (newlevel + 1) */
 		assert(tli == si->tlvl_info_head);
 		temp_kill_set = si->kill_set_head;
-		FREE_KILL_SET(si, temp_kill_set);
+		FREE_KILL_SET(temp_kill_set);
 		si->kill_set_head = si->kill_set_tail = NULL;
 		FREE_JFB_INFO_IF_NEEDED(csa, si, tli, TRUE);
 		reinitialize_hashtab_int4(si->blks_in_use);

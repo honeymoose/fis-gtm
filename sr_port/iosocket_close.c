@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2007 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -35,7 +35,10 @@
 #include "stringpool.h"
 
 GBLREF tcp_library_struct	tcp_routines;
+GBLREF io_desc		*active_device;
 LITREF unsigned char		io_params_size[];
+error_def(ERR_SOCKNOTFND);
+
 void iosocket_close(io_desc *iod, mval *pp)
 {
 	boolean_t	socket_specified = FALSE;
@@ -46,9 +49,11 @@ void iosocket_close(io_desc *iod, mval *pp)
 	char		sock_handle[MAX_HANDLE_LEN];
 	int4		ii, jj, start, end, index;
 	int		p_offset = 0;
-	error_def(ERR_SOCKNOTFND);
+	boolean_t socket_destroy = FALSE;
+
 	assert(iod->type == gtmsocket);
 	dsocketptr = (d_socket_struct *)iod->dev_sp;
+
 	while (iop_eol != (ch = *(pp->str.addr + p_offset++)))
 	{
 		switch (ch)
@@ -86,6 +91,12 @@ void iosocket_close(io_desc *iod, mval *pp)
 				ICONV_OPEN_CD(iod->output_conv_cd, (char *)(pp->str.addr + p_offset + 1), INSIDE_CH_SET);
 #endif
 			break;
+		case iop_destroy:
+			socket_destroy = TRUE;
+			break;
+		case iop_nodestroy:
+			socket_destroy = FALSE;
+			break;
 		default:
 			break;
 		}
@@ -96,7 +107,7 @@ void iosocket_close(io_desc *iod, mval *pp)
 	{
 		if (0 > (index = iosocket_handle(sock_handle, &handle_len, FALSE, dsocketptr)))
 		{
-			rts_error(VARLSTCNT(4) ERR_SOCKNOTFND, 2, handle_len, sock_handle);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_SOCKNOTFND, 2, handle_len, sock_handle);
 			return;
 		}
 		start = end = index;
@@ -110,11 +121,7 @@ void iosocket_close(io_desc *iod, mval *pp)
 	{
 		socketptr = dsocketptr->socket[ii];
 		tcp_routines.aa_close(socketptr->sd);
-		iosocket_delimiter((unsigned char *)NULL, 0, socketptr, TRUE); /* free the delimiter space */
-		free(socketptr->buffer);
-		if (NULL != socketptr->zff.addr)
-			free(socketptr->zff.addr);
-		free(socketptr);
+		SOCKET_FREE(socketptr);
 		if (dsocketptr->current_socket >= ii)
 			dsocketptr->current_socket--;
 		for (jj = ii + 1; jj <= dsocketptr->n_socket - 1; jj++)
@@ -122,5 +129,12 @@ void iosocket_close(io_desc *iod, mval *pp)
 		dsocketptr->n_socket--;
 	}
 	if (!socket_specified)
+	{
 		iod->state = dev_closed;
+		if (socket_destroy)
+		{
+			active_device = 0;
+			iosocket_destroy(iod);
+		}
+	}
 }

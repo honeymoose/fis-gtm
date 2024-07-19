@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2006, 2010 Fidelity Information Services, Inc	*
+ *	Copyright 2006, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -49,10 +49,14 @@ GBLREF	gtmsource_options_t	gtmsource_options;
 GBLREF	boolean_t		holds_sem[NUM_SEM_SETS][NUM_SRC_SEMS];
 GBLREF	gd_addr			*gd_header;
 
+error_def(ERR_NOTALLDBOPN);
+error_def(ERR_REPLJNLCLOSED);
+error_def(ERR_SRCSRVNOTEXIST);
+
 int gtmsource_checkhealth(void)
 {
 	uint4			gtmsource_pid;
-	int			status, semval;
+	int			status, semval, save_errno;
 	boolean_t		srv_alive, all_files_open;
 	gtmsource_local_ptr_t	gtmsourcelocal_ptr;
 	int4			index, num_servers;
@@ -61,10 +65,7 @@ int gtmsource_checkhealth(void)
 	sgmnt_addrs		*csa;
 	sgmnt_data_ptr_t	csd;
 	char			errtxt[OUT_BUFF_SIZE];
-
-	error_def(ERR_NOTALLDBOPN);
-	error_def(ERR_REPLJNLCLOSED);
-	error_def(ERR_SRCSRVNOTEXIST);
+	char			*modestr;
 
 	assert(holds_sem[SOURCE][JNL_POOL_ACCESS_SEM]);
 	if (NULL != jnlpool.gtmsource_local)	/* Check health of a specific source server */
@@ -92,14 +93,27 @@ int gtmsource_checkhealth(void)
 		srv_alive = (0 == gtmsource_pid) ? FALSE : is_proc_alive(gtmsource_pid, 0);
 		if (srv_alive)
 		{
-			repl_log(stderr, FALSE, TRUE, FORMAT_STR1, gtmsource_pid, "Source server", "",
-				((GTMSOURCE_MODE_ACTIVE == gtmsourcelocal_ptr->mode) ? "ACTIVE" : "PASSIVE"));
+			if (GTMSOURCE_MODE_ACTIVE == gtmsourcelocal_ptr->mode)
+				modestr = "ACTIVE";
+			else if (GTMSOURCE_MODE_ACTIVE_REQUESTED == gtmsourcelocal_ptr->mode)
+				modestr = "ACTIVE REQUESTED";
+			else if (GTMSOURCE_MODE_PASSIVE == gtmsourcelocal_ptr->mode)
+				modestr = "PASSIVE";
+			else if (GTMSOURCE_MODE_PASSIVE_REQUESTED == gtmsourcelocal_ptr->mode)
+				modestr = "PASSIVE REQUESTED";
+			else
+			{
+				assert(gtmsourcelocal_ptr->mode != gtmsourcelocal_ptr->mode);
+				modestr = "UNKNOWN";
+			}
+			repl_log(stderr, FALSE, TRUE, FORMAT_STR1, gtmsource_pid, "Source server", "", modestr);
 			status |= SRV_ALIVE;
 			num_servers++;
 		} else
 		{
 			repl_log(stderr, FALSE, TRUE, FORMAT_STR, gtmsource_pid, "Source server", " NOT");
-			gtm_putmsg(VARLSTCNT(4) ERR_SRCSRVNOTEXIST, 2, LEN_AND_STR(gtmsourcelocal_ptr->secondary_instname));
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_SRCSRVNOTEXIST, 2,
+					LEN_AND_STR(gtmsourcelocal_ptr->secondary_instname));
 			status |= SRV_DEAD;
 		}
 		if (NULL != jnlpool.gtmsource_local)
@@ -112,8 +126,9 @@ int gtmsource_checkhealth(void)
 		semval = get_sem_info(SOURCE, SRC_SERV_COUNT_SEM, SEM_INFO_VAL);
 		if (-1 == semval)
 		{
+			save_errno = errno;
 			repl_log(stderr, FALSE, TRUE,
-				"Error fetching source server count semaphore value : %s\n", REPL_SEM_ERROR);
+				"Error fetching source server count semaphore value : %s\n", STRERROR(save_errno));
 			status |= SRV_ERR;
 		} else if (semval != num_servers)
 		{
@@ -132,7 +147,7 @@ int gtmsource_checkhealth(void)
 	all_files_open = region_init(FALSE);
 	if (!all_files_open)
 	{
-		gtm_putmsg(VARLSTCNT(1) ERR_NOTALLDBOPN);
+		gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_NOTALLDBOPN);
 		status |= SRV_ERR;
 	} else
 	{
@@ -151,6 +166,12 @@ int gtmsource_checkhealth(void)
 				status |= SRV_ERR;
 			}
 		}
+	}
+	if (jnlpool.jnlpool_ctl->freeze)
+	{
+		repl_log(stderr, FALSE, FALSE, "Warning: Instance Freeze is ON\n");
+		repl_log(stderr, FALSE, TRUE, "   Freeze Comment: %s\n", jnlpool.jnlpool_ctl->freeze_comment);
+		status |= SRV_ERR;
 	}
 	return (status + NORMAL_SHUTDOWN);
 }

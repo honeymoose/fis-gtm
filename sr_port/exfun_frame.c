@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -14,10 +14,11 @@
 #include "gtm_stdio.h"
 #include "gtm_string.h"
 
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "stack_frame.h"
 #include "mprof.h"
 #include "error.h"
+#include "glvn_pool.h"
 
 GBLREF stack_frame	*frame_pointer;
 GBLREF unsigned char	*msp, *stackbase, *stackwarn, *stacktop;
@@ -38,9 +39,9 @@ void exfun_frame (void)
 		if (msp <= stacktop)
 		{
 			msp = msp_save;
-			rts_error(VARLSTCNT(1) ERR_STACKOFLOW);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_STACKOFLOW);
 		} else
-			rts_error(VARLSTCNT(1) ERR_STACKCRIT);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_STACKCRIT);
 	}
 	assert (msp < stackbase);
 	assert((frame_pointer < frame_pointer->old_frame_pointer) || (NULL == frame_pointer->old_frame_pointer));
@@ -51,17 +52,20 @@ void exfun_frame (void)
 		if (msp <= stacktop)
 		{
 			msp = msp_save;
-			rts_error(VARLSTCNT(1) ERR_STACKOFLOW);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_STACKOFLOW);
 		} else
-			rts_error(VARLSTCNT(1) ERR_STACKCRIT);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_STACKCRIT);
 	}
 	sf->temps_ptr = msp;
 	assert(msp < stackbase);
 	memset(msp, 0, sf->rvector->temp_size);
-	sf->for_ctrl_stack = NULL;
+	SET_GLVN_INDX(sf, GLVN_POOL_UNTOUCHED);
 	sf->ret_value = NULL;
 	sf->dollar_test = -1;
 	sf->old_frame_pointer = frame_pointer;
+	sf->type &= SFT_ZINTR_OFF;	/* Don't propagate special type - normally can't propagate but if $ZINTERRUPT frame is
+					 * rewritten by ZGOTO to a "regular" frame, this frame type *can* propagate.
+					 */
 	frame_pointer = sf;
 	assert((frame_pointer < frame_pointer->old_frame_pointer) || (NULL == frame_pointer->old_frame_pointer));
 	DBGEHND((stderr, "exfun_frame: Added stackframe at addr 0x"lvaddr"  old-msp: 0x"lvaddr"  new-msp: 0x"lvaddr"\n",

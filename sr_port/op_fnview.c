@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -38,6 +38,7 @@
 #include "alias.h"
 #include "gtmimagename.h"
 #include "fullbool.h"
+#include "wbox_test_init.h"
 
 GBLREF spdesc		stringpool;
 GBLREF int4		cache_hits, cache_fails;
@@ -268,7 +269,7 @@ void	op_fnview(UNIX_ONLY_COMMA(int numarg) mval *dst, ...)
 		case VTK_NOISOLATION:
 			if (NOISOLATION_NULL != parmblk.ni_list.type || NULL == parmblk.ni_list.gvnh_list
 			    || NULL != parmblk.ni_list.gvnh_list->next)
-				rts_error(VARLSTCNT(1) ERR_VIEWFN);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_VIEWFN);
 			n = parmblk.ni_list.gvnh_list->gvnh->noisolation;
 			break;
 		case VTK_PATCODE:
@@ -276,23 +277,35 @@ void	op_fnview(UNIX_ONLY_COMMA(int numarg) mval *dst, ...)
 			s2pool(&tmpstr);
 			dst->str = tmpstr;
 			break;
+#ifdef		DEBUG
+		case VTK_PROBECRIT:
+			if (!gd_header)		/* IF GD_HEADER ==0 THEN OPEN GBLDIR */
+				gvinit();
+			if (!parmblk.gv_ptr->open)
+				gv_init_reg(parmblk.gv_ptr);
+			reg = parmblk.gv_ptr;
+			grab_crit(reg);
+			if (!WBTEST_ENABLED(WBTEST_HOLD_CRIT_ENABLED))
+				rel_crit(reg);
+			break;
+#endif
 		case VTK_REGION:
-		  /* if gd_header is null then get the current one, and update the gd_map */
-		  if (!gd_header)
-		  {
-			  SET_GD_HEADER(v);
-			  SET_GD_MAP;
-		  }
-		  DEBUG_ONLY(else GD_HEADER_ASSERT);
-		  map = gd_map;
-		  map++;	/* get past local locks */
-		  for (; memcmp(parmblk.ident.c, map->name, SIZEOF(mident_fixed)) >= 0; map++)
-		    assert(map < gd_map_top);
-		  reg = map->reg.addr;
-		  tmpstr.addr = (char *)reg->rname;
-		  tmpstr.len = reg->rname_len;
-		  s2pool(&tmpstr);
-		  dst->str = tmpstr;
+			/* if gd_header is null then get the current one, and update the gd_map */
+			if (!gd_header)
+			{
+				SET_GD_HEADER(v);
+				SET_GD_MAP;
+			}
+			DEBUG_ONLY(else GD_HEADER_ASSERT);
+			map = gd_map;
+			map++;	/* get past local locks */
+			for (; memcmp(parmblk.ident.c, map->name, SIZEOF(mident_fixed)) >= 0; map++)
+				assert(map < gd_map_top);
+			reg = map->reg.addr;
+			tmpstr.addr = (char *)reg->rname;
+			tmpstr.len = reg->rname_len;
+			s2pool(&tmpstr);
+			dst->str = tmpstr;
 		  break;
 		case VTK_RTNEXT:
 			view_routines(dst, &parmblk.ident);
@@ -402,13 +415,15 @@ void	op_fnview(UNIX_ONLY_COMMA(int numarg) mval *dst, ...)
 			RESET_GV_TARGET(DO_GVT_GVKEY_CHECK);
 			break;
 		case VTK_YLCT:
-			if (!arg)
-				n = TREF(local_collseq) ? (TREF(local_collseq))->act : 0;
-			else
+			n = -1;
+			if (arg)
 			{
-				assert(!MEMCMP_LIT(arg->str.addr, "ncol"));
-				n = TREF(local_collseq_stdnull);
-			}
+				if (0 == MEMCMP_LIT(arg->str.addr, "nct"))
+					n = TREF(local_coll_nums_as_strings) ? 1 : 0;
+				else if (0 == MEMCMP_LIT(arg->str.addr, "ncol"))
+					n = TREF(local_collseq_stdnull);
+			} else
+				n = TREF(local_collseq) ? (TREF(local_collseq))->act : 0;
 			break;
 		case VTK_ZDEFBUFF:
 			n = 0;
@@ -463,13 +478,16 @@ void	op_fnview(UNIX_ONLY_COMMA(int numarg) mval *dst, ...)
 			dst->str.len = gtmImageNames[image_type].imageNameLen;
 			dst->str.addr = gtmImageNames[image_type].imageName;
 			break;
-#ifndef VMS
+		case VTK_LOGTPRESTART:
+			n = TREF(tprestart_syslog_delta);
+			break;
+#		ifndef VMS
 		case VTK_JNLERROR:
 			n = TREF(error_on_jnl_file_lost);
 			break;
-#endif
+#		endif
 		default:
-			rts_error(VARLSTCNT(1) ERR_VIEWFN);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_VIEWFN);
 	}
 	dst->mvtype = vtp->restype;
 	if (MV_NM == vtp->restype)

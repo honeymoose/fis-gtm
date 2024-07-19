@@ -1,6 +1,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;								;
-;	Copyright 2001, 2011 Fidelity Information Services, Inc	;
+;	Copyright 2001, 2013 Fidelity Information Services, Inc	;
 ;								;
 ;	This source code contains the intellectual property	;
 ;	of its copyright holder(s), and is made available	;
@@ -15,7 +15,6 @@ ALL
 COMMANDS
 	s BOL="!"
 	set delim=$select("VMS"=ver:"/",1:"-")
-	set defconst=$select("VMS"=ver:"$DEFAULT",1:"DEFAULT")
 	i $l($get(cfile)) o cfile:(newversion:exc="w !,$ztatus c cfile zgoto $zl:cfilefail") u cfile d
 	. d namec,segmentc,regionc,templatec
 	. c cfile
@@ -44,8 +43,7 @@ namec:
 	w !,"LOCKS "_delim_"REGION=",nams(s)
 	f  s s=$o(nams(s)) q:'$l(s)  d
 	. i "*"'=s w !,"ADD "_delim_"NAME ",s," "_delim_"REGION=",nams(s) q
-	. s defreg=nams(s)
-	. i defconst'=defreg w !,"RENAME "_delim_"REGION "_defconst_" ",defreg
+	. i defreg'=nams(s) w !,"CHANGE "_delim_"NAME "_s_" "_delim_"REGION=",nams(s)
 	w !
 	q
 REGION
@@ -66,10 +64,14 @@ r1:	d regionhd s jnl=0,s=""
 	q
 onereg:
 	w !,BOL,?x(1),s,?x(2),regs(s,"DYNAMIC_SEGMENT"),?x(3),$j(regs(s,"COLLATION_DEFAULT"),4)
-	w ?x(4),$j(regs(s,"RECORD_SIZE"),5),?x(5),$j(regs(s,"KEY_SIZE"),5)
+	i ver'="VMS" w ?x(4),$j(regs(s,"RECORD_SIZE"),7)
+	e  w ?x(4),$j(regs(s,"RECORD_SIZE"),5)
+	w ?x(5),$j(regs(s,"KEY_SIZE"),5)
 	w ?x(6),$s(regs(s,"NULL_SUBSCRIPTS")=1:"ALWAYS",regs(s,"NULL_SUBSCRIPTS")=2:"EXISTING",1:"NEVER")
 	w ?x(7),$s(regs(s,"STDNULLCOLL"):"Y",1:"N")
 	w ?x(8),$s(regs(s,"JOURNAL"):"Y",1:"N")
+	i ver'="VMS" w ?x(9),$s(regs(s,"INST_FREEZE_ON_ERROR"):"ENABLED",1:"DISABLED")
+	i ver'="VMS" w ?x(10),$s(regs(s,"QDBRUNDOWN"):"ENABLED",1:"DISABLED")
 	q
 onejnl:
 	w !,BOL,?x(1),s,?x(2),$s($l(regs(s,"FILE_NAME")):regs(s,"FILE_NAME"),1:"<based on DB file-spec>")
@@ -81,21 +83,25 @@ onejnl:
 	w !,BOL
 	q
 regionc:
-	s s=""
+	n defseen,cmd
+	s s="",defseen=FALSE
 	f  s s=$o(regs(s)) q:'$l(s)  d
-	. i s=defreg s defseg=regs(s,"DYNAMIC_SEGMENT")
-	. w !,$s(s=defreg:"CHANGE",1:"ADD")," "_delim_"REGION ",s," "_delim_"DYNAMIC=",regs(s,"DYNAMIC_SEGMENT")
+	. i s=defreg s defseen=TRUE,cmd="CHANGE"
+	. e  s cmd="ADD"
+	. w !,cmd," "_delim_"REGION ",s," "_delim_"DYNAMIC=",regs(s,"DYNAMIC_SEGMENT")
 	. f q="COLLATION_DEFAULT","RECORD_SIZE","KEY_SIZE" w " "_delim,q,"=",regs(s,q)
-	. w " "_delim_"NULL_SUBSCRIPTS=",$s(regs(s,"NULL_SUBSCRIPTS")=1:"ALWAYS",tmpreg("NULL_SUBSCRIPTS")=2:"EXISTING",1:"NEVER")
+	. w " "_delim_"NULL_SUBSCRIPTS=",$s(regs(s,"NULL_SUBSCRIPTS")=1:"ALWAYS",regs(s,"NULL_SUBSCRIPTS")=2:"EXISTING",1:"NEVER")
 	. i regs(s,"STDNULLCOLL") w " "_delim_"STDNULLCOLL"
 	. i regs(s,"JOURNAL") d
-	.. w " "_delim_"JOURNAL=(",$s(regs(s,"BEFORE_IMAGE"):"",1:"NO"),"BEFORE_IMAGE",",BUFFER_SIZE=",tmpreg("BUFFER_SIZE")
+	.. w " "_delim_"JOURNAL=(",$s(regs(s,"BEFORE_IMAGE"):"",1:"NO"),"BEFORE_IMAGE",",BUFFER_SIZE=",regs(s,"BUFFER_SIZE")
 	.. w ",ALLOCATION=",regs(s,"ALLOCATION"),",EXTENSION=",regs(s,"EXTENSION")
 	.. i ver'="VMS" w ",AUTOSWITCHLIMIT=",regs(s,"AUTOSWITCHLIMIT")
 	.. i $l(regs(s,"FILE_NAME")) w ",FILE=""",regs(s,"FILE_NAME"),""""
 	.. w ")"
 	. else  w " "_delim_"NOJOURNAL"
-	i defconst'=defseg w !,"DELETE "_delim_"SEGMENT "_defconst
+	. i (ver'="VMS") w " "_delim_$s(regs(s,"INST_FREEZE_ON_ERROR"):"",1:"NO")_"INST_FREEZE_ON_ERROR"
+	. i (ver'="VMS") w " "_delim_$s(regs(s,"QDBRUNDOWN"):"",1:"NO")_"QDBRUNDOWN"
+	i (FALSE=defseen) w !,"DELETE "_delim_"REGION "_defreg
 	w !,BOL
 	q
 SEGMENT
@@ -133,9 +139,12 @@ MM	w ?x(8),$s(segs(s,"DEFER"):"DEFER",1:"NODEFER")
 	i $ZVersion'["VMS" w !,BOL,?x(8),"ENCR=OFF"
 	q
 segmentc:
-	s s=""
+	n defseen,cmd
+	s s="",defseen=FALSE
 	f  s s=$o(segs(s)) q:'$l(s)  s am=segs(s,"ACCESS_METHOD") d
-	. w !,$s(s=defseg:"CHANGE",1:"ADD")," "_delim_"SEGMENT ",s," "_delim_"ACCESS_METHOD=",segs(s,"ACCESS_METHOD")
+	. i s=defseg s defseen=TRUE,cmd="CHANGE"
+	. e  s cmd="ADD"
+	. w !,cmd," "_delim_"SEGMENT ",s," "_delim_"ACCESS_METHOD=",segs(s,"ACCESS_METHOD")
 	. i am="USER" q
 	. f q="BLOCK_SIZE","ALLOCATION","EXTENSION_COUNT","LOCK_SPACE","RESERVED_BYTES" w " "_delim,q,"=",segs(s,q)
 	. i "BG"=am d
@@ -143,6 +152,7 @@ segmentc:
 	.. i $zver'["VMS",encsupportedplat=TRUE,segs(s,"ENCRYPTION_FLAG") w " "_delim_"ENCRYPT"
 	. i "MM"=am w " "_delim,$s(segs(s,"DEFER"):"DEFER",1:"NODEFER")
 	. w " "_delim_"FILE=",segs(s,"FILE_NAME")
+	i (FALSE=defseen) w !,"DELETE "_delim_"SEGMENT "_defseg
 	w !,BOL
 	q
 MAP
@@ -178,10 +188,14 @@ TEMPLATE
 	q
 t1:	d tmpreghd
 	w !,BOL,?x(1),"<default>",?x(3),$j(tmpreg("COLLATION_DEFAULT"),4)
-	w ?x(4),$j(tmpreg("RECORD_SIZE"),5),?x(5),$j(tmpreg("KEY_SIZE"),5)
+	i ver'="VMS" w ?x(4),$j(tmpreg("RECORD_SIZE"),7)
+	e  w ?x(4),$j(tmpreg("RECORD_SIZE"),5)
+	w ?x(5),$j(tmpreg("KEY_SIZE"),5)
 	w ?x(6),$s(tmpreg("NULL_SUBSCRIPTS")=1:"ALWAYS",tmpreg("NULL_SUBSCRIPTS")=2:"EXISTING",1:"NEVER")
 	w ?x(7),$s(tmpreg("STDNULLCOLL"):"Y",1:"N")
 	w ?x(8),$s(tmpreg("JOURNAL"):"Y",1:"N")
+	i ver'="VMS" w ?x(9),$s(tmpreg("INST_FREEZE_ON_ERROR"):"ENABLED",1:"DISABLED")
+	i ver'="VMS" w ?x(10),$s(tmpreg("QDBRUNDOWN"):"ENABLED",1:"DISABLED")
 	i tmpreg("JOURNAL") d tmpjnlhd,tmpjnlbd
 	d tmpseghd
 	w !,BOL,?x(1),"<default>",?x(2),$s(tmpacc="BG":"  *",1:""),?x(3),"BG"
@@ -212,11 +226,13 @@ templatec:
 	. i "BG"=am d
 	.. w " "_delim_"GLOBAL_BUFFER_COUNT=",tmpseg("BG","GLOBAL_BUFFER_COUNT")
 	.. i $zver'["VMS",encsupportedplat=TRUE,tmpseg("BG","ENCRYPTION_FLAG") w " "_delim_"ENCRYPT"
-	. i "MM"=am w $s(tmpseg("MM","DEFER"):delim,1:delim_"NO"),"DEFER"
+	. i "MM"=am w " ",$s(tmpseg("MM","DEFER"):delim,1:delim_"NO"),"DEFER"
 	w !,"TEMPLATE "_delim_"REGION"
 	f q="RECORD_SIZE","KEY_SIZE" w " "_delim,q,"=",tmpreg(q)
 	w " "_delim_"NULL_SUBSCRIPTS=",$s(tmpreg("NULL_SUBSCRIPTS")=1:"ALWAYS",tmpreg("NULL_SUBSCRIPTS")=2:"EXISTING",1:"NEVER")
 	i tmpreg("STDNULLCOLL") w " "_delim_"STDNULLCOLL"
+	i (ver'="VMS") w " "_delim_$s(tmpreg("INST_FREEZE_ON_ERROR"):"",1:"NO")_"INST_FREEZE_ON_ERROR"
+	i (ver'="VMS") w " "_delim_$s(tmpreg("QDBRUNDOWN"):"",1:"NO")_"QDBRUNDOWN"
 	i tmpreg("JOURNAL") d
 	. w !,"TEMPLATE "_delim_"REGION "_delim_"JOURNAL=("
 	. w $s(tmpreg("BEFORE_IMAGE"):"",1:"NO"),"BEFORE_IMAGE,BUFFER_SIZE=",tmpreg("BUFFER_SIZE")
@@ -235,12 +251,27 @@ namehd:
 	w !,BOL,?x(1),$tr($j("",78)," ","-")
 	q
 regionhd:
-	s x(0)=32,x(1)=1,x(2)=33,x(3)=65,x(4)=71,x(5)=77,x(6)=83,x(7)=94,x(8)=104
+	s x(0)=32,x(1)=1,x(2)=33,x(3)=65,x(4)=71
+	i ver'="VMS" s x(5)=79,x(6)=85,x(7)=96,x(8)=101,x(9)=105,x(10)=114
+	e  s x(5)=77,x(6)=83,x(7)=94,x(8)=104
 	w !,BOL,!,BOL,?x(0),"*** REGIONS ***"
-	w !,BOL,?x(2),"Dynamic",?x(3),$j("Def",4),?x(4),$j("Rec",5),?x(5),$j("Key",5),?x(6),"Null",?x(7),"Standard"
-	w !,BOL,?x(1),"Region",?x(2),"Segment",?x(3),$j("Coll",4),?x(4),$j("Size",5),?x(5),$j("Size",5)
-	w ?x(6),"Subs",?x(7),"NullColl",?x(8),"Journaling"
-	w !,BOL,?x(1),$tr($j("",114)," ","-")
+	w !,BOL,?x(7),"Std"
+	i ver'="VMS" w ?x(9),"Inst"
+	w !,BOL,?x(2),"Dynamic",?x(3),$j("Def",4)
+	i ver'="VMS" w ?x(4),$j("Rec",7)
+	e  w ?x(4),$j("Rec",5)
+	w ?x(5),$j("Key",5),?x(6),"Null",?x(7),"Null"
+	i ver'="VMS" w ?x(9),"Freeze"
+	i ver'="VMS" w ?x(10),"Qdb"
+	w !,BOL,?x(1),"Region",?x(2),"Segment",?x(3),$j("Coll",4)
+	if ver'="VMS" w ?x(4),$j("Size",7)
+	e  w ?x(4),$j("Size",5)
+	w ?x(5),$j("Size",5)
+	w ?x(6),"Subs",?x(7),"Coll",?x(8),"Jnl"
+	i ver'="VMS" w ?x(9),"on Error"
+	i ver'="VMS" w ?x(10),"Rndwn"
+	i ver'="VMS" w !,BOL,?x(1),$tr($j("",122)," ","-")
+	e  w !,BOL,?x(1),$tr($j("",107)," ","-")
 	q
 jnlhd:
 	s x(0)=26,x(1)=1,x(2)=33,x(3)=59,x(4)=65,x(5)=71,x(6)=82,x(7)=$s(ver="VMS":88,1:91)
@@ -264,21 +295,39 @@ maphd:
 	w !,BOL,!,BOL,?x(0),x
 	w !,BOL,?x(1),"  -  -  -  -  -  -  -  -  -  - Names -  -  - -  -  -  -  -  -  -"
 	w !,BOL,?x(1),"From",?x(2),"Up to",?x(3),"Region / Segment / File(def ext: .dat)"
-	w !,BOL,?x(1),$tr($j("",131)," ","-")
+	w !,BOL,?x(1),$tr($j("",122)," ","-")
 	q
 tmpreghd:
-	s x(0)=31,x(1)=1,x(2)=19,x(3)=44,x(4)=49,x(5)=55,x(6)=61,x(7)=72,x(8)=82
+	s x(0)=31,x(1)=1,x(2)=19,x(3)=44,x(4)=49
+	i ver'="VMS" s x(5)=57,x(6)=63,x(7)=74,x(8)=79,x(9)=83,x(10)=92
+	e  s x(5)=55,x(6)=61,x(7)=72,x(8)=82
 	w !,BOL,!,BOL,?x(0),"*** TEMPLATES ***"
-	w !,BOL,?x(3),$j("Def",4),?x(4),$j("Rec",5),?x(5),$j("Key",5),?x(6),"Null",?x(7),"Standard"
-	w !,BOL,?x(1),"Region",?x(3),$j("Coll",4),?x(4),$j("Size",5),?x(5),$j("Size",5)
-	w ?x(6),"Subs",?x(7),"NullColl",?x(8),"Journaling"
-	w !,BOL,?x(1),$tr($j("",92)," ","-")
+	w !,BOL,?x(7),"Std"
+	i ver'="VMS" w ?x(9),"Inst"
+	w !,BOL,?x(3),$j("Def",4)
+	i ver'="VMS" w ?x(4),$j("Rec",7)
+	e  w ?x(4),$j("Rec",5)
+	w ?x(5),$j("Key",5),?x(6),"Null",?x(7),"Null"
+	i ver'="VMS" w ?x(9),"Freeze"
+	i ver'="VMS" w ?x(10),"Qdb"
+	w !,BOL,?x(1),"Region",?x(3),$j("Coll",4)
+	i ver'="VMS" w ?x(4),$j("Size",7)
+	e  w ?x(4),$j("Size",5)
+	w ?x(5),$j("Size",5)
+	w ?x(6),"Subs",?x(7),"Coll",?x(8),"Jnl"
+	i ver'="VMS" w ?x(9),"on Error"
+	i ver'="VMS" w ?x(10),"Rndwn"
+	i ver'="VMS" w !,BOL,?x(1),$tr($j("",100)," ","-")
+	e  w !,BOL,?x(1),$tr($j("",85)," ","-")
 	q
 tmpjnlhd:
 	s x(0)=26,x(1)=1,x(2)=18,x(3)=44,x(4)=51,x(5)=57,x(6)=68,x(7)=74
 	w !,BOL,?x(2),"Jnl File (def ext: .mjl)"
-	w ?x(3),"Before",?x(4),$j("Buff",5),?x(5),$j("Alloc",10),?x(6),"Exten" ;?x(7),"Stop"
-	w !,BOL,?x(1),$tr($j("",78)," ","-")
+	w ?x(3),"Before",?x(4),$j("Buff",5),?x(5),$j("Alloc",10)
+	i ver="VMS" w ?x(6),"Exten"
+	e  w ?x(6),$j("Exten",10),?x(7),$j("AutoSwitch",13)
+	i ver="VMS" w !,BOL,?x(1),$tr($j("",78)," ","-")
+	e  w !,BOL,?x(1),$tr($j("",90)," ","-")
 	q
 tmpseghd:
 	s x(0)=32,x(1)=1,x(2)=18,x(3)=38,x(4)=42,x(5)=46,x(6)=52,x(7)=63,x(8)=69

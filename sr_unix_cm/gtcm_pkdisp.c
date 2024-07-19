@@ -31,7 +31,7 @@
 #include "omi.h"
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/gtcm_pkdisp.c,v 1.8 2013/10/23 03:49:31 tuskentower Exp $";
 #endif
 
 GBLREF char	*omi_oprlist[];

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2006, 2012 Fidelity Information Services, Inc.*
+ *	Copyright 2006, 2013 Fidelity Information Services, Inc.*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -205,7 +205,6 @@ typedef struct
 typedef struct
 {
 	uint4		recv_serv_pid;		/* Process identification of receiver server */
-	int4		primary_inet_addr;	/* IP address of the primary system */
 	int4		lastrecvd_time;		/* unused */
 	/* Data items used in communicating action qualifiers (show statistics, shutdown) and
 	 * qualifier values (log file, shutdown time, etc). */
@@ -329,10 +328,13 @@ typedef enum
 	UPDPROC,
 	UPD_HELPER_READER,
 	UPD_HELPER_WRITER,
-	GTMRECV
-#ifdef VMS
-	, GTMRECV_CHILD
-#endif
+	GTMRECV,
+#	ifdef UNIX
+	GTMZPEEK
+#	endif
+#	ifdef VMS
+	GTMRECV_CHILD
+#	endif
 } recvpool_user;
 
 typedef struct
@@ -355,6 +357,7 @@ typedef struct
 	boolean_t	helpers;
 	boolean_t	reuse_specified;
 	boolean_t	resume_specified;
+	boolean_t	initialize_specified;
 	int4		resume_strm_num;
 	int4		n_readers;
 	int4		n_writers;

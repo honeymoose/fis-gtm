@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2009 Fidelity Information Services, Inc *
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc *
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -17,14 +17,14 @@
  */
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/gtcm_cn_disc.c,v 1.7 2013/10/23 03:49:31 tuskentower Exp $";
 #endif
 
 #include "mdef.h"
 
 #include "gtm_stdio.h"
 #include "gtm_unistd.h"		/* for close() used by CLOSEFILE_RESET */
-#include "gtm_time.h"		/* for ctime() and time() */
+#include "gtm_time.h"		/* for GTM_CTIME() and GTM_TIME() */
 
 #include "gtcm.h"
 #include "gtmio.h"
@@ -59,7 +59,7 @@ void gtcm_cn_disc(omi_conn *cptr, omi_conn_ll *cll)
 		cll->stats.clos++;
 	OMI_DBG_STMP;
 	OMI_DBG((omi_debug, "%s: connection %d to %s closed\n",
-	SRVR_NAME, cptr->stats.id, gtcm_hname(&cptr->stats.sin)));
+	SRVR_NAME, cptr->stats.id, gtcm_hname(&cptr->stats.ai)));
 	OMI_DBG((omi_debug, "%s:\t%ld seconds connect time\n", SRVR_NAME, end - cptr->stats.start));
 	OMI_DBG((omi_debug, "%s:\t%d transactions\n", SRVR_NAME, nxact));
 	OMI_DBG((omi_debug, "%s:\t%d errors\n", SRVR_NAME, nerrs));

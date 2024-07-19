@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -23,8 +23,6 @@
 #include "alloc_reg.h"
 #include "cdbg_dump.h"
 
-#define MAX_TEMP_COUNT		128
-
 GBLDEF int4			sa_temps[VALUED_REF_TYPES];
 GBLDEF int4			sa_temps_offset[VALUED_REF_TYPES];
 
@@ -44,7 +42,11 @@ LITDEF int4 sa_class_sizes[VALUED_REF_TYPES] =
 };
 LITREF octabstruct 		oc_tab[];
 
+#define MAX_TEMP_COUNT		1024
+
 error_def(ERR_TMPSTOREMAX);
+
+STATICFNDCL void remove_backptr(triple *curtrip, oprtype *opnd, char (*tempcont)[MAX_TEMP_COUNT]);
 
 void alloc_reg(void)
 {
@@ -94,14 +96,22 @@ void alloc_reg(void)
 					COMPDBG(PRINTF("   ** Converting triple to NOOP (rsn 2) **\n"););
 					continue;	/* continue, because 'normal' NOOP continues from this switch */
 				}
+#				ifndef DEBUG
 				break;
+#				endif
 			case OC_LINEFETCH:
+#				ifdef DEBUG
+				for (c = temphigh[TVAL_REF]; 0 <= c; c--)
+					assert(0 == tempcont[TVAL_REF][c]);	/* check against leaking TVAL temps */
+				if (OC_LINESTART == opc)
+					break;
+#				endif
 			case OC_FETCH:
 				assert((TRIP_REF == x->operand[0].oprclass) && (OC_ILIT == x->operand[0].oprval.tref->opcode));
 				if (x->operand[0].oprval.tref->operand[0].oprval.ilit == mvmax)
 				{
 					x->operand[0].oprval.tref->operand[0].oprval.ilit = 0;
-					x->operand[1].oprclass = 0;
+					x->operand[1].oprclass = NO_REF;
 				}
 				break;
 			case OC_STO:
@@ -121,50 +131,24 @@ void alloc_reg(void)
 				    && (0 == x->operand[0].oprval.tref->operand[0].oprval.mlit->v.str.len))
 				{
 					x->operand[0] = x->operand[1];
-					x->operand[1].oprclass = 0;
+					x->operand[1].oprclass = NO_REF;
 					opc = x->opcode = OC_EQUNUL;
 				} else if ((TRIP_REF == x->operand[1].oprclass) && (OC_LIT == x->operand[1].oprval.tref->opcode)
 					   && (0 == x->operand[1].oprval.tref->operand[0].oprval.mlit->v.str.len))
 				{
-					x->operand[1].oprclass = 0;
+					x->operand[1].oprclass = NO_REF;
 					opc = x->opcode = OC_EQUNUL;
 				}
 				break;
 		}
-		for (j = x->operand, y = x; j < ARRAYTOP(y->operand); )
-		{
-			if (TRIP_REF == j->oprclass)
-			{
-				ref = j->oprval.tref;
-				if (OC_PARAMETER == ref->opcode)
-				{
-					y = ref;
-					j = y->operand;
-					continue;
-				}
-				if (r = ref->destination.oprclass)	/* Note assignment */
-				{
-					dqloop(&ref->backptr, que, b)
-					{
-						if (b->bpt == y)
-						{
-							dqdel(b, que);
-							break;
-						}
-					}
-					if ((ref->backptr.que.fl == &ref->backptr) && (TVAR_REF != r))
-						tempcont[r][j->oprval.tref->destination.oprval.temp] = 0;
-				}
-			}
-			j++;
-		}
 		if (OC_PASSTHRU == x->opcode)
 		{
 			COMPDBG(PRINTF(" *** OC_PASSTHRU opcode being NOOP'd\n"););
+			remove_backptr(x, &x->operand[0], tempcont);
 			x->opcode = OC_NOOP;
 			continue;
 		}
-		if (!(dest_type = x->destination.oprclass))	/* Note assignment */
+		if (NO_REF == (dest_type = x->destination.oprclass))	/* Note assignment */
 		{
 			oct = oc_tab[opc].octype;
 			if ((oct & OCT_VALUE) && (x->backptr.que.fl != &x->backptr) && !(oct & OCT_CGSKIP))
@@ -175,7 +159,7 @@ void alloc_reg(void)
 				{
 					x->destination = y->operand[0];
 					y->opcode = OC_NOOP;
-					y->operand[0].oprclass = y->operand[1].oprclass = 0;
+					y->operand[0].oprclass = y->operand[1].oprclass = NO_REF;
 				} else
 				{
 					oct &= OCT_VALUE | OCT_MVADDR;
@@ -186,7 +170,7 @@ void alloc_reg(void)
 					for (c = 0; tempcont[r][c] && (MAX_TEMP_COUNT > c); c++)
 						;
 					if (MAX_TEMP_COUNT <= c)
-						rts_error(VARLSTCNT(1) ERR_TMPSTOREMAX);
+						rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_TMPSTOREMAX);
 					tempcont[r][c] = 1;
 					x->destination.oprclass = r;
 					x->destination.oprval.temp = c;
@@ -201,6 +185,27 @@ void alloc_reg(void)
 			assert(x->destination.oprval.tref->destination.oprclass);
 			x->destination = x->destination.oprval.tref->destination;
 		}
+		for (j = x->operand, y = x; j < ARRAYTOP(y->operand); )
+		{	/* Loop through all the parameters of the current opcode. For each parameter that requires an intermediate
+			 * temporary, decrement (this is what remove_backptr does) the "reference count" -- opcodes yet to be
+			 * processed that still need the intermediate result -- and if that number is zero, mark the temporary
+			 * available. We can then reuse the temp to hold the results of subsequent opcodes. Note that remove_backptr
+			 * is essentially the resolve_tref() in resolve_ref.c. resolve_tref increments the "reference count",
+			 * while remove_backptr decrements it.
+			 */
+			if (TRIP_REF == j->oprclass)
+			{
+				ref = j->oprval.tref;
+				if (OC_PARAMETER == ref->opcode)
+				{
+					y = ref;
+					j = y->operand;
+					continue;
+				}
+				remove_backptr(y, j, tempcont);
+			}
+			j++;
+		}
 	}
 	for (r = 0; VALUED_REF_TYPES > r; r++)
 		sa_temps[r] = temphigh[r] + 1;
@@ -208,10 +213,40 @@ void alloc_reg(void)
 	size = sa_temps[TVAL_REF] * sa_class_sizes[TVAL_REF];
 	sa_temps_offset[TVAL_REF] = size;
 	/* Since we need to align the temp region to the largest types, align even int temps to SIZEOF(char*) */
-	size += ROUND_UP2(sa_temps[TINT_REF] * sa_class_sizes[TINT_REF], SIZEOF(char *));
+	size += ROUND_UP2(sa_temps[TINT_REF] *sa_class_sizes[TINT_REF], SIZEOF(char *));
 	sa_temps_offset[TINT_REF] = size;
 	size += sa_temps[TVAD_REF] * sa_class_sizes[TVAD_REF];
 	sa_temps_offset[TVAD_REF] = size;
 	size += sa_temps[TCAD_REF] * sa_class_sizes[TCAD_REF];
 	sa_temps_offset[TCAD_REF] = size;
+}
+
+void remove_backptr(triple *curtrip, oprtype *opnd, char (*tempcont)[MAX_TEMP_COUNT])
+{
+	triple		*ref;
+	tbp		*b;
+	int		r;
+
+	assert(TRIP_REF == opnd->oprclass);
+	ref = opnd->oprval.tref;
+	while (OC_PASSTHRU == opnd->oprval.tref->opcode)
+	{
+		ref = ref->operand[0].oprval.tref;
+		opnd = &ref->operand[0];
+		assert(TRIP_REF == opnd->oprclass);
+	}
+	r = ref->destination.oprclass;
+	if (NO_REF != r)
+	{
+		dqloop(&ref->backptr, que, b)
+		{
+			if (b->bpt == curtrip)
+			{
+				dqdel(b, que);
+				break;
+			}
+		}
+		if ((ref->backptr.que.fl == &ref->backptr) && (TVAR_REF != r))
+			tempcont[r][ref->destination.oprval.temp] = 0;
+	}
 }

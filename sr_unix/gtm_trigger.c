@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2010, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2010, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -19,6 +19,7 @@
 
 #include <errno.h>
 
+#include "cmd_qlf.h"
 #include "compiler.h"
 #include "error.h"
 #include <rtnhdr.h>
@@ -299,6 +300,10 @@ STATICFNDEF int gtm_trigger_invoke(void)
 	REVERT;
 	assert(frame_pointer->type & SFT_TRIGR);
 	assert(0 <= gtm_trigger_depth);
+	CHECKHIGHBOUND(ctxt);
+	CHECKLOWBOUND(ctxt);
+	CHECKHIGHBOUND(active_ch);
+	CHECKLOWBOUND(active_ch);
 	return rc;
 }
 
@@ -450,7 +455,7 @@ int gtm_trigger_complink(gv_trigger_t *trigdsc, boolean_t dolink)
 	mv_chain->mv_st_cont.mvs_msav.v = dollar_zsource;
 	mv_chain->mv_st_cont.mvs_msav.addr = &dollar_zsource;
 	TREF(trigger_compile) = TRUE;		/* Set flag so compiler knows this is a special trigger compile */
-	op_zcompile(&zcompprm, FALSE);	/* Compile but don't require a .m file extension */
+	op_zcompile(&zcompprm, TRUE);	/* Compile but don't use $ZCOMPILE qualifiers */
 	TREF(trigger_compile) = FALSE;	/* compile_source_file() establishes handler so always returns */
 	if (0 != TREF(dollar_zcstatus))
 	{	/* Someone err'd.. */
@@ -538,7 +543,8 @@ int gtm_trigger(gv_trigger_t *trigdsc, gtm_trigger_parms *trigprm)
 	{	/* Create new trigger base frame first that back-stops stack unrolling and return to us */
 		if (GTM_TRIGGER_DEPTH_MAX < (gtm_trigger_depth + 1))	/* Verify we won't nest too deep */
 			rts_error(VARLSTCNT(3) ERR_MAXTRIGNEST, 1, GTM_TRIGGER_DEPTH_MAX);
-		DBGTRIGR((stderr, "gtm_trigger: PUSH: frame_pointer 0x%016lx  ctxt value: 0x%016lx\n", frame_pointer, ctxt));
+		DBGTRIGR((stderr, "gtm_trigger: Invoking new trigger at frame_pointer 0x%016lx  ctxt value: 0x%016lx\n",
+			  frame_pointer, ctxt));
 		/* Protect against interrupts while we have only a trigger base frame on the stack */
 		DEFER_INTERRUPTS(INTRPT_IN_TRIGGER_NOMANS_LAND);
 		/* The current frame invoked a trigger. We cannot return to it for a TP restart or other reason unless
@@ -547,8 +553,8 @@ int gtm_trigger(gv_trigger_t *trigdsc, gtm_trigger_parms *trigprm)
 		 * command (KILL, SET or ZTRIGGER) was entered. Set flag in the frame to prevent MUM_TSTART unless the frame gets
 		 * reset.
 		 */
-		frame_pointer->flags |= SFF_TRIGR_CALLD;	/* Do not return to this frame via MUM_TSTART */
-		DBGTRIGR((stderr, "gtm_trigger: Setting SFF_TRIGR_CALLD in frame 0x"lvaddr"\n", frame_pointer));
+		frame_pointer->flags |= SFF_IMPLTSTART_CALLD;	/* Do not return to this frame via MUM_TSTART */
+		DBGTRIGR((stderr, "gtm_trigger: Setting SFF_IMPLTSTART_CALLD in frame 0x"lvaddr"\n", frame_pointer));
 		base_frame(trigdsc->rtn_desc.rt_adr);
 		/* Finish base frame initialization - reset mpc/context to return to us without unwinding base frame */
 		frame_pointer->type |= SFT_TRIGR;
@@ -616,8 +622,17 @@ int gtm_trigger(gv_trigger_t *trigdsc, gtm_trigger_parms *trigprm)
 		mv_st_ent->mv_st_cont.mvs_trigr.gtm_trigdsc_last_save = trigdsc;
 		mv_st_ent->mv_st_cont.mvs_trigr.gtm_trigprm_last_save = trigprm;
 #		endif
-		assert(((0 == gtm_trigger_depth) && (ch_at_trigger_init == ctxt->ch))
-		       || ((0 < gtm_trigger_depth) && (&mdb_condition_handler == ctxt->ch)));
+		/* If this is a spanning node update, a spanning node condition handler may be at the front of the line. However,
+		 * the condition handler just behind it should be either mdb_condition_handler or ch_at_trigger_init.
+		 */
+		assert(((0 == gtm_trigger_depth)
+			&& (((ch_at_trigger_init == ctxt->ch)
+			     || ((ch_at_trigger_init == (ctxt - 1)->ch)
+				 && ((&gvcst_put_ch == ctxt->ch) || (&gvcst_kill_ch == ctxt->ch))))))
+		       || ((0 < gtm_trigger_depth)
+			   && (((&mdb_condition_handler == ctxt->ch)
+				|| ((&mdb_condition_handler == (ctxt - 1)->ch)
+				    && ((&gvcst_put_ch == ctxt->ch) || (&gvcst_kill_ch == ctxt->ch)))))));
 		mv_st_ent->mv_st_cont.mvs_trigr.ctxt_save = ctxt;
 		mv_st_ent->mv_st_cont.mvs_trigr.gtm_trigger_depth_save = gtm_trigger_depth;
 		if (0 == gtm_trigger_depth)
@@ -736,6 +751,12 @@ int gtm_trigger(gv_trigger_t *trigdsc, gtm_trigger_parms *trigprm)
 		{	/* Unwind a trigger level to restart level or to next trigger boundary */
 			gtm_trigger_fini(FALSE, FALSE);	/* Get rid of this trigger level - we won't be returning */
 			DBGTRIGR((stderr, "gtm_trigger: dm_start returned rethrow code - rethrowing ERR_TPRETRY\n"));
+			/* The bottommost mdb_condition handler better not be catching this restart if we did an implicit
+			 * tstart. mdb_condition_handler will try to unwind further, and the process will inadvertently exit.
+			 */
+			assert((&mdb_condition_handler != ch_at_trigger_init)
+				|| ((&mdb_condition_handler == ctxt->ch) && (&mdb_condition_handler == chnd[1].ch)
+				     && (!tp_pointer->implicit_tstart || (&chnd[1] < ctxt))));
 			INVOKE_RESTART;
 		} else
 		{	/* It is possible we are restarting a transaction that never got around to creating a base
@@ -751,9 +772,9 @@ int gtm_trigger(gv_trigger_t *trigdsc, gtm_trigger_parms *trigprm)
 			{       /* Unusual case of trigger that died in no-mans-land before trigger base frame established.
 				 * Remove the "do not return to me" flag only on non-error unwinds */
 				assert(tp_pointer->implicit_tstart);
-				assert(SFF_TRIGR_CALLD & frame_pointer->flags);
-				frame_pointer->flags &= SFF_TRIGR_CALLD_OFF;
-				DBGTRIGR((stderr, "gtm_trigger: turning off SFF_TRIGR_CALLD (1) in frame 0x"lvaddr"\n",
+				assert(SFF_IMPLTSTART_CALLD & frame_pointer->flags);
+				frame_pointer->flags &= SFF_IMPLTSTART_CALLD_OFF;
+				DBGTRIGR((stderr, "gtm_trigger: turning off SFF_IMPLTSTART_CALLD (1) in frame 0x"lvaddr"\n",
 					  frame_pointer));
 				DBGTRIGR((stderr, "gtm_trigger: unwinding no-base-frame trigger for TP restart\n"));
 			}
@@ -799,15 +820,15 @@ void gtm_trigger_fini(boolean_t forced_unwind, boolean_t fromzgoto)
 	/* Unwind the trigger base frame */
 	op_unwind();
 	/* restore frame_pointer stored at msp (see base_frame.c) */
-	frame_pointer = *(stack_frame**)msp;
-	msp += SIZEOF(stack_frame *);		/* Remove frame save pointer from stack */
+        frame_pointer = *(stack_frame**)msp;
+	msp += SIZEOF(stack_frame *);           /* Remove frame save pointer from stack */
 	if (!forced_unwind)
 	{	/* Remove the "do not return to me" flag only on non-error unwinds. Note this flag may have already been
 		 * turned off by an earlier tp_restart if this is not an implicit_tstart situation.
 		 */
-		assert(!tp_pointer->implicit_tstart || (SFF_TRIGR_CALLD & frame_pointer->flags));
-		frame_pointer->flags &= SFF_TRIGR_CALLD_OFF;
-		DBGTRIGR((stderr, "gtm_trigger_fini: turning off SFF_TRIGR_CALLD (2) in frame 0x"lvaddr"\n", frame_pointer));
+		assert(!tp_pointer->implicit_tstart || (SFF_IMPLTSTART_CALLD & frame_pointer->flags));
+		frame_pointer->flags &= SFF_IMPLTSTART_CALLD_OFF;
+		DBGTRIGR((stderr, "gtm_trigger_fini: turning off SFF_IMPLTSTART_CALLD (2) in frame 0x"lvaddr"\n", frame_pointer));
 	} else
 	{	/* Error unwind, make sure certain cleanups are done */
 #		ifdef DEBUG
@@ -828,7 +849,8 @@ void gtm_trigger_fini(boolean_t forced_unwind, boolean_t fromzgoto)
 				OP_TROLLBACK(-1); /* We just unrolled the implicitly started TSTART so unroll what it did */
 		}
 	}
-	DBGTRIGR((stderr, "gtm_trigger: POP: frame_pointer 0x%016lx  ctxt value: 0x%016lx\n", frame_pointer, ctxt));
+	DBGTRIGR((stderr, "gtm_trigger: Unwound to trigger invoking frame: frame_pointer 0x%016lx  ctxt value: 0x%016lx\n",
+		  frame_pointer, ctxt));
 	/* Re-allow interruptions now that our base frame is gone */
 	if (forced_unwind)
 	{	/* Since we are being force-unwound, we don't know the state of things except that it it should be either
@@ -954,7 +976,7 @@ void gtm_trigger_cleanup(gv_trigger_t *trigdsc)
 	stp_move((char *)rtnhdr->literal_text_adr,
 		 (char *)(rtnhdr->literal_text_adr + rtnhdr->literal_text_len));
 	GTM_TEXT_FREE(rtnhdr->ptext_adr);			/* R/O releasable section */
-	free(rtnhdr->literal_adr);				/* R/W releasable section part 1 */
+	free(RW_REL_START_ADR(rtnhdr));				/* R/W releasable section part 1 */
 	free(rtnhdr->linkage_adr);				/* R/W releasable section part 2 */
 	free(rtnhdr->labtab_adr);				/* Usually non-releasable but triggers don't have labels so
 								 * this is just cleaning up a dangling null malloc

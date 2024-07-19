@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -43,6 +43,7 @@
 #ifdef UNICODE_SUPPORTED
 #include "gtm_icu_api.h"
 #include "gtm_utf8.h"
+#include "gtm_conv.h"
 #endif
 #ifdef GTM_CRYPT
 #include "gtmci.h"
@@ -55,6 +56,9 @@ GBLREF	char				cli_token_buf[];
 GBLREF	char				cli_err_str[];
 GBLREF	CLI_ENTRY			mumps_cmd_ary[];
 GTMTRIG_DBG_ONLY(GBLREF	ch_ret_type	(*ch_at_trigger_init)();)
+#ifdef UNICODE_SUPPORTED
+GBLREF	u_casemap_t 			gtm_strToTitle_ptr;		/* Function pointer for gtm_strToTitle */
+#endif
 
 GBLDEF	CLI_ENTRY			*cmd_ary = &mumps_cmd_ary[0]; /* Define cmd_ary to be the MUMPS specific cmd table */
 GBLREF	boolean_t			skip_dbtriggers;
@@ -66,25 +70,28 @@ GBLREF	boolean_t			skip_dbtriggers;
 	 * array passed to the main program is an array of 64-bit pointers.  Thus the C program needs to declare argv[]
 	 * as an array of 64-bit pointers and needs to do the same for any pointer it sets to an element of argv[].
 	 */
-#pragma pointer_size (save)
-#pragma pointer_size (long)
+# pragma pointer_size (save)
+# pragma pointer_size (long)
 #endif
-
 GBLDEF char 		**gtmenvp;
-
-int gtm_main (int argc, char **argv, char **envp)
-
-#ifdef __osf__
-#pragma pointer_size (restore)
+#ifdef GTM_CRYPT
+error_def(ERR_CRYPTDLNOOPEN);
+error_def(ERR_CRYPTDLNOOPEN2);
+error_def(ERR_CRYPTINIT);
+error_def(ERR_CRYPTINIT2);
 #endif
-
+int gtm_main (int argc, char **argv, char **envp)
+#ifdef __osf__
+# pragma pointer_size (restore)
+#endif
 {
 	char			*ptr;
 	int             	eof, parse_ret;
-	GTMCRYPT_ONLY(
-		char		*gtm_passwd;
-		int		init_status;
-	)
+#	ifdef GTM_CRYPT
+	char			*gtm_passwd;
+	const char		*gtmcrypt_errlit = "during GT.M startup";
+	int			gtmcrypt_errno;
+#	endif
 	DCL_THREADGBL_ACCESS;
 
 	GTM_THREADGBL_INIT;
@@ -95,6 +102,7 @@ int gtm_main (int argc, char **argv, char **envp)
 	gtm_wcswidth_fnptr = gtm_wcswidth;
 	gtm_env_init();	/* read in all environment variables */
 	err_init(stop_image_conditional_core);
+	UNICODE_ONLY(gtm_strToTitle_ptr = &gtm_strToTitle);
 	GTM_ICU_INIT_IF_NEEDED;	/* Note: should be invoked after err_init (since it may error out) and before CLI parsing */
 	cli_lex_setup(argc, argv);
 	/* put the arguments into buffer, then clean up the token buffer
@@ -138,9 +146,19 @@ int gtm_main (int argc, char **argv, char **envp)
 	    && (NULL != (gtm_passwd = (char *)getenv(GTM_PASSWD)))
 	    && (0 == strlen(gtm_passwd)))
 	{
-		INIT_PROC_ENCRYPTION(init_status);
-		if (0 != init_status)
-			GC_RTS_ERROR(init_status, NULL);
+		INIT_PROC_ENCRYPTION(NULL, gtmcrypt_errno);
+		if (0 != gtmcrypt_errno)
+		{
+			CLEAR_CRYPTERR_MASK(gtmcrypt_errno);
+			assert(!IS_REPEAT_MSG_MASK(gtmcrypt_errno));
+			assert((ERR_CRYPTDLNOOPEN == gtmcrypt_errno) || (ERR_CRYPTINIT == gtmcrypt_errno));
+			if (ERR_CRYPTDLNOOPEN == gtmcrypt_errno)
+				gtmcrypt_errno = ERR_CRYPTDLNOOPEN2;
+			else if (ERR_CRYPTINIT == gtmcrypt_errno)
+				gtmcrypt_errno = ERR_CRYPTINIT2;
+			gtmcrypt_errno = SET_CRYPTERR_MASK(gtmcrypt_errno);
+			GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, rts_error, STRLEN(gtmcrypt_errlit), gtmcrypt_errlit);
+		}
 	}
 #	endif
 	dm_start();

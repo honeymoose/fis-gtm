@@ -1,7 +1,7 @@
 #!/usr/local/bin/tcsh -f
 #################################################################
 #								#
-#	Copyright 2001, 2011 Fidelity Information Services, Inc	#
+#	Copyright 2001, 2013 Fidelity Information Services, Inc	#
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -47,39 +47,6 @@ while (0 < $#)
 	endsw
 	shift
 end
-#set temp=(`getopt nchl $argv:q`)
-#if ($? == 0) then
-#	eval set argv=\($temp:q\)
-#	while (1)
-#		switch ($1:q)
-#			case -n :
-#				set listonly = 1
-#				shift
-#				breaksw
-#
-#			case -c :
-#				set compileonly = 1
-#				shift
-#				breaksw
-#
-#			case -l :
-#				set linkonly = 1
-#				shift
-#				breaksw
-#
-#			case -h :
-#				set helponly = 1
-#				shift
-#				breaksw
-#
-#			case -- :
-#				shift
-#				break
-#		endsw
-#	end
-#else
-#	set helponly = 1
-#endif
 
 if ($helponly) then
 	echo "Usage : `basename $0` [-n|-c|-h] [file...]"
@@ -130,6 +97,20 @@ endif
 
 cd $gtm_root/$RUNALL_VERSION/${RUNALL_IMAGE}/obj
 
+version $RUNALL_VERSION $RUNALL_IMAGE
+
+if ($?RUNALL_BYPASS_VERSION_CHECK == 0) then
+	if ($gtm_verno =~ V[4-8]* || $gtm_verno == "V990" ) then
+		echo ""
+		echo "-----------------------------------------------------------------------------------"
+		echo "RUNALL-E-WRONGVERSION : Cannot Runall a Non-Developemental Version  ---->   $gtm_verno"
+		echo "-----------------------------------------------------------------------------------"
+		echo ""
+		@ runall_status = 1	# to signal that the runall failed to do its job
+		goto cleanup
+	endif
+endif
+
 echo ""
 echo "Start of $gtm_tools/runall.csh"
 echo ""
@@ -147,6 +128,7 @@ echo "     RUNALL_VERSION         ---->  [ $RUNALL_VERSION ]"
 echo "     RUNALL_IMAGE           ---->  [ $RUNALL_IMAGE ]"
 echo "     RUNALL_EXTRA_CC_FLAGS  ---->  [ $RUNALL_EXTRA_CC_FLAGS ]"
 echo "     RUNALL_EXTRA_AS_FLAGS  ---->  [ $RUNALL_EXTRA_AS_FLAGS ]"
+echo "     gtmroutines            ---->  [ $gtmroutines ]"
 echo ""
 
 if (`uname` == "SunOS") then
@@ -155,7 +137,6 @@ endif
 
 set user=`id -u -n`
 
-version $RUNALL_VERSION $RUNALL_IMAGE
 
 rm -f $gtm_log/error.$RUNALL_IMAGE.log >& /dev/null
 
@@ -167,19 +148,6 @@ onintr cleanup
 
 set platform_name = `uname | sed 's/-//g' | sed 's,/,,' | tr '[A-Z]' '[a-z]'`
 set mach_type = `uname -m`
-
-if ($?RUNALL_BYPASS_VERSION_CHECK == 0) then
-	set temp_ver=`echo $gtm_verno | sed 's/./& /g'`
-	if ($temp_ver[2] != "9" || $temp_ver[3] == "9" && $temp_ver[4] == "0") then
-		echo ""
-		echo "-----------------------------------------------------------------------------------"
-		echo "RUNALL-E-WRONGVERSION : Cannot Runall a Non-Developemental Version  ---->   $gtm_verno"
-		echo "-----------------------------------------------------------------------------------"
-		echo ""
-		@ runall_status = 1	# to signal that the runall failed to do its job
-		goto cleanup
-	endif
-endif
 
 # ---- currently, dtgbldir isn't built into an executable. So a "dummy" executable is assigned to it.
 
@@ -498,15 +466,17 @@ if (! -z ${TMP_DIR}_src_files) then
 				# gtm_startup_chk requires gtm_dist setup
 				rm -f ${file}_ctl.c ${file}_ansi.h	# in case an old version is lying around
 				set real_gtm_dist = "$gtm_dist"
+				if ($?gtmroutines) set save_gtmroutines = "$gtmroutines"
 				setenv gtm_dist "$gtm_root/$gtm_curpro/pro"
 				setenv gtmroutines "$gtm_obj($gtm_pct)"
 				$gtm_root/$gtm_curpro/pro/mumps -run msg $gtm_src/$file.msg Unix
 				if (0 != $status) @ runall_status = $status
 				setenv gtm_dist "$real_gtm_dist"
 				unset real_gtm_dist
-				mv ${file}_ctl.c $gtm_src/${file}_ctl.c
+				if ($?save_gtmroutines) setenv gtmroutines "$save_gtmroutines"
+				\mv -f ${file}_ctl.c $gtm_src/${file}_ctl.c
 				if ( -f ${file}_ansi.h ) then
-					mv -f ${file}_ansi.h $gtm_inc
+					\mv -f ${file}_ansi.h $gtm_inc
 				endif
 				runall_cc $RUNALL_EXTRA_CC_FLAGS $gtm_src/${file}_ctl.c
 				if (0 != $status) @ runall_status = $status
@@ -610,7 +580,7 @@ else
 		cat ${TMP_DIR}_main_.final >>! ${TMP_DIR}_build_routine.final
 	endif
 	# If we have a non-zero pct file list then include gde as one of the final build routines
-	if (! -z ${TMP_DIR}_pct_files) then
+	if (-e ${TMP_DIR}_pct_files && ! -z ${TMP_DIR}_pct_files) then
 		echo "gde" >>! ${TMP_DIR}_build_routine.final
 	endif
 	set build_routine = `cat ${TMP_DIR}_build_routine.final`

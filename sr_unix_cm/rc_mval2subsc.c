@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -112,7 +112,7 @@ unsigned char *mval2subsc(mval *v, gv_key *g)
 			in_ptr = (unsigned char *)mstr_buf1.addr; /* mstr_buf1.addr is used just in case it is
 								     reallocated by the XFORM routine */
                 }
-		if ((g->end + n + 3) > (g->top - MAX_NUM_SUBSC_LEN))
+		if ((g->end + n + 3) > (g->top - MAX_GVKEY_PADDING_LEN))
 		{
 			if (0 == (end = format_targ_key(buff, MAX_ZWR_KEY_SZ, g, TRUE)))
 				end = &buff[MAX_ZWR_KEY_SZ - 1];
@@ -127,7 +127,7 @@ unsigned char *mval2subsc(mval *v, gv_key *g)
 				if (ch <= 1)
 				{
 					*out_ptr++ = STR_SUB_ESCAPE;
-					if ( out_ptr - g->base + n + 3 > g->top - MAX_NUM_SUBSC_LEN)
+					if ( out_ptr - g->base + n + 3 > g->top - MAX_GVKEY_PADDING_LEN)
 					{
 						if ((end = format_targ_key(buff, MAX_ZWR_KEY_SZ, g, TRUE)) == 0)
 						{
@@ -144,7 +144,7 @@ unsigned char *mval2subsc(mval *v, gv_key *g)
 			*out_ptr++ = (!TREF(transform) || 0 == gv_cur_region->std_null_coll)
 				? STR_SUB_PREFIX : SUBSCRIPT_STDCOL_NULL;
 		}
-		goto FINI;
+		goto ALLDONE;
 	}
 	/* Its a number, is it an integer? */
 	if ( mvt & MV_INT )
@@ -159,7 +159,7 @@ unsigned char *mval2subsc(mval *v, gv_key *g)
 		} else if (0 == m)
 		{
 			*out_ptr++ = 0x80;
-			goto FINI;
+			goto ALLDONE;
 		}
 		if (10 > m)
 		{
@@ -285,11 +285,11 @@ LAST_LONGWORD:
 FINISH_NUMBER:
 	if (is_negative)
 		*out_ptr++ = 0xff;
-FINI:
+ALLDONE:
 	*out_ptr++ = 0 ; *out_ptr = 0 ;
 	g->prev = g->end ;
 	g->end  = out_ptr - g->base ;
-	if (g->end > g->top - MAX_NUM_SUBSC_LEN - 1)
+	if (g->end > g->top - MAX_GVKEY_PADDING_LEN - 1)
 	{	/* take of extra space and one for last zero */
 		if ((end = format_targ_key(buff, MAX_ZWR_KEY_SZ, g, TRUE)) == 0)
 			end = &buff[MAX_ZWR_KEY_SZ - 1];

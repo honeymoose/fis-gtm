@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2005, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2005, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -9,7 +9,7 @@
  *								*
  ****************************************************************/
 
-#define _POSIX_EXIT	/* Needed for VMS system() call */
+#define _POSIX_EXIT	/* Needed for VMS system() call */ /* BYPASSOK: system() used insode the comment, no SYSTEM() needed */
 #include "mdef.h"
 
 #ifdef VMS
@@ -93,11 +93,12 @@ void dbc_open_command_file(phase_static_area *psa)
 					dont_sendmsg_on_log2long);
 #ifdef UNIX
 	if (SS_LOG2LONG == status)
-		rts_error(VARLSTCNT(5) ERR_LOGTOOLONG, 3, gtm_dist_m.len, gtm_dist_m.addr, SIZEOF(gtm_dist_path_buff) - 1);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_LOGTOOLONG, 3,
+				gtm_dist_m.len, gtm_dist_m.addr, SIZEOF(gtm_dist_path_buff) - 1);
 	else
 #endif
 	if (SS_NORMAL != status)
-		rts_error(VARLSTCNT(1) ERR_GTMDISTUNDEF);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_GTMDISTUNDEF);
 	assert(0 < gtm_dist_path.len);
 	VMS_ONLY(dbc_remove_command_file(psa));	/* If we don't do this, the command files versions pile up fast */
 	psa->tcfp = Fopen((char_ptr_t)psa->tmpcmdfile, "w");
@@ -105,7 +106,7 @@ void dbc_open_command_file(phase_static_area *psa)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(8) ERR_DEVOPENFAIL, 2, psa->tmpcmdfile_len, psa->tmpcmdfile,
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_DEVOPENFAIL, 2, psa->tmpcmdfile_len, psa->tmpcmdfile,
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
 	UNIX_ONLY(dbc_write_command_file(psa, SHELL_START));
@@ -128,7 +129,7 @@ void dbc_write_command_file(phase_static_area *psa, char_ptr_t cmd)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(11) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("fprintf()"), CALLFROM, /* BYPASSOK */
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(11) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("fprintf()"), CALLFROM, /* BYPASSOK */
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
 	rc = CHMOD((char_ptr_t)psa->tmpcmdfile, S_IRUSR + S_IWUSR + S_IXUSR + S_IRGRP + S_IROTH); /* Change to 744 */
@@ -136,7 +137,7 @@ void dbc_write_command_file(phase_static_area *psa, char_ptr_t cmd)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("chmod()"), CALLFROM,
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("chmod()"), CALLFROM,
 			  ERR_TEXT, 2, psa->tmpcmdfile_len, psa->tmpcmdfile,
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
@@ -179,7 +180,7 @@ void dbc_run_command_file(phase_static_area *psa, char_ptr_t cmdname, char_ptr_t
 			*cp = '\0';
 			dbc_syscmd((char_ptr_t)cmdbuf2);
 		}
-		rts_error(VARLSTCNT(13) ERR_DBCCMDFAIL, 7, rc, cmd_len, cmdbuf1, RTS_ERROR_TEXT(cmdname),
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(13) ERR_DBCCMDFAIL, 7, rc, cmd_len, cmdbuf1, RTS_ERROR_TEXT(cmdname),
 			  RTS_ERROR_TEXT(cmdargs), ERR_TEXT, 2,
 			  RTS_ERROR_LITERAL("Note that the "UNIX_ONLY("environment variable $")VMS_ONLY("logical ")GTM_DIST
 					    " must point to the current GT.M V4 installation"));
@@ -200,7 +201,7 @@ void dbc_remove_command_file(phase_static_area *psa)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("remove()"), CALLFROM,
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("remove()"), CALLFROM,
 			  ERR_TEXT, 2, psa->tmpcmdfile_len, psa->tmpcmdfile,
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
@@ -219,7 +220,7 @@ void dbc_open_result_file(phase_static_area *psa)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(8) ERR_DEVOPENFAIL, 2, psa->tmprsltfile_len, psa->tmprsltfile,
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_DEVOPENFAIL, 2, psa->tmprsltfile_len, psa->tmprsltfile,
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
 }
@@ -240,22 +241,22 @@ uchar_ptr_t dbc_read_result_file(phase_static_area *psa, int rderrmsg, uchar_ptr
 		{	/* Non-EOF message */
 			save_errno = errno;
 			errmsg = STRERROR(save_errno);
-			rts_error(VARLSTCNT(11) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("fgets()"), CALLFROM,
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(11) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("fgets()"), CALLFROM,
 				  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 		} else
 		{	/* We have EOF */
 			if (0 != rderrmsg)
-				rts_error(VARLSTCNT(4) rderrmsg, 2, RTS_ERROR_TEXT((char_ptr_t)arg));
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) rderrmsg, 2, RTS_ERROR_TEXT((char_ptr_t)arg));
 			else
 			{
 				strcpy(emsg, "Temporary results file (");
 				strcat(emsg, (char_ptr_t)psa->tmprsltfile);
 				strcat(emsg, " had unexpected values");
-				rts_error(VARLSTCNT(6) ERR_PREMATEOF, 0, ERR_TEXT, 2,
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PREMATEOF, 0, ERR_TEXT, 2,
 					  RTS_ERROR_TEXT(emsg));
 			}
 		}
-		exit(1);	/* We shouldn't come here but in case... */
+		exit(EXIT_FAILURE);	/* We shouldn't come here but in case... */
 	}
 	return (uchar_ptr_t)fgs;
 }
@@ -282,7 +283,7 @@ void dbc_remove_result_file(phase_static_area *psa)
 	{
 		save_errno = errno;
 		errmsg = STRERROR(save_errno);
-		rts_error(VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("remove()"), CALLFROM,
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(15) ERR_SYSCALL, 5, RTS_ERROR_LITERAL("remove()"), CALLFROM,
 			  ERR_TEXT, 2, psa->tmprsltfile_len, psa->tmprsltfile,
 			  ERR_TEXT, 2, RTS_ERROR_TEXT(errmsg));
 	}
@@ -378,7 +379,7 @@ int dbc_syscmd(char_ptr_t cmdparm)
 #endif
 
 #ifdef VMS
-	/* Verify system() is supported */
+	/* Verify system() is supported */ /* BYPASSOK: system() used insode the comment, no SYSTEM() needed */
 	if (0 == SYSTEM(NULL))
 		GTMASSERT;
 #endif
@@ -632,10 +633,11 @@ int dbc_read_dbblk(phase_static_area *psa, int blk_num, enum gdsblk_type blk_typ
 void dbc_find_key(phase_static_area *psa, dbc_gv_key *key, uchar_ptr_t rec_p, int blk_levl)
 {
 	int		cmpc, rec_len;
+	int		tmp_cmpc;
 	unsigned short	us_rec_len;
 	uchar_ptr_t	key_targ_p, key_src_p;
 
-	cmpc = ((rec_hdr_ptr_t)rec_p)->cmpc;
+	cmpc = EVAL_CMPC((rec_hdr *)rec_p);
 	GET_USHORT(us_rec_len, &((rec_hdr_ptr_t)rec_p)->rsiz);
 	rec_len = us_rec_len;
 	if (BSTAR_REC_SIZE == rec_len && 0 < blk_levl)
@@ -694,6 +696,7 @@ int dbc_find_record(phase_static_area *psa, dbc_gv_key *key, int blk_index, int 
 	uchar_ptr_t	rec_p, blk_p, blk_top, key1, key2;
 	unsigned short	us_rec_len;
 	int		blk_ptr, blk_levl, key_len, key_len1, key_len2, rec_len;
+	int		tmp_cmpc;
 	enum gdsblk_type blk_type;
 	block_info	*blk_set_p;
 
@@ -770,7 +773,7 @@ int dbc_find_record(phase_static_area *psa, dbc_gv_key *key, int blk_index, int 
 			DBC_DEBUG(("DBC_DEBUG: dbc_find_record: Recursing down a level via keyed index record at offset 0x%lx\n",
 				   (rec_p - blk_p)));
 			GET_ULONG(blk_ptr, (rec_p + SIZEOF(rec_hdr) + blk_set_p->curr_blk_key->end
-					   - ((rec_hdr *)rec_p)->cmpc + 1));
+					   - EVAL_CMPC((rec_hdr *)rec_p) + 1));
 			blk_index = dbc_read_dbblk(psa, blk_ptr, blk_type);
 			return dbc_find_record(psa, key, blk_index, min_levl, blk_type, fail_ok);
 		}
@@ -796,7 +799,7 @@ int dbc_find_record(phase_static_area *psa, dbc_gv_key *key, int blk_index, int 
 	if (!fail_ok)
 	{
 		assert(FALSE);
-		rts_error(VARLSTCNT(8) ERR_DBCINTEGERR, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn),
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_DBCINTEGERR, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn),
 			  ERR_TEXT, 2, RTS_ERROR_TEXT("Unable to find index record for an existing global"));
 	}
 	return -1;
@@ -893,9 +896,9 @@ void dbc_init_db(phase_static_area *psa)
 	if (0 != ACCESS((char_ptr_t)psa->dbc_gv_cur_region->dyn.addr->fname, (R_OK | W_OK)))
 	{
 		if (EACCES == errno)
-			rts_error(VARLSTCNT(4) ERR_DBRDONLY, 2, DB_LEN_STR(psa->dbc_gv_cur_region));
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_DBRDONLY, 2, DB_LEN_STR(psa->dbc_gv_cur_region));
 		else
-			rts_error(VARLSTCNT(5) ERR_DBOPNERR, 2, DB_LEN_STR(psa->dbc_gv_cur_region), errno);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_DBOPNERR, 2, DB_LEN_STR(psa->dbc_gv_cur_region), errno);
 	}
 	/* Open the database which on VMS gives standalone access (for phase 2) */
 	psa->fc->op = FC_OPEN;
@@ -906,7 +909,7 @@ void dbc_init_db(phase_static_area *psa)
 	{	/* Verify the fileid has not changed */
 		if (!is_gdid_gdid_identical(&psa->ofhdr.unique_id.uid,
 					    &FILE_INFO(psa->dbc_gv_cur_region)->UNIX_ONLY(fileid)VMS_ONLY(file_id)))
-			rts_error(VARLSTCNT(1) ERR_DBCNOTSAMEDB);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_DBCNOTSAMEDB);
 	}
 
 	/* Read in database file header */
@@ -920,9 +923,9 @@ void dbc_init_db(phase_static_area *psa)
 	if (0 != memcmp(psa->dbc_cs_data->label, V15_GDS_LABEL, GDS_LABEL_SZ - 1))
 	{
 		if (memcmp(psa->dbc_cs_data->label, V15_GDS_LABEL, GDS_LABEL_SZ - 3))
-			rts_error(VARLSTCNT(4) ERR_DBNOTGDS, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn));
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_DBNOTGDS, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn));
 		else
-			rts_error(VARLSTCNT(4) ERR_BADDBVER, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.regname));
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_BADDBVER, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.regname));
 	}
 
 	if (!psa->phase_one)
@@ -943,12 +946,15 @@ void dbc_init_db(phase_static_area *psa)
 #endif
 		/* Verify reserved_bytes and max_rec_len again and verify kill_in_prog is not set */
 		if (VMS_ONLY(9) UNIX_ONLY(8) > psa->dbc_cs_data->reserved_bytes)
-			rts_error(VARLSTCNT(4) ERR_DBMINRESBYTES, 2, VMS_ONLY(9) UNIX_ONLY(8), psa->dbc_cs_data->reserved_bytes);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_DBMINRESBYTES, 2,
+					VMS_ONLY(9) UNIX_ONLY(8), psa->dbc_cs_data->reserved_bytes);
 		if (SIZEOF(blk_hdr) > (psa->dbc_cs_data->blk_size - psa->dbc_cs_data->max_rec_size))
-			rts_error(VARLSTCNT(5) ERR_DBMAXREC2BIG, 3, psa->dbc_cs_data->max_rec_size, psa->dbc_cs_data->blk_size,
-				  (psa->dbc_cs_data->blk_size - SIZEOF(blk_hdr)));
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_DBMAXREC2BIG, 3,
+					psa->dbc_cs_data->max_rec_size, psa->dbc_cs_data->blk_size,
+					  (psa->dbc_cs_data->blk_size - SIZEOF(blk_hdr)));
 		if (0 != psa->dbc_cs_data->kill_in_prog)
-			rts_error(VARLSTCNT(4) ERR_DBCKILLIP, 2, RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn));
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_DBCKILLIP, 2,
+					RTS_ERROR_TEXT((char_ptr_t)psa->ofhdr.dbfn));
 		/* Turn off replication and/or journaling for our trip here */
 		if (jnl_open == psa->dbc_cs_data->jnl_state)
 		{

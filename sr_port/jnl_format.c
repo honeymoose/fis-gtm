@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2010 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -26,7 +26,7 @@
 #include "jnl.h"
 #include "gdscc.h"
 #include "iosp.h"
-#include "mdefsp.h"
+#include <mdefsp.h>
 #include "ccp.h"
 #include "buddy_list.h"		/* needed for tp.h */
 #include "hashtab_int4.h"	/* needed for tp.h */
@@ -105,10 +105,14 @@ jnl_format_buffer *jnl_format(jnl_action_code opcode, gv_key *key, mval *val, ui
 	sgmnt_data_ptr_t	csd;
 	uint4			align_fill_size, jrec_size, tmp_jrec_size, update_length;
 	boolean_t		is_ztworm_rec = FALSE;
+	uint4			cursum;
 	DEBUG_ONLY(
 		static boolean_t	dbg_in_jnl_format = FALSE;
 	)
-	GTMCRYPT_ONLY(int	crypt_status;)
+#	ifdef GTM_CRYPT
+	int			gtmcrypt_errno;
+	gd_segment		*seg;
+#	endif
 #	ifdef GTM_TRIGGER
 	boolean_t		ztworm_matched, match_possible;
 	mstr			prev_str, *cur_str;
@@ -268,6 +272,7 @@ jnl_format_buffer *jnl_format(jnl_action_code opcode, gv_key *key, mval *val, ui
 	rec->prefix.forwptr = jrec_size;
 	assert(&rec->jrec_set_kill.update_num == &rec->jrec_ztworm.update_num);
 	rec->jrec_set_kill.update_num = jgbl.tp_ztp_jnl_upd_num;
+	rec->jrec_set_kill.num_participants = 0;
 	local_buffer = (char *)rec + FIXED_UPD_RECLEN;
 	mumps_node_ptr = local_buffer;
 	if (NULL != key)
@@ -304,29 +309,31 @@ jnl_format_buffer *jnl_format(jnl_action_code opcode, gv_key *key, mval *val, ui
 	assert(REPL_ALLOWED(csa) || !is_ztworm_rec || jgbl.forw_phase_recovery);
 	if (csd->is_encrypted)
 	{
-		/* At this place we have all the components of the *SET or *KILL or *ZTWORM records filled.
-		 * Before the variable part of the journal record gets encrypted, we make sure we copy the buff
-		 * into alt_buff to be used in it's original form in jnl_write.
-		 */
+		/* At this point we have all the components of *SET, *KILL, *ZTWORM and *ZTRIG records filled. */
 		if (REPL_ALLOWED(csa))
 		{
+			/* Before encrypting the journal record, copy the unencrypted buffer to an alternate buffer
+			 * that eventually gets copied to the journal pool (in jnl_write). This way, the replication
+			 * stream sends unencrypted data.
+			 */
 			memcpy(jfb->alt_buff, rec, jrec_size);
 			SET_PREV_ZTWORM_JFB_IF_NEEDED(is_ztworm_rec, (jfb->alt_buff + FIXED_UPD_RECLEN));
 		}
-		/* With the fixed length computed above as FIXED_UPD_RECLEN + JREC_SUFFIX_SIZE, we encode
-		 * the remaining buffer which consists of the *SET or *KILL or *ZTWORM components.
-		 */
 		ASSERT_ENCRYPTION_INITIALIZED;
-		GTMCRYPT_ENCODE_FAST(csa->encr_key_handle, mumps_node_ptr, update_length, NULL, crypt_status);
-		if (0 != crypt_status)
-			GC_RTS_ERROR(crypt_status, gv_cur_region->dyn.addr->fname);
+		/* Encrypt the logical portion of the record which eventually gets written to the journal buffer/file */
+		GTMCRYPT_ENCRYPT(csa, csa->encr_key_handle, mumps_node_ptr, update_length, NULL, gtmcrypt_errno);
+		if (0 != gtmcrypt_errno)
+		{
+			seg = gv_cur_region->dyn.addr;
+			GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, rts_error, seg->fname_len, seg->fname);
+		}
 	} else
 #	endif
 	{
 		SET_PREV_ZTWORM_JFB_IF_NEEDED(is_ztworm_rec, mumps_node_ptr);
 	}
 	/* The below call to jnl_get_checksum makes sure that checksum computation happens AFTER the encryption (if turned on) */
-	jfb->checksum = jnl_get_checksum((uint4 *)mumps_node_ptr, NULL, (int)(local_buffer - mumps_node_ptr));
+	jfb->checksum = compute_checksum(INIT_CHECKSUM_SEED, (uint4 *)mumps_node_ptr, (int)(local_buffer - mumps_node_ptr));
 	assert(0 == ((UINTPTR_T)local_buffer % SIZEOF(jrec_suffix)));
 	DEBUG_ONLY(dbg_in_jnl_format = FALSE;)
 	return jfb;

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -22,7 +22,6 @@
 
 #if defined(UNIX)
 #include "gtm_ipc.h"
-GBLREF uint4	user_id;
 #endif
 
 #include "gdsblk.h"
@@ -40,9 +39,8 @@ GBLREF uint4	user_id;
 #include "min_max.h"		/* needed for init_root_gv.h */
 #include "init_root_gv.h"
 #include "dse.h"
-
 #ifdef UNIX
-#include "mutex.h"
+# include "mutex.h"
 #endif
 #include "wcs_flu.h"
 #include <signal.h>		/* for VSIG_ATOMIC_T */
@@ -170,11 +168,10 @@ void dse_all(void)
 				GTMASSERT;
 			}
 			patch_curr_blk = get_dir_root();
-
 			if (crit)
 			{
-				UNIX_ONLY(gtm_mutex_init(gv_cur_region, NUM_CRIT_ENTRY, TRUE);)
-				VMS_ONLY(mutex_init(cs_addrs->critical, NUM_CRIT_ENTRY, TRUE);)
+				UNIX_ONLY(gtm_mutex_init(gv_cur_region, NUM_CRIT_ENTRY(cs_addrs->hdr), TRUE));
+				VMS_ONLY(mutex_init(cs_addrs->critical, NUM_CRIT_ENTRY(cs_addrs->hdr), TRUE));
 				cs_addrs->nl->in_crit = 0;
 				cs_addrs->hold_onto_crit = FALSE;	/* reset this just before cs_addrs->now_crit is reset */
 				cs_addrs->now_crit = FALSE;

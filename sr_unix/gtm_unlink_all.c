@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2011, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2011, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -15,6 +15,7 @@
 #include "error_trap.h"
 #include "golevel.h"
 #include "cache.h"
+#include "cmd_qlf.h"
 #include "hashtab.h"
 #include "hashtab_objcode.h"
 #include "hashtab_mname.h"
@@ -95,7 +96,10 @@ void gtm_unlink_all(void)
 	/* Step 3: re-Initialize $ECODE, $REFERENCE, and $TEST */
 	NULLIFY_DOLLAR_ECODE;		/* Clears $ECODE and results returned for $STACK */
 	if (NULL != gv_currkey)
-		gv_currkey->end = 0;	/* Clears $REFERENCE */
+	{	/* Clears $REFERENCE */
+		gv_currkey->end = 0;
+		gv_currkey->base[0] = KEY_DELIMITER;
+	}
 	dollar_truth = FALSE;		/* aka $TEST */
 	/* Step 4: Remove all triggers */
 #	ifdef GTM_TRIGGER
@@ -153,7 +157,7 @@ void gtm_unlink_all(void)
 			if (NULL == rtnhdr->shlib_handle)
 				/* We can only release this section if this is not a shared library */
 				GTM_TEXT_FREE(rtnhdr->ptext_adr);			/* R/O releasable section */
-			free(rtnhdr->literal_adr);				/* R/W releasable section part 1 */
+			free(RW_REL_START_ADR(rtnhdr));				/* R/W releasable section part 1 */
 			free(rtnhdr->linkage_adr);				/* R/W releasable section part 2 */
 			free(rtnhdr->labtab_adr);				/* Usually non-releasable but not in this case */
 			/* Run the chain of old (replaced) versions freeing them also */

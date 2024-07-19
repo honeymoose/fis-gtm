@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -26,6 +26,9 @@
 #include "gtm_inet.h"
 
 #include <signal.h>
+#ifdef GTM_PTHREAD
+#  include <pthread.h>
+#endif
 
 #include "gtm_stdio.h"
 #include "error.h"
@@ -37,17 +40,26 @@
 #include "gtmmsg.h"
 #include "gtmio.h"
 #include "have_crit.h"
+#include "util.h"
 
-#define	DEFER_EXIT_PROCESSING	((EXIT_PENDING_TOLERANT >= exit_state) &&			\
+#define	DEFER_EXIT_PROCESSING	((EXIT_PENDING_TOLERANT >= exit_state) &&	\
 	(exit_handler_active || !OK_TO_INTERRUPT))
+
+/* Combine send_msg and gtm_putmsg into one macro to conserve space. */
+#define SEND_AND_PUT_MSG(...)					\
+{								\
+	if (OK_TO_SEND_MSG)					\
+		send_msg_csa(CSA_ARG(NULL) __VA_ARGS__);	\
+	gtm_putmsg_csa(CSA_ARG(NULL) __VA_ARGS__);		\
+}
+
 /* These fields are defined as globals not because they are used globally but
  * so they will be easily retrievable even in 'pro' cores.
  */
-GBLDEF siginfo_t	exi_siginfo;
+GBLDEF siginfo_t		exi_siginfo;
 
-GBLDEF gtm_sigcontext_t exi_context;
+GBLDEF gtm_sigcontext_t 	exi_context;
 
-GBLREF	VSIG_ATOMIC_T		forced_exit;
 GBLREF	int4			forced_exit_err;
 GBLREF	int4			exi_condition;
 GBLREF	boolean_t		dont_want_core;
@@ -75,12 +87,12 @@ error_def(ERR_KRNLKILL);
 
 void generic_signal_handler(int sig, siginfo_t *info, void *context)
 {
-	boolean_t	exit_now;
 	gtm_sigcontext_t	*context_ptr;
-	void		(*signal_routine)();
+	void			(*signal_routine)();
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
+	FORWARD_SIG_TO_MAIN_THREAD_IF_NEEDED(sig);
 	/* Save parameter value in global variables for easy access in core */
 	dont_want_core = FALSE;		/* (re)set in case we recurse */
 	created_core = FALSE;		/* we can deal with a second core if needbe */
@@ -126,29 +138,33 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 	switch(sig)
 	{
 		case SIGTERM:
-			forced_exit_err = (IS_GTMSECSHR_IMAGE ? ERR_GTMSECSHRSHUTDN : ERR_FORCEDHALT);
-			/* If nothing pending AND we have crit or in wcs_wtstart() or already in exit processing, wait to
-			 * invoke shutdown. wcs_wtstart() manipulates the active queue that a concurrent process in crit
-			 * in bt_put() might be waiting for. interrupting it can cause deadlocks (see C9C11-002178).
-			 */
-			if (DEFER_EXIT_PROCESSING)
+			if (!IS_GTMSECSHR_IMAGE)
 			{
-				forced_exit = TRUE;
-				exit_state++;		/* Make exit pending, may still be tolerant though */
-				assert(!IS_GTMSECSHR_IMAGE);
-				if (exit_handler_active && !gtm_quiet_halt)
+				forced_exit_err = ERR_FORCEDHALT;
+				/* If nothing pending AND we have crit or in wcs_wtstart() or already in exit processing, wait to
+				 * invoke shutdown. wcs_wtstart() manipulates the active queue that a concurrent process in crit
+				 * in bt_put() might be waiting for. interrupting it can cause deadlocks (see C9C11-002178).
+				 */
+				if (DEFER_EXIT_PROCESSING)
 				{
-					send_msg(VARLSTCNT(1) forced_exit_err);
-					gtm_putmsg(VARLSTCNT(1) forced_exit_err);
+					SET_FORCED_EXIT_STATE;
+					exit_state++;		/* Make exit pending, may still be tolerant though */
+					assert(!IS_GTMSECSHR_IMAGE);
+					if (exit_handler_active && !gtm_quiet_halt)
+						SEND_AND_PUT_MSG(VARLSTCNT(1) forced_exit_err);
+					return;
 				}
-				return;
-			}
-			exit_state = EXIT_IMMED;
-			SET_PROCESS_EXITING_TRUE; /* set this BEFORE cancelling timers as wcs_phase2_commit_wait relies on this */
-			if (ERR_FORCEDHALT != forced_exit_err || !gtm_quiet_halt)
-			{
-				send_msg(VARLSTCNT(1) forced_exit_err);
-				gtm_putmsg(VARLSTCNT(1) forced_exit_err);
+				exit_state = EXIT_IMMED;
+				SET_PROCESS_EXITING_TRUE; 	/* Set this BEFORE cancelling timers as wcs_phase2_commit_wait
+								 * relies on this.
+								 */
+				if (ERR_FORCEDHALT != forced_exit_err || !gtm_quiet_halt)
+					SEND_AND_PUT_MSG(VARLSTCNT(1) forced_exit_err);
+			} else
+			{	/* Special case for gtmsecshr - no deferral just exit */
+				forced_exit_err = ERR_GTMSECSHRSHUTDN;
+				if (OK_TO_SEND_MSG)
+					send_msg_csa(CSA_ARG(NULL) VARLSTCNT(1) forced_exit_err);
 			}
 			dont_want_core = TRUE;
 			break;
@@ -179,7 +195,7 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 			/* If nothing pending AND we have crit or already in exit processing, wait to invoke shutdown */
 			if (DEFER_EXIT_PROCESSING)
 			{
-				forced_exit = TRUE;
+				SET_FORCED_EXIT_STATE;
 				exit_state++;		/* Make exit pending, may still be tolerant though */
 				assert(!IS_GTMSECSHR_IMAGE);
 				return;
@@ -189,32 +205,24 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 			switch(signal_info.infotype)
 			{
 				case GTMSIGINFO_NONE:
-					send_msg(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type), process_id, sig);
-					gtm_putmsg(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type), process_id, sig);
+					SEND_AND_PUT_MSG(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type),
+						process_id, sig);
 					break;
 				case GTMSIGINFO_USER:
-					send_msg(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.send_pid, signal_info.send_uid);
-					gtm_putmsg(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.send_pid, signal_info.send_uid);
+					SEND_AND_PUT_MSG(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.send_pid, signal_info.send_uid);
 					break;
 				case GTMSIGINFO_ILOC + GTMSIGINFO_BADR:
-					send_msg(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
-					gtm_putmsg(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
 					break;
 				case GTMSIGINFO_ILOC:
-					send_msg(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr);
-					gtm_putmsg(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.int_iadr);
 					break;
 				case GTMSIGINFO_BADR:
-					send_msg(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.bad_vadr);
-					gtm_putmsg(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.bad_vadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.bad_vadr);
 					break;
 			}
 			break;
@@ -224,15 +232,14 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 			/* If nothing pending AND we have crit or already in exit processing, wait to invoke shutdown */
 			if (DEFER_EXIT_PROCESSING)
 			{
-				forced_exit = TRUE;
+				SET_FORCED_EXIT_STATE;
 				exit_state++;		/* Make exit pending, may still be tolerant though */
 				assert(!IS_GTMSECSHR_IMAGE);
 				return;
 			}
 			exit_state = EXIT_IMMED;
 			SET_PROCESS_EXITING_TRUE;
-			send_msg(VARLSTCNT(1) forced_exit_err);
-			gtm_putmsg(VARLSTCNT(1) forced_exit_err);
+			SEND_AND_PUT_MSG(VARLSTCNT(1) forced_exit_err);
 			dont_want_core = TRUE;
 			break;
 #		endif
@@ -243,8 +250,8 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 				case GTMSIGINFO_NONE:
 					exit_state = EXIT_IMMED;
 					SET_PROCESS_EXITING_TRUE;
-					send_msg(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type), process_id, sig);
-					gtm_putmsg(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type), process_id, sig);
+					SEND_AND_PUT_MSG(VARLSTCNT(6) ERR_KILLBYSIG, 4, GTMIMAGENAMETXT(image_type),
+						process_id, sig);
 					break;
 				case GTMSIGINFO_USER:
 					/* This signal was SENT to us so it can wait until we are out of crit to cause an exit */
@@ -253,7 +260,7 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 					if (DEFER_EXIT_PROCESSING)
 					{
 						assert(!IS_GTMSECSHR_IMAGE);
-						forced_exit = TRUE;
+						SET_FORCED_EXIT_STATE;
 						exit_state++;		/* Make exit pending, may still be tolerant though */
 						need_core = TRUE;
 						gtm_fork_n_core();	/* Generate "virgin" core while we can */
@@ -261,34 +268,26 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 					}
 					exit_state = EXIT_IMMED;
 					SET_PROCESS_EXITING_TRUE;
-					send_msg(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.send_pid, signal_info.send_uid);
-					gtm_putmsg(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.send_pid, signal_info.send_uid);
+					SEND_AND_PUT_MSG(VARLSTCNT(8) ERR_KILLBYSIGUINFO, 6, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.send_pid, signal_info.send_uid);
 					break;
 				case GTMSIGINFO_ILOC + GTMSIGINFO_BADR:
 					exit_state = EXIT_IMMED;
 					SET_PROCESS_EXITING_TRUE;
-					send_msg(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
-					gtm_putmsg(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(8) ERR_KILLBYSIGSINFO1, 6, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.int_iadr, signal_info.bad_vadr);
 					break;
 				case GTMSIGINFO_ILOC:
 					exit_state = EXIT_IMMED;
 					SET_PROCESS_EXITING_TRUE;
-					send_msg(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr);
-					gtm_putmsg(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.int_iadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(7) ERR_KILLBYSIGSINFO2, 5, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.int_iadr);
 					break;
 				case GTMSIGINFO_BADR:
 					exit_state = EXIT_IMMED;
 					SET_PROCESS_EXITING_TRUE;
-					send_msg(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.bad_vadr);
-					gtm_putmsg(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
-							process_id, sig, signal_info.bad_vadr);
+					SEND_AND_PUT_MSG(VARLSTCNT(7) ERR_KILLBYSIGSINFO3, 5, GTMIMAGENAMETXT(image_type),
+						process_id, sig, signal_info.bad_vadr);
 					break;
 				default:
 					exit_state = EXIT_IMMED;
@@ -297,12 +296,14 @@ void generic_signal_handler(int sig, siginfo_t *info, void *context)
 			}
 			if (0 != signal_info.sig_err)
 			{
-				send_msg(VARLSTCNT(1) signal_info.sig_err);
-				gtm_putmsg(VARLSTCNT(1) signal_info.sig_err);
+				SEND_AND_PUT_MSG(VARLSTCNT(1) signal_info.sig_err);
 			}
 			break;
 	} /* switch (sig) */
-	cancel_timer(0);	/* Don't want any interruptions */
+	/* Stop the timers but do not cancel them. This allows the timer structures to appear in the core where gtmpcat can
+	 * extract them allowing us to see what was going on.
+	 */
+	sys_canc_timer();
 	FFLUSH(stdout);
 	if (!dont_want_core)
 	{

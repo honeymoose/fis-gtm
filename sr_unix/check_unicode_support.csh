@@ -1,6 +1,6 @@
 #################################################################
 #								#
-#	Copyright 2007, 2010 Fidelity Information Services, Inc #
+#	Copyright 2007, 2013 Fidelity Information Services, Inc #
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -19,17 +19,17 @@
 ###########################################################################################
 
 set found_icu = 0
-set utflocale = `locale -a | grep -i en_us | grep -i utf | grep '8$'`
+set utflocale = `locale -a | grep -i en_us | grep -i utf | grep '8$' | head -n 1`
 if ("OS/390" == $HOSTOS) then
 #	z/OS has both en_US.UTF-8 and En_US.UTF-8 with both .xplink and .lp64 suffixes - we need .lp64
-	set utflocale = `locale -a | grep En_US.UTF-8.lp64 | sed 's/.lp64$//'`
+	set utflocale = `locale -a | grep En_US.UTF-8.lp64 | sed 's/.lp64$//' | head -n 1`
 endif
 
 # This _could_ not work on new platforms or newly installed supported platforms.
 # It should be manually tested using this command :
 #    ssh <some host> ls -l {/usr/local,/usr,}/lib{64,,32}/libicuio.{a,so,sl}
 
-foreach libdir ( {/usr/local,/usr,}/lib{64,,32}/libicuio.{a,so,sl} )
+foreach libdir ( {/usr/local,/usr,}/lib{64,/x86_64-linux-gnu,,32,/i386-linux-gnu}/libicuio.{a,so,sl} )
 	# 36 is the least version GT.M supports for ICU.
 	# We have to get the numeric value from the ICU library. On non-AIX platforms, this can be done by
 	# first getting the library to which libicuio.so is pointing to (this is always TRUE, in the sense

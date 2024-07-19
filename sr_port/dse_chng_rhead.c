@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -42,12 +42,11 @@ GBLREF gd_region        *gv_cur_region;
 GBLREF uint4		update_array_size;
 GBLREF srch_hist	dummy_hist;
 GBLREF block_id		patch_curr_blk;
-GBLREF unsigned char	patch_comp_count;
+GBLREF unsigned short	patch_comp_count;
 GBLREF sgmnt_addrs	*cs_addrs;
 GBLREF sgmnt_data_ptr_t cs_data;
 GBLREF gd_addr		*gd_header;
 GBLREF cw_set_element   cw_set[];
-GBLREF unsigned char    *non_tp_jfb_buff_ptr;
 
 void dse_chng_rhead(void)
 {
@@ -58,6 +57,7 @@ void dse_chng_rhead(void)
 	uint4		x;
 	blk_segment	*bs1, *bs_ptr;
 	int4		blk_seg_cnt, blk_size;
+	int		tmp_cmpc;
 	srch_blk_status	blkhist;
 
 	error_def(ERR_DBRDONLY);
@@ -102,7 +102,7 @@ void dse_chng_rhead(void)
 		return;
 	}
 	GET_SHORT(new_rec.rsiz, &((rec_hdr_ptr_t)rp)->rsiz);
-	new_rec.cmpc = ((rec_hdr_ptr_t)rp)->cmpc;
+	SET_CMPC(&new_rec, EVAL_CMPC((rec_hdr_ptr_t)rp));
 	if (cli_present("CMPC") == CLI_PRESENT)
 	{
 		if (!cli_get_hex("CMPC", &x))
@@ -110,7 +110,7 @@ void dse_chng_rhead(void)
 			t_abort(gv_cur_region, cs_addrs);
 			return;
 		}
-		if (x > 0x7f)
+		if (x >= MAX_KEY_SZ)
 		{
 			util_out_print("Error: invalid cmpc.",TRUE);
 			t_abort(gv_cur_region, cs_addrs);
@@ -118,7 +118,7 @@ void dse_chng_rhead(void)
 		}
 		if (x > patch_comp_count)
 			util_out_print("Warning:  specified compression count is larger than the current expanded key size.", TRUE);
-		new_rec.cmpc = x;
+		SET_CMPC(&new_rec, x);
 		chng_rec = TRUE;
 	}
 	if (cli_present("RSIZ") == CLI_PRESENT)
@@ -157,7 +157,7 @@ void dse_chng_rhead(void)
 			return;
 		}
 		t_write(&blkhist, (unsigned char *)bs1, 0, 0, ((blk_hdr_ptr_t)bp)->levl, TRUE, FALSE, GDS_WRITE_KILLTN);
-		BUILD_AIMG_IF_JNL_ENABLED(cs_data, non_tp_jfb_buff_ptr, cs_addrs->ti->curr_tn);
+		BUILD_AIMG_IF_JNL_ENABLED(cs_data, cs_addrs->ti->curr_tn);
 		t_end(&dummy_hist, NULL, TN_NOT_SPECIFIED);
 	}
 	return;

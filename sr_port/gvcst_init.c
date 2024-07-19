@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -57,6 +57,10 @@
 #include "gtmmsg.h"
 #ifdef UNIX
 #include "heartbeat_timer.h"
+#include "anticipatory_freeze.h"
+#include "wbox_test_init.h"
+
+#define MAX_DBINIT_RETRY	4
 #endif
 
 #ifdef	GTM_FD_TRACE
@@ -76,7 +80,6 @@ GBLREF	ua_list			*first_ua, *curr_ua;
 GBLREF	short			crash_count;
 GBLREF	uint4			dollar_tlevel;
 GBLREF	jnl_format_buffer	*non_tp_jfb_ptr;
-GBLREF	unsigned char		*non_tp_jfb_buff_ptr;
 GBLREF	boolean_t		mupip_jnl_recover;
 GBLREF	buddy_list		*global_tlvl_info_list;
 GBLREF	tp_region		*tp_reg_free_list;	/* Ptr to list of tp_regions that are unused */
@@ -92,6 +95,11 @@ GBLREF	volatile int4		fast_lock_count;
 GBLREF	gvt_container		*gvt_pending_list;
 GBLREF	boolean_t		dse_running;
 GBLREF	jnl_gbls_t		jgbl;
+#ifdef UNIX
+GBLREF	boolean_t		pool_init;
+GBLREF	boolean_t		jnlpool_init_needed;
+GBLREF	jnlpool_addrs		jnlpool;
+#endif
 
 LITREF char			gtm_release_name[];
 LITREF int4			gtm_release_name_len;
@@ -103,6 +111,7 @@ error_def(ERR_DBNOTGDS);
 error_def(ERR_DBVERPERFWARN1);
 error_def(ERR_DBVERPERFWARN2);
 error_def(ERR_MMNODYNUPGRD);
+error_def(ERR_REGOPENFAIL);
 
 void	assert_jrec_member_offsets(void)
 {
@@ -172,12 +181,19 @@ void	assert_jrec_member_offsets(void)
 	assert(NULL_RECLEN == (ROUND_UP(SIZEOF(struct_jrec_null), JNL_REC_START_BNDRY)));
 	assert(EPOCH_RECLEN == (ROUND_UP(SIZEOF(struct_jrec_epoch), JNL_REC_START_BNDRY)));
 	assert(EOF_RECLEN == (ROUND_UP(SIZEOF(struct_jrec_eof), JNL_REC_START_BNDRY)));
+	/* Assert following comment which is relied upon in JNL_FILE_TAIL_PRESERVE macro.
+	 * 	"We know PINI_RECLEN is maximum of EPOCH_RECLEN, PFIN_RECLEN, EOF_RECLEN"
+	 */
+	assert(PINI_RECLEN > EPOCH_RECLEN);
+	assert(PINI_RECLEN > PFIN_RECLEN);
+	assert(PINI_RECLEN > EOF_RECLEN);
 	/* Assumption about the structures in code */
 	assert(0 == MIN_ALIGN_RECLEN % JNL_REC_START_BNDRY);
 	assert(SIZEOF(uint4) == SIZEOF(jrec_suffix));
-	assert((MAX_JNL_REC_SIZE - MAX_LOGI_JNL_REC_SIZE) > MIN_PBLK_RECLEN);
+	assert((SIZEOF(jnl_record) + MAX_LOGI_JNL_REC_SIZE + SIZEOF(jrec_suffix)) < MAX_JNL_REC_SIZE);
 	assert((DISK_BLOCK_SIZE * JNL_DEF_ALIGNSIZE) >= MAX_JNL_REC_SIZE);/* default alignsize supports max jnl record length */
-	assert(MAX_DB_BLK_SIZE < MAX_JNL_REC_SIZE);	/* Ensure a PBLK record can accommodate a full GDS block */
+	assert(MAX_MAX_NONTP_JNL_REC_SIZE <= MAX_JNL_REC_SIZE);
+	assert(MAX_DB_BLK_SIZE < MAX_MAX_NONTP_JNL_REC_SIZE);	/* Ensure a PBLK record can accommodate a full GDS block */
 	assert(MAX_JNL_REC_SIZE <= (1 << 24));
 		/* Ensure that the 24-bit length field in the journal record can accommodate the maximum journal record size */
 	assert(tcom_record.prefix.forwptr == tcom_record.suffix.backptr);
@@ -194,6 +210,8 @@ void gvcst_init(gd_region *greg)
 	sgmnt_data_ptr_t	temp_cs_data;
 #	endif
 	uint4			segment_update_array_size;
+	int4			bsize;
+	boolean_t		realloc_alt_buff;
 	file_control		*fc;
 	gd_region		*prev_reg, *reg_top;
 #	ifdef DEBUG
@@ -215,9 +233,16 @@ void gvcst_init(gd_region *greg)
 	gv_namehead		*gvt, *gvt_stay;
 	gvnh_reg_t		*gvnh_reg;
 	hash_table_mname	*table;
-	boolean_t		added, first_wasopen;
+	boolean_t		added, first_wasopen, onln_rlbk_cycle_mismatch = FALSE;
 	intrpt_state_t		save_intrpt_ok_state;
+#	ifdef UNIX
+	replpool_identifier	replpool_id;
+	unsigned int		full_len;
+	int4			db_init_retry;
+#	endif
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	UNSUPPORTED_PLATFORM_CHECK;
 	assert(!jgbl.forw_phase_recovery);
 	CWS_INIT;	/* initialize the cw_stagnate hash-table */
@@ -225,11 +250,12 @@ void gvcst_init(gd_region *greg)
 	assert(SIZEOF(th_rec) == (SIZEOF(bt_rec) - SIZEOF(bt->blkque)));
 	assert(SIZEOF(cache_rec) == (SIZEOF(cache_state_rec) + SIZEOF(cr->blkque)));
 	DEBUG_ONLY(assert_jrec_member_offsets();)
+	assert(MAX_DB_BLK_SIZE < (1 << NEXT_OFF_MAX_BITS));	/* Ensure a off_chain record's next_off member
+								 * can work with all possible block sizes */
         set_num_additional_processors();
-
 	DEBUG_ONLY(
-		/* Note that the "block" member in the blk_ident structure in gdskill.h has 28 bits.
-		 * Currently, the maximum number of blocks is 2**28. If ever this increases, something
+		/* Note that the "block" member in the blk_ident structure in gdskill.h has 30 bits.
+		 * Currently, the maximum number of blocks is 2**30. If ever this increases, something
 		 * has to be correspondingly done to the "block" member to increase its capacity.
 		 * The following assert checks that we always have space in the "block" member
 		 * to represent a GDS block number.
@@ -314,20 +340,20 @@ void gvcst_init(gd_region *greg)
 		greg->jnl_deq = csd->jnl_deq;
 		greg->jnl_buffer_size = csd->jnl_buffer_size;
 		greg->jnl_before_image = csd->jnl_before_image;
-		greg->open = TRUE;
-		greg->opening = FALSE;
-		greg->was_open = TRUE;
+		SET_REGION_OPEN_TRUE(greg, WAS_OPEN_TRUE);
 		assert(1 <= csa->regcnt);
 		csa->regcnt++;	/* Increment # of regions that point to this csa */
 		return;
 	}
 	GTM_FD_TRACE_ONLY(gtm_dbjnl_dupfd_check();)	/* check if any of db or jnl fds collide (D9I11-002714) */
 	greg->was_open = FALSE;
-	/* we shouldn't have crit on any region unless we are in TP and in the final retry or we are in
-	 * mupip_set_journal trying to switch journals across all regions. Currently, there is no fine-granular
-	 * checking for mupip_set_journal, hence a coarse MUPIP_IMAGE check for image_type
+	/* We shouldn't have crit on any region unless we are in TP and in the final retry or we are in mupip_set_journal trying to
+	 * switch journals across all regions. WBTEST_HOLD_CRIT_ENABLED is an exception because it exercises a deadlock situation so
+	 * it needs to hold multiple crits at the same time. Currently, there is no fine-granular checking for mupip_set_journal,
+	 * hence a coarse MUPIP_IMAGE check for image_type.
 	 */
-	assert(dollar_tlevel && (CDB_STAGNATE <= t_tries) || IS_MUPIP_IMAGE || (0 == have_crit(CRIT_HAVE_ANY_REG)));
+	assert(dollar_tlevel && (CDB_STAGNATE <= t_tries) || IS_MUPIP_IMAGE || (0 == have_crit(CRIT_HAVE_ANY_REG))
+	       || WBTEST_ENABLED(WBTEST_HOLD_CRIT_ENABLED));
 	if (dollar_tlevel && (0 != have_crit(CRIT_HAVE_ANY_REG)))
 	{	/* To avoid deadlocks with currently holding crits and the DLM lock request to be done in db_init(),
 		 * we should insert this region in the tp_reg_list and tp_restart should do the gvcst_init after
@@ -352,9 +378,9 @@ void gvcst_init(gd_region *greg)
         csa->jnl = NULL;
 	csa->persistent_freeze = FALSE;	/* want secshr_db_clnup() to clear an incomplete freeze/unfreeze codepath */
 	csa->regcnt = 1;	/* At this point, only one region points to this csa */
-#	ifdef VMS
 	csa->db_addrs[0] = csa->db_addrs[1] = NULL;
 	csa->lock_addrs[0] = csa->lock_addrs[1] = NULL;
+#	ifdef VMS
 	greg_acc_meth = greg->dyn.addr->acc_meth;
 	assert(dba_cm != greg_acc_meth);
 	temp_cs_data = (sgmnt_data_ptr_t)cs_data_buff;
@@ -437,15 +463,46 @@ void gvcst_init(gd_region *greg)
 	assert(268 == OFFSETOF(node_local, now_running[0]));
  	assert(36 == SIZEOF(((node_local *)NULL)->now_running));
 	assert(36 == MAX_REL_NAME);
-	UNIX_ONLY(START_HEARTBEAT_IF_NEEDED;)
+#	ifdef UNIX
+	START_HEARTBEAT_IF_NEEDED;
+	if (!pool_init && jnlpool_init_needed && ANTICIPATORY_FREEZE_AVAILABLE && REPL_INST_AVAILABLE)
+		jnlpool_init(GTMRELAXED, (boolean_t)FALSE, (boolean_t *)NULL);
+	/* Any LSEEKWRITEs hence forth will wait if the instance is frozen. To aid in printing the region information before
+	 * and after the wait, csa->region is referenced. Since it is NULL at this point, set it to greg. This is a safe
+	 * thing to do since csa->region is anyways set in db_common_init (few lines below).
+	 */
+	csa->region = greg;
+#	endif
 	/* Protect the db_init and the code below until we set greg->open to TRUE. This is needed as otherwise,
 	 * if a MUPIP STOP is issued to this process at a time-window when db_init is completed but greg->open
 	 * is NOT set to TRUE, will cause gds_rundown NOT to clean up the shared memory created by db_init and
 	 * thus would be left over in the system.
 	 */
 	DEFER_INTERRUPTS(INTRPT_IN_GVCST_INIT);
-	VMS_ONLY(db_init(greg, temp_cs_data);)
-	UNIX_ONLY(db_init(greg);)
+	VMS_ONLY(db_init(greg, temp_cs_data));
+#	ifdef UNIX
+	db_init_retry = 0;
+	GTM_WHITE_BOX_TEST(WBTEST_HOLD_FTOK_UNTIL_BYPASS, db_init_retry, 3);
+	for (; db_init_retry < MAX_DBINIT_RETRY; db_init_retry++)
+	{
+		if (0 == db_init(greg))
+			break;
+		db_init_err_cleanup(MAX_DBINIT_RETRY >  (db_init_retry + 1));
+	}
+	if (MAX_DBINIT_RETRY == db_init_retry) /* We retried enough. Error out. */
+	{
+		assert(IS_LKE_IMAGE || IS_DSE_IMAGE);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_REGOPENFAIL, 4, REG_LEN_STR(greg), DB_LEN_STR(greg));
+	}
+
+#	endif
+	/* At this point, we have initialized the database, but haven't yet set reg->open to TRUE. If any rts_errors happen in
+	 * the meantime, there are no condition handlers established to handle the rts_error. More importantly, it is non-trivial
+	 * to add logic to such a condition handler to undo the effects of db_init. Also, in some cases, the rts_error can can
+	 * confuse future calls of db_init. By invoking DBG_MARK_RTS_ERROR_UNUSABLE, we can catch any rts_errors in future and
+	 * eliminate it on a case by case basis.
+	 */
+	UNIX_ONLY(DBG_MARK_RTS_ERROR_UNUSABLE);
 	crash_count = csa->critical->crashcnt;
 	csa->regnum = ++region_open_count;
 	csd = csa->hdr;
@@ -458,17 +515,6 @@ void gvcst_init(gd_region *greg)
 	/* set csd and fill in selected fields */
 	assert(greg->dyn.addr->acc_meth == csd->acc_meth); /* db_init should have made sure this assert holds good */
 	greg_acc_meth = csd->acc_meth;
-	switch (greg_acc_meth)
-	{
-	case dba_mm:
-		csa->acc_meth.mm.base_addr = (sm_uc_ptr_t)((sm_ulong_t)csd + (int)(csd->start_vbn - 1) * DISK_BLOCK_SIZE);
-		break;
-	case dba_bg:
-		db_csh_ini(csa);
-		break;
-	default:
-		GTMASSERT;
-	}
 	/* It is necessary that we do the pending gv_target list reallocation BEFORE db_common_init as the latter resets
 	 * greg->max_key_size to be equal to the csd->max_key_size and hence process_gvt_pending_list might wrongly conclude
 	 * that NO reallocation (since it checks greg->max_key_size with csd->max_key_size) is needed when in fact a
@@ -492,9 +538,9 @@ void gvcst_init(gd_region *greg)
 	    && COMPSWAP_LOCK(&csd->next_upgrd_warn.time_latch, next_warn_uint4, 0, (curr_time_uint4 + UPGRD_WARN_INTERVAL), 0))
 	{	/* The msg is due and we have successfully updated the next time interval */
 		if (GDSVCURR != csd->desired_db_format)
-			send_msg(VARLSTCNT(4) ERR_DBVERPERFWARN1, 2, DB_LEN_STR(greg));
+			send_msg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_DBVERPERFWARN1, 2, DB_LEN_STR(greg));
 		else
-			send_msg(VARLSTCNT(4) ERR_DBVERPERFWARN2, 2, DB_LEN_STR(greg));
+			send_msg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_DBVERPERFWARN2, 2, DB_LEN_STR(greg));
 	}
 
 	/* Compute the maximum journal space requirements for a PBLK (including possible ALIGN record).
@@ -541,22 +587,37 @@ void gvcst_init(gd_region *greg)
 	assert(global_tlvl_info_list || !csa->sgm_info_ptr);
 	if (JNL_ALLOWED(csa))
 	{
+		bsize = csd->blk_size;
+		realloc_alt_buff = FALSE;
 		if (NULL == non_tp_jfb_ptr)
 		{
 			non_tp_jfb_ptr = (jnl_format_buffer *)malloc(SIZEOF(jnl_format_buffer));
-			non_tp_jfb_buff_ptr =  (unsigned char *)malloc(MAX_JNL_REC_SIZE);
-			non_tp_jfb_ptr->buff = (char *)non_tp_jfb_buff_ptr;
-			/* If the journal records need to be encrypted in the journal file and if replication is in use,
-			 * we will need access to both the encrypted (for the journal file) and unencrypted (for the
-			 * journal pool) journal record contents. Since this code is executed only once (for the first
-			 * journaled database opened) by this process, we will have to allocate an alternate buffer
-			 * for this purpose (to hold the unencrypted data) as long as this GT.M version supports encryption.
-			 */
-			GTMCRYPT_ONLY(
-				non_tp_jfb_ptr->alt_buff = (char *)malloc(MAX_JNL_REC_SIZE);
-			)
+			non_tp_jfb_ptr->hi_water_bsize = bsize;
+			non_tp_jfb_ptr->buff = (char *)malloc(MAX_NONTP_JNL_REC_SIZE(bsize));
 			non_tp_jfb_ptr->record_size = 0;	/* initialize it to 0 since TOTAL_NONTPJNL_REC_SIZE macro uses it */
+			GTMCRYPT_ONLY(non_tp_jfb_ptr->alt_buff = NULL);
+		} else if (bsize > non_tp_jfb_ptr->hi_water_bsize)
+		{	/* Need a larger buffer to accommodate larger non-TP journal records */
+			non_tp_jfb_ptr->hi_water_bsize = bsize;
+			free(non_tp_jfb_ptr->buff);
+			non_tp_jfb_ptr->buff = (char *)malloc(MAX_NONTP_JNL_REC_SIZE(bsize));
+#			ifdef GTM_CRYPT
+			if (NULL != non_tp_jfb_ptr->alt_buff)
+			{
+				free(non_tp_jfb_ptr->alt_buff);
+				realloc_alt_buff = TRUE;
+			}
+#			endif
 		}
+		/* If the journal records need to be encrypted in the journal file and if replication is in use,
+		 * we will need access to both the encrypted (for the journal file) and unencrypted (for the
+		 * journal pool) journal record contents. Allocate an alternative buffer if any open journaled region
+		 * is encrypted.
+		 */
+#		ifdef GTM_CRYPT
+		if (realloc_alt_buff || (csd->is_encrypted && (NULL == non_tp_jfb_ptr->alt_buff)))
+			non_tp_jfb_ptr->alt_buff = (char *)malloc(MAX_NONTP_JNL_REC_SIZE(non_tp_jfb_ptr->hi_water_bsize));
+#		endif
 		/* csa->min_total_tpjnl_rec_size represents the minimum journal buffer space needed for a TP transaction.
 		 * It is a conservative estimate assuming that one ALIGN record and one PINI record will be written for
 		 * one set of fixed size jnl records written.
@@ -581,8 +642,18 @@ void gvcst_init(gd_region *greg)
 		global_tlvl_info_list = (buddy_list *)malloc(SIZEOF(buddy_list));
 		initialize_list(global_tlvl_info_list, SIZEOF(global_tlvl_info), GBL_TLVL_INFO_LIST_INIT_ALLOC);
 	}
-	greg->open = TRUE;
-	greg->opening = FALSE;
+	assert(!greg->was_open);
+	SET_REGION_OPEN_TRUE(greg, WAS_OPEN_FALSE);
+	csa = (sgmnt_addrs*)&FILE_INFO(greg)->s_addrs;
+	if (NULL != csa->dir_tree)
+	{	/* It is possible that dir_tree has already been targ_alloc'ed. This is because GT.CM or VMS DAL
+		 * calls can run down regions without the process halting out. We don't want to double malloc.
+		 */
+		csa->dir_tree->clue.end = 0;
+	}
+	SET_CSA_DIR_TREE(csa, greg->max_key_size, greg);
+	/* Now that reg->open is set to TRUE and directory tree is initialized, go ahead and set rts_error back to being usable */
+	UNIX_ONLY(DBG_MARK_RTS_ERROR_USABLE);
 	/* gds_rundown if invoked from now on will take care of cleaning up the shared memory segment */
 	ENABLE_INTERRUPTS(INTRPT_IN_GVCST_INIT);
 	if (dba_bg == greg_acc_meth)
@@ -632,6 +703,7 @@ void gvcst_init(gd_region *greg)
 		greg_fid = &(csa->nl->unique_id);
 		for (regcsa = cs_addrs_list; NULL != regcsa; regcsa = regcsa->next_csa)
 		{
+			UNIX_ONLY(onln_rlbk_cycle_mismatch |= (regcsa->db_onln_rlbkd_cycle != regcsa->nl->db_onln_rlbkd_cycle));
 			if ((NULL != prevcsa) && (regcsa->fid_index < prevcsa->fid_index))
 				continue;
 			reg_fid = &((regcsa)->nl->unique_id);
@@ -647,6 +719,14 @@ void gvcst_init(gd_region *greg)
 			csa->fid_index = 1;
 		else
 			csa->fid_index = prevcsa->fid_index + 1;
+		UNIX_ONLY(
+			if (onln_rlbk_cycle_mismatch)
+			{
+				csa->root_search_cycle--;
+				csa->onln_rlbk_cycle--;
+				csa->db_onln_rlbkd_cycle--;
+			}
+		)
 		/* Add current csa into list of open csas */
 		csa->next_csa = cs_addrs_list;
 		cs_addrs_list = csa;
@@ -655,5 +735,21 @@ void gvcst_init(gd_region *greg)
 			tr->file.fid_index = (&FILE_INFO(tr->reg)->s_addrs)->fid_index;
 		DBG_CHECK_TP_REG_LIST_SORTING(tp_reg_list);
 	}
+#	ifdef UNIX
+	if (pool_init && REPL_ALLOWED(csd) && jnlpool_init_needed)
+	{
+		/* Last parameter to VALIDATE_INITIALIZED_JNLPOOL is TRUE if the process does logical updates and FALSE otherwise.
+		 * This parameter governs whether the macro can do SCNDDBNOUPD check or not. All the utilities that sets
+		 * jnlpool_init_needed global variable don't do logical updates (REORG, EXTEND, etc.). But, for GT.M,
+		 * jnlpool_init_needed is set to TRUE unconditionally. Even though GT.M can do logical updates, we pass FALSE
+		 * unconditionally to the macro (indicating no logical updates). This is because, at this point, there is no way to
+		 * tell if this process wants to open the database for read or write operation. If it is for a read operation, we
+		 * don't want the below macro to issue SCNDDBNOUPD error. If it is for write operation, we will skip the
+		 * SCNDDBNOUPD error message here. But, eventually when this process goes to gvcst_{put,kill} or op_ztrigger,
+		 * SCNDDBNOUPD is issued.
+		 */
+		VALIDATE_INITIALIZED_JNLPOOL(csa, csa->nl, greg, GTMRELAXED, SCNDDBNOUPD_CHECK_FALSE);
+	}
+#	endif
 	return;
 }

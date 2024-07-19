@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -154,7 +154,7 @@ error_def(ERR_MUJNLSTAT);
 	struct tm	*tsp;										\
 													\
 	short_time = (time_t)input_time;								\
-	tsp = localtime((const time_t *)&short_time);							\
+	GTM_LOCALTIME(tsp, (const time_t *)&short_time);						\
 	SPRINTF(time_str, "%04d/%02d/%02d %02d:%02d:%02d", 						\
 		(1900 + tsp->tm_year), (1 + tsp->tm_mon), tsp->tm_mday, tsp->tm_hour, tsp->tm_min, tsp->tm_sec);	\
 }
@@ -648,6 +648,7 @@ typedef struct reg_ctl_list_struct
 	boolean_t		deleted_from_unprocessed_list;
 	jnl_ctl_list 		*last_processed_jctl;
 	uint4			last_processed_rec_offset;
+	seq_num			last_processed_jnl_seqno;	/* last jnl_seqno processed in this region */
 #	endif
 	boolean_t		db_present;		/* TRUE if database pointed by curr->gd is present or not */
 } reg_ctl_list;
@@ -987,6 +988,25 @@ typedef struct onln_rlbk_reg_list_struct
 
 #define	MUR_WITHIN_ERROR_LIMIT(err_cnt, error_limit) ((++err_cnt <= error_limit) || (mur_options.interactive && mur_interactive()))
 
+#ifdef DEBUG
+#	define	MUR_DBG_SET_LAST_PROCESSED_JNL_SEQNO(TOKEN, RCTL)					\
+	{												\
+		if (NULL != RCTL)									\
+		{											\
+			assert(!mur_options.rollback || RCTL->last_processed_jnl_seqno <= TOKEN);	\
+			RCTL->last_processed_jnl_seqno = TOKEN;						\
+		}											\
+	}
+#else
+#	define	MUR_DBG_SET_LAST_PROCESSED_JNL_SEQNO(TOKEN, RCTL)
+#endif
+
+#define	MUR_SET_JNL_FENCE_CTL_TOKEN(TOKEN, RCTL)			\
+{									\
+	MUR_DBG_SET_LAST_PROCESSED_JNL_SEQNO(TOKEN, RCTL);		\
+	jnl_fence_ctl.token = TOKEN;					\
+}
+
 #if defined(UNIX)
 #define MUR_TOKEN_LOOKUP(token, image_count, rec_time, fence) mur_token_lookup(token, rec_time, fence)
 #elif defined(VMS)
@@ -1068,27 +1088,6 @@ typedef struct onln_rlbk_reg_list_struct
 	assert(!holds_sem[RECV][RECV_SERV_OPTIONS_SEM]);	\
 }
 
-#define ASSERT_VALID_JNLPOOL(CSA)										\
-{														\
-	GBLREF	jnlpool_ctl_ptr_t	jnlpool_ctl;								\
-	GBLREF	jnlpool_addrs		jnlpool;								\
-														\
-	assert(CSA && CSA->critical && CSA->nl); /* should have been setup in mu_rndwn_replpool */		\
-	assert(jnlpool_ctl && (jnlpool_ctl == jnlpool.jnlpool_ctl));						\
-	assert(CSA->critical == (mutex_struct_ptr_t)((sm_uc_ptr_t)jnlpool.jnlpool_ctl + JNLPOOL_CTL_SIZE));	\
-	assert(CSA->nl == (node_local_ptr_t) ((sm_uc_ptr_t)CSA->critical + CRIT_SPACE				\
-		+ SIZEOF(mutex_spin_parms_struct)));								\
-	assert(jnlpool_ctl->filehdr_off);									\
-	assert(jnlpool_ctl->srclcl_array_off > jnlpool.jnlpool_ctl->filehdr_off);				\
-	assert(jnlpool_ctl->sourcelocal_array_off > jnlpool.jnlpool_ctl->srclcl_array_off);			\
-	assert(jnlpool.repl_inst_filehdr == (repl_inst_hdr_ptr_t) ((sm_uc_ptr_t)jnlpool_ctl			\
-			+ jnlpool_ctl->filehdr_off));								\
-	assert(jnlpool.gtmsrc_lcl_array == (gtmsrc_lcl_ptr_t)((sm_uc_ptr_t)jnlpool_ctl				\
-			+ jnlpool_ctl->srclcl_array_off));							\
-	assert(jnlpool.gtmsource_local_array == (gtmsource_local_ptr_t)((sm_uc_ptr_t)jnlpool_ctl		\
-					+ jnlpool_ctl->sourcelocal_array_off));					\
-}
-
 /* Prototypes */
 #ifdef UNIX
 seq_num			mur_get_max_strm_reg_seqno(int strm_index);
@@ -1102,7 +1101,7 @@ uint4 			mur_back_processing(jnl_ctl_list **jjctl, boolean_t apply_pblk, seq_num
 				jnl_tm_t alt_tp_resolve_time);
 uint4 			mur_block_count_correct(reg_ctl_list *rctl);
 int4			mur_blocks_free(reg_ctl_list *rctl);
-void			mur_close_files(void);
+boolean_t		mur_close_files(void);
 void			mur_close_file_extfmt(void);
 int4			mur_cre_file_extfmt(jnl_ctl_list *jctl, int recstat);
 boolean_t		mur_do_wildcard(char *jnl_str, char *pat_str, int jnl_len, int pat_len);

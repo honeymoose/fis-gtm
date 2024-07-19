@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -45,6 +45,7 @@
 #include "have_crit.h"
 #include "memcoherency.h"
 #include "gtm_c_stack_trace.h"
+#include "anticipatory_freeze.h"
 
 GBLREF sgmnt_addrs	*cs_addrs;
 GBLREF gd_region	*gv_cur_region;
@@ -54,6 +55,10 @@ GBLREF unsigned int	t_tries;
 GBLREF uint4		dollar_tlevel;
 GBLREF sgm_info		*sgm_info_ptr;
 GBLREF boolean_t        mu_reorg_process;
+#ifdef UNIX
+GBLREF uint4 		update_trans;
+GBLREF jnlpool_addrs	jnlpool;
+#endif
 
 #define	TRACE_AND_SLEEP(ocnt)				\
 {							\
@@ -80,9 +85,13 @@ cache_rec_ptr_t	db_csh_getn(block_id block)
 	sgmnt_data_ptr_t	csd;
 	srch_blk_status		*tp_srch_status;
 	ht_ent_int4		*tabent;
+	boolean_t		dont_flush_buff;
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	csa = cs_addrs;
 	csd = csa->hdr;
+	assert(dba_mm != csd->acc_meth);
 	assert(csa->now_crit);
 	assert(csa == &FILE_INFO(gv_cur_region)->s_addrs);
 	max_ent = csd->n_bts;
@@ -92,6 +101,9 @@ cache_rec_ptr_t	db_csh_getn(block_id block)
 	pass1 = max_ent;	/* skip referred or dirty or read-into cache records */
 	pass2 = 2 * max_ent;	/* skip referred cache records */
 	pass3 = 3 * max_ent;	/* skip nothing */
+	dont_flush_buff = gv_cur_region->read_only UNIX_ONLY(||
+		(!(dollar_tlevel ? sgm_info_ptr->update_trans : update_trans) && IS_REPL_INST_FROZEN)
+	);
 	INCR_DB_CSH_COUNTER(csa, n_db_csh_getns, 1);
 	DEFER_INTERRUPTS(INTRPT_IN_DB_CSH_GETN);
 	for (lcnt = 0;  ; lcnt++)
@@ -177,7 +189,7 @@ cache_rec_ptr_t	db_csh_getn(block_id block)
 			 * In VMS, another process cannot be concurrently resetting cr->dirty to 0 as the resetting routine
 			 * is "wcs_wtfini" which is executed in crit which another process cannot be in as we are in crit now.
 			 */
-			if (gv_cur_region->read_only)
+			if (dont_flush_buff)
 				continue;
 			if (lcnt < pass1)
 			{
@@ -189,7 +201,7 @@ cache_rec_ptr_t	db_csh_getn(block_id block)
 			if (FALSE == wcs_get_space(gv_cur_region, 0, cr))
 			{	/* failed to flush it out - force a rebuild */
 				BG_TRACE_PRO(wc_blocked_db_csh_getn_wcsstarvewrt);
-				assert(csd->wc_blocked); /* only reason we currently know why wcs_get_space could fail */
+				assert(csa->nl->wc_blocked); /* only reason we currently know why wcs_get_space could fail */
 				assert(gtm_white_box_test_case_enabled);
 				break;
 			}

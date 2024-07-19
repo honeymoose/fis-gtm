@@ -1,6 +1,6 @@
 #################################################################
 #								#
-#	Copyright 2001, 2012 Fidelity Infromation Services, Inc #
+#	Copyright 2001, 2013 Fidelity Infromation Services, Inc #
 #								#
 #	This source code contains the intellectual property	#
 #	of its copyright holder(s), and is made available	#
@@ -32,7 +32,9 @@
 echo "Start of $0 `date`"
 echo ""
 
-echo "Built on $HOST"
+set uname_out = `uname -a`
+
+echo "Built on $HOST : $uname_out"
 echo ""
 
 echo "arguments: '$1' '$2' '$3' '$4'"
@@ -79,94 +81,6 @@ set dollar_sign = \$
 unalias ls rm
 
 set comlist_start_directory = `pwd`
-
-switch ( $gtm_verno )
-
-
-case "V990":
-	#	V990 is designated "most recent on the main line of descent in CMS"
-	#	and should be protected from inadvertent change.
-	set comlist_chmod_protect = 1
-	breaksw
-
-case "V99*":
-	#	Other V9.9 releases are provided for the "private" use of developers to
-	#	modify as they see fit for test purposes and should allow modification.
-	set comlist_chmod_protect = 0
-	breaksw
-
-default:
-	#	Anything else should be a configured release (i.e., should correspond to
-	#	a CMS release class) and should be protected against inadvertent change.
-	set comlist_chmod_protect = 1
-	breaksw
-
-endsw
-
-set mach_type = `uname -m`
-
-if ( $comlist_chmod_protect == 1 ) then
-	#	Change the permissions on all of the source files to prevent inadvertent
-	#	modification by developers.
-	set comlist_chmod_conf = 755
-	set comlist_chmod_src = 444
-
-else
-	#	Change the permissions on all of the source files to allow modification by developers.
-	set comlist_chmod_conf = 775
-	set comlist_chmod_src = 664
-
-endif
-
-
-#	Change the permissions on the root directory for this version to allow
-#	others in this group (i.e., developers) to create new subdirectories.  This
-#	is usually done for running tests or creating readme.txt files, although
-#	there may be other reasons.
-chmod 775 $gtm_ver
-
-
-
-#	Change the permissions on the configured directories for this version to
-#	prevent inadvetent modification (creation / deletion of files) by developers
-#	or allow modification as appropriate.
-cd $gtm_ver
-chmod $comlist_chmod_conf bta dbg pro inc pct src tools gtmsrc.csh
-
-chmod 775 log
-
-
-
-#	Change permisions on all source files to prevent inadvertent modification of
-#	source files corresponding to configured releases and allowing modification
-#	for development and test releases.
-cd $gtm_inc
-chmod $comlist_chmod_src *
-
-
-cd $gtm_pct
-chmod $comlist_chmod_src *
-
-
-#	In $gtm_src, use xargs because this directory has so many files that the
-#	command line expansion overflows the command length limits on some Unix
-#	implementations.
-cd $gtm_src
-/bin/ls | xargs -n25 chmod $comlist_chmod_src
-
-cd $gtm_tools
-chmod $comlist_chmod_src *
-
-if ( $comlist_chmod_protect == 1 ) then
-	chmod 555 *sh	# make the shell scripts executable, but protect against inadvertent modification
-
-else
-	chmod 775 *sh	# make the shell scripts exectuable and allow modification
-
-endif
-
-#	Remove old error log.
-rm $gtm_log/error.`basename $gtm_exe`.log
 
 # Verify arguments:
 set p1 = "$1"
@@ -223,6 +137,102 @@ if (0 != $comlist_status) then
 	echo "version command failed -- aborting build"
 	goto comlist.END
 endif
+
+switch ( $gtm_verno )
+
+case "V990":
+	#	V990 is designated "most recent on the main line of descent in CMS"
+	#	and should be protected from inadvertent change.
+	set comlist_chmod_protect = 1
+	breaksw
+
+case "V9*":
+	#	Other V9 releases are provided for the "private" use of developers to
+	#	modify as they see fit for test purposes and should allow modification.
+	set comlist_chmod_protect = 0
+	breaksw
+
+default:
+	#	Anything else should be a configured release (i.e., should correspond to
+	#	a CMS release class) and should be protected against inadvertent change.
+	set comlist_chmod_protect = 1
+	breaksw
+
+endsw
+
+set mach_type = `uname -m`
+
+if ( $comlist_chmod_protect == 1 ) then
+	#	Change the permissions on all of the source files to prevent inadvertent
+	#	modification by developers.
+	set comlist_chmod_conf = 755
+	set comlist_chmod_src = 444
+
+else
+	#	Change the permissions on all of the source files to allow modification by developers.
+	set comlist_chmod_conf = 775
+	set comlist_chmod_src = 664
+
+endif
+
+
+if !(-o $gtm_ver) then
+	echo "COMLIST-E-NOTOWNER. $USER is not owner of $gtm_ver cannot coninue"
+	goto comlist.END
+endif
+
+#	Change the permissions on the root directory for this version to allow
+#	others in this group (i.e., developers) to create new subdirectories.  This
+#	is usually done for running tests or creating readme.txt files, although
+#	there may be other reasons.
+chmod 775 $gtm_ver
+
+
+
+#	Change the permissions on the configured directories for this version to
+#	prevent inadvetent modification (creation / deletion of files) by developers
+#	or allow modification as appropriate.
+cd $gtm_ver
+chmod $comlist_chmod_conf inc pct src tools gtmsrc.csh
+
+chmod 775 log
+if !(-w $gtm_exe) then
+	echo "COMLIST-E-PERMISSON : There is no write permission to $gtm_exe. Exiting"
+	exit
+endif
+
+
+#	Change permisions on all source files to prevent inadvertent modification of
+#	source files corresponding to configured releases and allowing modification
+#	for development and test releases.
+cd $gtm_inc
+chmod $comlist_chmod_src *
+
+
+cd $gtm_pct
+chmod $comlist_chmod_src *
+
+
+#	In $gtm_src, use xargs because this directory has so many files that the
+#	command line expansion overflows the command length limits on some Unix
+#	implementations.
+cd $gtm_src
+/bin/ls | xargs -n25 chmod $comlist_chmod_src
+
+cd $gtm_tools
+chmod $comlist_chmod_src *
+
+if ( $comlist_chmod_protect == 1 ) then
+	chmod 555 *sh	# make the shell scripts executable, but protect against inadvertent modification
+
+else
+	chmod 775 *sh	# make the shell scripts exectuable and allow modification
+
+endif
+
+#	Remove old error log.
+rm $gtm_log/error.`basename $gtm_exe`.log
+
 
 echo ""
 echo "Assembler-related aliases:"
@@ -295,6 +305,7 @@ chmod +x {lowerc,gtminstall}*
 cp $gtm_tools/*.gtc .
 mv configure{.gtc,}
 
+cp $gtm_inc/gtm_common_defs.h .
 cp $gtm_inc/gtmxc_types.h .
 cp $gtm_inc/gtm_descript.h .
 cp $gtm_inc/gtm_sizeof.h .
@@ -484,8 +495,18 @@ endif
 if ( $?gt_as_use_prebuilt == 0 ) then
 	# Finally assemble any sources originally in native dialect so they
 	# can supersede any conflicting non-native dialect sources:
-	foreach asm (${gs[1]}/*${gt_as_src_suffix})
-		$shell $gtm_tools/gt_as.csh $asm
+	@ asm_batch_size=25
+	@ asm_batch_tail = ${asm_batch_size} + 1
+	set asmlist=(`echo ${gs[1]}/*${gt_as_src_suffix}`)
+	while ($#asmlist)
+		if (${#asmlist} > ${asm_batch_size}) then
+			set asmsublist=(${asmlist[1-${asm_batch_size}]})
+			set asmlist=(${asmlist[${asm_batch_tail}-]})
+		else
+			set asmsublist=(${asmlist})
+			set asmlist=()
+		endif
+		$shell $gtm_tools/gt_as.csh ${asmsublist}
 	end
 else
 	cp -p $gtm_vrt/$gt_as_use_prebuilt/*.o .
@@ -646,40 +667,77 @@ rm -f GTMDefinedTypesInit.m >& /dev/null
 echo "Generating GTMDefinedTypesInit.m"
 if ($?work_dir) then
 	if (-e $work_dir/tools/cms_tools/gengtmdeftypes.csh) then
+		echo "Using gengtmdeftypes.csh from $work_dir"
 		$work_dir/tools/cms_tools/gengtmdeftypes.csh >& obj/gengtmdeftypes.log
+		@ savestatus = $status
 	else
 		$cms_tools/gengtmdeftypes.csh >& obj/gengtmdeftypes.log
+		@ savestatus = $status
 	endif
 else
 	$cms_tools/gengtmdeftypes.csh >& obj/gengtmdeftypes.log
-endif
-if ((0 != $status) || (! -e GTMDefinedTypesInit.m)) then
 	@ savestatus = $status
-	if (`expr $gtm_verno \>= V900`) @ comlist_status = $savestatus  # note no errors for development versions
-	echo "gengtmdeftypes.csh failed to create GTMDefinedTypesInit.m - see log in $gtm_obj/gengtmdeftypes.log" >> \
-	$gtm_log/error.`basename $gtm_exe`.log
+endif
+if ((0 != $savestatus) || (! -e GTMDefinedTypesInit.m)) then
+	set errmsg = "COMLIST-E-FAIL gengtmdeftypes.csh failed to create GTMDefinedTypesInit.m "
+	set errmsg = "$errmsg - see log in $gtm_obj/gengtmdeftypes.log"
+	if (`expr $gtm_verno \< V900`) then
+		@ comlist_status = $savestatus  # No errors for development - this fails the build
+	else
+		echo "Warning: Build of $gtm_verno on $HOST, $errmsg" | \
+			mailx -s "${HOST}: Build for $gtm_verno failed to create GTMDefinedTypes.m" $USER
+	endif
+	echo $errmsg >> $gtm_log/error.`basename $gtm_exe`.log
 endif
 if (-e GTMDefinedTypesInit.m) then
 	# Need a different name for each build type as they can be different
 	cp -f GTMDefinedTypesInit.m $gtm_pct/GTMDefinedTypesInit${bldtype}.m
+	setenv LC_CTYPE C
+	setenv gtm_chset M
 	./mumps GTMDefinedTypesInit.m
-	if (0 != $status) then
-		if (`expr $gtm_verno \>= V900`) @ comlist_status = $status
-		echo "Failed to compile $gtm_exe/GTMDefinedTypes.m" >> $gtm_log/error.`basename $gtm_exe`.log
+	@ savestatus = $status
+	if (0 != $savestatus) then
+		set errmsg = "COMLIST-E-FAIL Failed to compile generated $gtm_exe/GTMDefinedTypes.m"
+		if (`expr $gtm_verno \< V900`) then
+			@ comlist_status = $savestatus
+		else
+			echo "Warning: During build of $gtm_verno on $HOST, ${errmsg}" | \
+				mailx -s "${HOST}: Compile for GTMDefinedTypes.m failed during build of $gtm_verno" $USER
+		endif
+		echo "${errmsg}" >> $gtm_log/error.`basename $gtm_exe`.log
 	endif
-	# If we have a utf8 dir (created by buildaux.csh called from buildbdp.csh above), add a link to it for GTMDefinedTypesInit.m
-	if (-e $gtm_dist/utf8) then
+	# If we have a utf8 dir (created by buildaux.csh called from buildbdp.csh above), add a link to it for
+	# GTMDefinedTypesInit.m and compile it in UTF8 mode
+	source $gtm_tools/set_library_path.csh
+	source $gtm_tools/check_unicode_support.csh
+	if (-e $gtm_dist/utf8 && ("TRUE" == "$is_unicode_support")) then
 		if (! -e $gtm_dist/utf8/GTMDefinedTypesInit.m) then
 		    ln -s $gtm_dist/GTMDefinedTypesInit.m $gtm_dist/utf8/GTMDefinedTypesInit.m
 		endif
 		pushd utf8
+		# Switch to UTF8 mode
+		if ( "OS/390" == $HOSTOS ) setenv gtm_chset_locale $utflocale      # LC_CTYPE not picked up right
+		setenv LC_CTYPE $utflocale
+		unsetenv LC_ALL
+		setenv gtm_chset UTF-8  # switch to "UTF-8" mode
 		# mumps executable not yet linked to utf8 dir so access it in parent directory
 		../mumps GTMDefinedTypesInit.m
-		if (0 != $status) then
-			if (`expr $gtm_verno \>= V900`) @ comlist_status = $status
-			echo "Failed to compile $gtm_exe/GTMDefinedTypes.m" >> $gtm_log/error.`basename $gtm_exe`.log
+		@ savestatus = $status
+		if (0 != $savestatus) then
+			set errmsg = "COMLIST_E-FAIL Failed to compile generated $gtm_exe/utf8/GTMDefinedTypes.m"
+			if (`expr $gtm_verno \< V900`) then
+				@ comlist_status = $savestatus
+			else
+				echo "Warning: During build of $gtm_verno on $HOST, ${errmsg}" | \
+					mailx -s "${HOST}: Compile for utf8/GTMDefinedTypes.m failed during build of $gtm_verno" \
+					$USER
+			endif
+			echo "${errmsg}" >> $gtm_log/error.`basename $gtm_exe`.log
 		endif
 		popd
+		setenv LC_CTYPE C
+		unsetenv gtm_chset      # switch back to "M" mode
+		if ( "OS/390" == $HOSTOS ) unsetenv gtm_chset_locale
 	endif
 endif
 
@@ -690,40 +748,27 @@ exit
 GDE_in1
 if (0 != $status) @ comlist_status = $status
 
-# Create the GT.M help database file.
-setenv gtmgbldir $gtm_dist/gtmhelp.gld
-gde <<GDE_in_gtmhelp
-Change -segment DEFAULT	-block=2048	-file=$gtm_dist/gtmhelp.dat
+# Create the GT.M/GDE/MUPIP/DSE/LKE help databases
+foreach hlp (*.hlp)
+	set prefix=${hlp:r}
+	if ("${prefix}" == "mumps") set prefix="gtm"
+	setenv gtmgbldir $gtm_dist/${prefix}help.gld
+	gde <<GDE_in_help
+Change -segment DEFAULT	-block=2048	-file=\$gtm_dist/${prefix}help.dat
 Change -region DEFAULT	-record=1020	-key=255
-GDE_in_gtmhelp
-if (0 != $status) @ comlist_status = $status
+GDE_in_help
+	if (0 != $status) @ comlist_status = $status
 
-mupip create
-if (0 != $status) @ comlist_status = $status
+	mupip create
+	if (0 != $status) @ comlist_status = $status
 
-gtm <<GTM_in_gtmhelp
+	gtm <<GTM_in_gtmhelp
 Do ^GTMHLPLD
-$gtm_dist/mumps.hlp
+$gtm_dist/${hlp}
 Halt
 GTM_in_gtmhelp
-if (0 != $status) @ comlist_status = $status
-
-# Create the GDE help database file.
-setenv gtmgbldir $gtm_dist/gdehelp.gld
-gde <<GDE_in_gdehelp
-Change -segment DEFAULT	-block=2048	-file=$gtm_dist/gdehelp.dat
-Change -region DEFAULT	-record=1020	-key=255
-GDE_in_gdehelp
-if (0 != $status) @ comlist_status = $status
-
-mupip create
-if (0 != $status) @ comlist_status = $status
-
-gtm <<GTM_in_gdehelp
-Do ^GTMHLPLD
-$gtm_dist/gde.hlp
-GTM_in_gdehelp
-if (0 != $status) @ comlist_status = $status
+	if (0 != $status) @ comlist_status = $status
+end
 
 chmod 775 *	# do not check $status here because we know it will be 1 since "gtmsecshr" permissions cannot be changed.
 
@@ -757,6 +802,12 @@ if (-e $gtm_exe/utf8) then	# would have been created by buildaux.csh while build
 	popd
 endif
 
+if ( $comlist_chmod_protect == 1 ) then
+	# If it is release build, protect it from inadvertent modification/rebuild etc
+	chmod -R a-w $gtm_inc $gtm_pct $gtm_src $gtm_tools $gtm_ver/gtmsrc.csh $gtm_exe $gtm_log
+	chmod ug+w $gtm_ver
+	chmod ug+w $gtm_log
+endif
 comlist.END:
 
 echo ""

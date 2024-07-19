@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2008, 2012 Fidelity Information Services, Inc.*
+ *	Copyright 2008, 2013 Fidelity Information Services, Inc.*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -47,15 +47,12 @@
 
 GBLREF	repl_msg_ptr_t		gtmrecv_msgp;
 GBLREF	int			gtmrecv_max_repl_msglen;
-GBLREF	struct timeval		gtmrecv_poll_interval, gtmrecv_poll_immediate;
 GBLREF	int			gtmrecv_listen_sock_fd;
 GBLREF	int			gtmrecv_sock_fd;
 GBLREF	boolean_t		repl_connection_reset;
 GBLREF	recvpool_addrs		recvpool;
 GBLREF	int			gtmrecv_log_fd;
 GBLREF	FILE			*gtmrecv_log_fp;
-GBLREF	int			gtmrecv_statslog_fd;
-GBLREF	FILE			*gtmrecv_statslog_fp;
 GBLREF	boolean_t		gtmrecv_logstats;
 GBLREF	boolean_t		gtmrecv_wait_for_jnl_seqno;
 GBLREF	boolean_t		gtmrecv_bad_trans_sent;
@@ -234,7 +231,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 				temp_send_seqno = GTM_BYTESWAP_64(send_seqno);
 				memcpy((uchar_ptr_t)&xoff_msg.msg[0], (uchar_ptr_t)&temp_send_seqno, SIZEOF(seq_num));
 			}
-			REPL_SEND_LOOP(gtmrecv_sock_fd, &xoff_msg, MIN_REPL_MSGLEN, FALSE, &gtmrecv_poll_immediate)
+			REPL_SEND_LOOP(gtmrecv_sock_fd, &xoff_msg, MIN_REPL_MSGLEN, REPL_POLL_NOWAIT)
 				; /* Empty Body */
 			if (SS_NORMAL != status)
 			{
@@ -248,14 +245,14 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 					send_badtrans = FALSE;
 
 				} else if (EREPL_SEND == repl_errno)
-					rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-						RTS_ERROR_LITERAL("Error sending XOFF msg due to BAD_TRANS or UPD crash/shutdown. "
+					rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+						LEN_AND_LIT("Error sending XOFF msg due to BAD_TRANS or UPD crash/shutdown. "
 								"Error in send"), status);
 				else
 				{
 					assert(EREPL_SELECT == repl_errno);
-					rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-						RTS_ERROR_LITERAL("Error sending XOFF msg due to BAD_TRANS or UPD crash/shutdown. "
+					rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+						LEN_AND_LIT("Error sending XOFF msg due to BAD_TRANS or UPD crash/shutdown. "
 								"Error in select"), status);
 				}
 			} else
@@ -324,7 +321,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 		{	/* Receive the header of a message */
 			assert(REPL_MSG_HDRLEN > *buff_unprocessed);	/* so we dont pass negative length in REPL_RECV_LOOP */
 			REPL_RECV_LOOP(gtmrecv_sock_fd, ((unsigned char *)gtmrecv_msgp) + *buff_unprocessed,
-				       (REPL_MSG_HDRLEN - *buff_unprocessed), FALSE, &gtmrecv_poll_interval)
+				       (REPL_MSG_HDRLEN - *buff_unprocessed), REPL_POLL_WAIT)
 				; /* Empty Body */
 			if (SS_NORMAL == status)
 			{
@@ -347,8 +344,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 		}
 		if ((SS_NORMAL == status) && (0 != *buff_unprocessed || 0 == *pending_data_len) && (REPL_XOFF_ACK == msg_type))
 		{	/* Receive the rest of the XOFF_ACK msg and signal the drain as complete */
-			REPL_RECV_LOOP(gtmrecv_sock_fd, gtmrecv_msgp, (MIN_REPL_MSGLEN - REPL_MSG_HDRLEN), FALSE,
-					&gtmrecv_poll_interval)
+			REPL_RECV_LOOP(gtmrecv_sock_fd, gtmrecv_msgp, (MIN_REPL_MSGLEN - REPL_MSG_HDRLEN), REPL_POLL_WAIT)
 				; /* Empty Body */
 			if (SS_NORMAL == status)
 			{
@@ -373,7 +369,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 			for ( ; SS_NORMAL == status && 0 < pending_msg_size; pending_msg_size -= gtmrecv_max_repl_msglen)
 			{
 				temp_len = (pending_msg_size < gtmrecv_max_repl_msglen)? pending_msg_size : gtmrecv_max_repl_msglen;
-				REPL_RECV_LOOP(gtmrecv_sock_fd, gtmrecv_msgp, temp_len, FALSE, &gtmrecv_poll_interval)
+				REPL_RECV_LOOP(gtmrecv_sock_fd, gtmrecv_msgp, temp_len, REPL_POLL_WAIT)
 					; /* Empty Body */
 			}
 			*buff_unprocessed = 0; *pending_data_len = 0;
@@ -399,13 +395,13 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 					send_badtrans = FALSE;
 					return_status = STOP_POLL;
 				} else
-					rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-						RTS_ERROR_LITERAL("Error while draining replication pipe. Error in recv"), status);
+					rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+						LEN_AND_LIT("Error while draining replication pipe. Error in recv"), status);
 			} else
 			{
 				assert(EREPL_SELECT == repl_errno);
-				rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-					RTS_ERROR_LITERAL("Error while draining replication pipe. Error in select"), status);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+					LEN_AND_LIT("Error while draining replication pipe. Error in select"), status);
 			}
 		}
 	} else
@@ -428,7 +424,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 			bad_trans_msg.len  = GTM_BYTESWAP_32(MIN_REPL_MSGLEN);
 			bad_trans_msg.start_seqno = GTM_BYTESWAP_64(send_seqno);
 		}
-		REPL_SEND_LOOP(gtmrecv_sock_fd, &bad_trans_msg, bad_trans_msg.len, FALSE, &gtmrecv_poll_immediate)
+		REPL_SEND_LOOP(gtmrecv_sock_fd, &bad_trans_msg, bad_trans_msg.len, REPL_POLL_NOWAIT)
 			; /* Empty Body */
 		if (SS_NORMAL == status)
 		{
@@ -453,13 +449,13 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 				repl_connection_reset = TRUE;
 				return_status = STOP_POLL;
 			} else if (EREPL_SEND == repl_errno)
-				rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-					RTS_ERROR_LITERAL("Error sending REPL_BADTRANS/REPL_CMP2UNCMP. Error in send"), status);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+					LEN_AND_LIT("Error sending REPL_BADTRANS/REPL_CMP2UNCMP. Error in send"), status);
 			else
 			{
 				assert(EREPL_SELECT == repl_errno);
-				rts_error(VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
-					RTS_ERROR_LITERAL("Error sending REPL_BADTRANS/REPL_CMP2UNCMP. Error in select"), status);
+				rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_REPLCOMM, 0, ERR_TEXT, 2,
+					LEN_AND_LIT("Error sending REPL_BADTRANS/REPL_CMP2UNCMP. Error in select"), status);
 			}
 		}
 		send_badtrans = FALSE;
@@ -548,7 +544,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 				 * just syncing the journal pool cycles as the databases are not opened. But, to be safe, grab
 				 * the lock and sync the cycles.
 				 */
-				GRAB_LOCK(jnlpool.jnlpool_dummy_reg, GRAB_LOCK_ONLY);
+				grab_lock(jnlpool.jnlpool_dummy_reg, TRUE, GRAB_LOCK_ONLY);
 				SYNC_ONLN_RLBK_CYCLES;
 				rel_lock(jnlpool.jnlpool_dummy_reg);
 				return_status = STOP_POLL;
@@ -575,7 +571,7 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 		if (gtmrecv_local->changelog & REPLIC_CHANGE_LOGFILE)
 		{
 			repl_log(gtmrecv_log_fp, TRUE, TRUE, "Changing log file to %s\n", gtmrecv_local->log_file);
-			repl_log_init(REPL_GENERAL_LOG, &gtmrecv_log_fd, NULL, gtmrecv_local->log_file, NULL);
+			repl_log_init(REPL_GENERAL_LOG, &gtmrecv_log_fd, gtmrecv_local->log_file);
 			repl_log_fd2fp(&gtmrecv_log_fp, gtmrecv_log_fd);
 			repl_log(gtmrecv_log_fp, TRUE, TRUE, "Change log to %s successful\n",gtmrecv_local->log_file);
 		}
@@ -587,27 +583,12 @@ int gtmrecv_poll_actions1(int *pending_data_len, int *buff_unprocessed, unsigned
 	if (0 == *pending_data_len && !gtmrecv_logstats && gtmrecv_local->statslog)
 	{
 		gtmrecv_logstats = TRUE;
-		repl_log_init(REPL_STATISTICS_LOG, &gtmrecv_log_fd, &gtmrecv_statslog_fd, gtmrecv_local->log_file,
-				gtmrecv_local->statslog_file);
-		repl_log_fd2fp(&gtmrecv_statslog_fp, gtmrecv_statslog_fd);
-		repl_log(gtmrecv_log_fp, TRUE, TRUE, "Starting stats log to %s\n", gtmrecv_local->statslog_file);
-		repl_log(gtmrecv_statslog_fp, TRUE, TRUE, "Begin statistics logging\n");
+		repl_log(gtmrecv_log_fp, TRUE, TRUE, "Begin statistics logging\n");
 	} else if (0 == *pending_data_len && gtmrecv_logstats && !gtmrecv_local->statslog)
 	{
 		gtmrecv_logstats = FALSE;
-		repl_log(gtmrecv_log_fp, TRUE, TRUE, "Stopping stats log\n");
 		/* Force all data out to the file before closing the file */
-		repl_log(gtmrecv_statslog_fp, TRUE, TRUE, "End statistics logging\n");
-		CLOSEFILE_RESET(gtmrecv_statslog_fd, status);	/* resets "gtmrecv_statslog_fd" to FD_INVALID */
-		/* We need to FCLOSE because a later open() in repl_log_init() might return the same file descriptor as the one
-		 * that we just closed. In that case, FCLOSE done in repl_log_fd2fp() affects the newly opened file and
-		 * FDOPEN will fail returning NULL for the file pointer. So, we close both the file descriptor and file pointer.
-		 * Note the same problem does not occur with GENERAL LOG because the current log is kept open while opening
-		 * the new log and hence the new file descriptor will be different (we keep the old log file open in case there
-		 * are errors during DUPing. In such a case, we do not switch the log file, but keep the current one).
-		 * We can FCLOSE the old file pointer later in repl_log_fd2fp() */
-		FCLOSE(gtmrecv_statslog_fp, status);
-		gtmrecv_statslog_fp = NULL;
+		repl_log(gtmrecv_log_fp, TRUE, TRUE, "End statistics logging\n");
 	}
 	if (0 == *pending_data_len)
 	{

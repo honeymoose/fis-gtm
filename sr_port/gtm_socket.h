@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2010 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -13,20 +13,23 @@
 #ifndef GTM_SOCKETH
 #define GTM_SOCKETH
 
+#ifdef VMS
+#include <socket.h>
+#else
 #include <sys/socket.h>
+#endif
 
 #define BIND		bind
 #define CONNECT		connect
 #define ACCEPT		accept
 #define RECVFROM	recvfrom
 #define SENDTO		sendto
+typedef struct sockaddr	*sockaddr_ptr;
 
 #if defined(__osf__) && defined(__alpha)
 #define GTM_SOCKLEN_TYPE size_t
 #elif defined(VMS)
 #define GTM_SOCKLEN_TYPE size_t
-#elif defined(__sparc)
-#define GTM_SOCKLEN_TYPE int
 #else
 #define GTM_SOCKLEN_TYPE socklen_t
 #endif
@@ -43,5 +46,28 @@
 
 int gtm_socket(int domain, int type, int protocol);
 int gtm_connect(int socket, struct sockaddr *address, size_t address_len);
+
+#if defined(VMS) && !defined(_SS_PAD2SIZE)
+/* No sockaddr_storage on OpenVMS 7.2-1, but we only support AF_INET on VMS, so use sockaddr_in. */
+#define	sockaddr_storage sockaddr_in
+/* getnameinfo() inexplicably throws an ACCVIO/NOPRIV on OpenVMS 7.2-1, so revert to the old API.  */
+#define GETNAMEINFO(SA, SALEN, HOST, HOSTLEN, SERV, SERVLEN, FLAGS, RES)			\
+{												\
+	assert(((struct sockaddr *)(SA))->sa_family == AF_INET);				\
+	assert((FLAGS & NI_NUMERICHOST) || (NULL == HOST));					\
+	assert((FLAGS & NI_NUMERICSERV) || (NULL == SERV));					\
+	assert(FLAGS & (NI_NUMERICHOST | NI_NUMERICSERV));					\
+	if ((FLAGS & NI_NUMERICHOST) && (NULL != HOST))						\
+		STRNCPY(HOST, inet_ntoa(((struct sockaddr_in *)(SA))->sin_addr), HOSTLEN);	\
+	if ((FLAGS & NI_NUMERICSERV) && (NULL != SERV))						\
+		i2asc((uchar_ptr_t)(SERV), ntohs(((struct sockaddr_in *)(SA))->sin_port));	\
+	RES = 0;										\
+}
+#else
+#define GETNAMEINFO(SA, SALEN, HOST, HOSTLEN, SERV, SERVLEN, FLAGS, RES)		\
+{											\
+	RES = getnameinfo(SA, SALEN, HOST, HOSTLEN, SERV, SERVLEN, FLAGS);		\
+}
+#endif
 
 #endif

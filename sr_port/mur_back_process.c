@@ -1,6 +1,6 @@
 /****************************************************************
- *
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *								*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -48,6 +48,7 @@
 #ifdef GTM_TRUNCATE
 #include "gdsfilext_nojnl.h"
 #endif
+#include "have_crit.h"
 
 GBLREF 	mur_gbls_t	murgbl;
 GBLREF	reg_ctl_list	*mur_ctl;
@@ -73,38 +74,56 @@ error_def(ERR_RESOLVESEQNO);
 error_def(ERR_RESOLVESEQSTRM);
 error_def(ERR_TEXT);
 
-#define SAVE_PRE_RESOLVE_SEQNO(rectype, rec_time, rec_token_seq, pre_resolve_seqno)		\
-{												\
-	if ((JRT_EPOCH == rectype) || (JRT_EOF == rectype))					\
-	{											\
-		if (rec_token_seq > *pre_resolve_seqno)						\
-			*pre_resolve_seqno = rec_token_seq;					\
-	} else											\
-	{											\
-		if ((rec_token_seq + 1) > *pre_resolve_seqno)					\
-			*pre_resolve_seqno = rec_token_seq + 1;					\
-	}											\
-	if (mur_options.verbose)								\
-	{											\
-		gtm_putmsg(VARLSTCNT(6) ERR_MUINFOUINT8, 4, LEN_AND_LIT("Pre-resolve seqno"),	\
-			pre_resolve_seqno, pre_resolve_seqno);					\
-	}											\
+#define	MAX_BACK_PROCESS_REDO_CNT	8
+
+#define SAVE_PRE_RESOLVE_SEQNO(rectype, rec_time, rec_token_seq, pre_resolve_seqno)				\
+{														\
+	if ((JRT_EPOCH == rectype) || (JRT_EOF == rectype))							\
+	{													\
+		if (rec_token_seq > *pre_resolve_seqno)								\
+			*pre_resolve_seqno = rec_token_seq;							\
+	} else													\
+	{													\
+		if ((rec_token_seq + 1) > *pre_resolve_seqno)							\
+			*pre_resolve_seqno = rec_token_seq + 1;							\
+	}													\
+	if (mur_options.verbose)										\
+	{													\
+		gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_MUINFOUINT8, 4, LEN_AND_LIT("Pre-resolve seqno"),	\
+			pre_resolve_seqno, pre_resolve_seqno);							\
+	}													\
 }
 
-#define MUR_BACK_PROCESS_ERROR(JCTL, JJCTL, MESSAGE_STRING)			\
-{										\
-	if (JCTL->after_end_of_data)						\
-	{									\
-		*JJCTL = JCTL;							\
-		return ERR_JNLBADRECFMT;					\
-	}									\
-	gtm_putmsg(VARLSTCNT(4) ERR_TEXT, 2, LEN_AND_LIT(MESSAGE_STRING));	\
-	if (!mur_report_error(JCTL, MUR_JNLBADRECFMT))				\
-	{									\
-		*JJCTL = JCTL;							\
-		return ERR_JNLBADRECFMT;					\
-	} else									\
-		continue;							\
+#define MUR_BACK_PROCESS_ERROR(JCTL, JJCTL, MESSAGE_STRING)					\
+{												\
+	if (JCTL->after_end_of_data)								\
+	{											\
+		*JJCTL = JCTL;									\
+		return ERR_JNLBADRECFMT;							\
+	}											\
+	gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_TEXT, 2, LEN_AND_LIT(MESSAGE_STRING));	\
+	if (!mur_report_error(JCTL, MUR_JNLBADRECFMT))						\
+	{											\
+		*JJCTL = JCTL;									\
+		return ERR_JNLBADRECFMT;							\
+	} else											\
+		continue;									\
+}
+
+#define MUR_BACK_PROCESS_ERROR_STR(JCTL, JJCTL, MESSAGE_STRING)					\
+{												\
+	if (JCTL->after_end_of_data)								\
+	{											\
+		*JJCTL = JCTL;									\
+		return ERR_JNLBADRECFMT;							\
+	}											\
+	gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_TEXT, 2, LEN_AND_STR(MESSAGE_STRING));	\
+	if (!mur_report_error(JCTL, MUR_JNLBADRECFMT))						\
+	{											\
+		*JJCTL = JCTL;									\
+		return ERR_JNLBADRECFMT;							\
+	} else											\
+		continue;									\
 }
 
 #ifdef VMS
@@ -116,8 +135,14 @@ error_def(ERR_TEXT);
 		 * and have not yet reached the last epoch in backward processing and the	\
 		 * pini_addr should also point to an offset that is after the last epoch.	\
 		 */										\
-		assert(JCTL->jfh->crash && (JCTL->rec_offset > JNLREC->prefix.pini_addr)	\
-			&& (JNLREC->prefix.pini_addr > JCTL->jfh->end_of_data));		\
+		assert(JCTL->jfh->crash && (JCTL->rec_offset >= JNLREC->prefix.pini_addr)	\
+			&& (JNLREC->prefix.pini_addr >= JCTL->jfh->end_of_data));		\
+		/* Register the offset of the corrupt record to be the PINI record (not the	\
+		 * current journal record), this way the "mur_back_processing" redo logic	\
+		 * inside "mur_back_process" restarts mur_fread_eof_crash search from the	\
+		 * lower offset and avoids lots of mur_back_processing redos (GTM-7393).	\
+		 */										\
+		JCTL->rec_offset = JNLREC->prefix.pini_addr;					\
 		MUR_BACK_PROCESS_ERROR(JCTL, JJCTL, "pini_addr is bad");			\
 	}											\
 }
@@ -178,6 +203,10 @@ error_def(ERR_TEXT);
 	}															\
 }
 
+#define TRANS_NUM_CONT_CHK_FAILED		"Transaction number continuity check failed: [0x%08X] vs [0x%08X]"
+#define SEQ_NUM_CONT_CHK_FAILED			"Sequence number continuity check failed: [0x%08X] vs [0x%08X]"
+#define TRANS_OR_SEQ_NUM_CONT_CHK_FAILED_SZ	(MAX(SIZEOF(TRANS_NUM_CONT_CHK_FAILED), SIZEOF(SEQ_NUM_CONT_CHK_FAILED)) + 2 * 20)
+
 STATICFNDCL void save_turn_around_point(reg_ctl_list *rctl, jnl_ctl_list *jctl, boolean_t apply_pblk);
 
 STATICFNDEF void save_turn_around_point(reg_ctl_list *rctl, jnl_ctl_list *jctl, boolean_t apply_pblk)
@@ -225,7 +254,7 @@ boolean_t mur_back_process(boolean_t apply_pblk, seq_num *pre_resolve_seqno)
 	jnl_ctl_list	*jctl;
 	reg_ctl_list	*rctl;
 	uint4		status;
-	int 		regno, reg_total;
+	int 		redo_cnt, regno, reg_total;
 	jnl_tm_t	alt_tp_resolve_time;
 	jnl_record	*jnlrec;
 
@@ -233,8 +262,10 @@ boolean_t mur_back_process(boolean_t apply_pblk, seq_num *pre_resolve_seqno)
 	assert(!mur_options.forward || 0 == mur_options.lookback_time);
 	reg_total = murgbl.reg_total;
 	alt_tp_resolve_time = 0;
-	for ( ; ; )
+	for ( redo_cnt = 0; ; redo_cnt++)
 	{
+		assert(MAX_BACK_PROCESS_REDO_CNT > redo_cnt);
+			/* ensure we are not doing too many redos of "mur_fread_eof_crash"/"mur_back_processing" */
 		*pre_resolve_seqno = 0;
 		DEBUG_ONLY(jctl = NULL;)
 		status = mur_back_processing(&jctl, apply_pblk, pre_resolve_seqno, alt_tp_resolve_time);
@@ -248,12 +279,13 @@ boolean_t mur_back_process(boolean_t apply_pblk, seq_num *pre_resolve_seqno)
 		} else if (ERR_CHNGTPRSLVTM == status)
 		{
 			jnlrec = jctl->reg_ctl->mur_desc->jnlrec;
-			gtm_putmsg(VARLSTCNT(6) ERR_CHNGTPRSLVTM, 4, jgbl.mur_tp_resolve_time, jnlrec->prefix.time,
-							jctl->jnl_fn_len, jctl->jnl_fn);
+			gtm_putmsg_csa(CSA_ARG(jctl->reg_ctl->csa) VARLSTCNT(6) ERR_CHNGTPRSLVTM, 4, jgbl.mur_tp_resolve_time,
+				jnlrec->prefix.time, jctl->jnl_fn_len, jctl->jnl_fn);
 			assert(jgbl.mur_tp_resolve_time > jnlrec->prefix.time);
 			alt_tp_resolve_time = jnlrec->prefix.time;
 		} else	/* An error message must have already been printed if status != SS_NORMAL */
 			break;
+		JNL_PUT_MSG_PROGRESS("Restarting Backward processing");
 		REINITIALIZE_LIST(murgbl.multi_list);
 		reinitialize_hashtab_int8(&murgbl.token_table);
 		murgbl.broken_cnt = 0;
@@ -301,9 +333,10 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 	uint4			max_blk_size, max_rec_size;
 	uint4			status, val_len;
 	unsigned short		max_key_size;
-	GTMCRYPT_ONLY(
-		int		crypt_status;
-	)
+#	ifdef GTM_CRYPT
+	int			gtmcrypt_errno;
+#	endif
+	char			s[TRANS_OR_SEQ_NUM_CONT_CHK_FAILED_SZ];	/* for appending sequence or transaction number */
 #	ifdef GTM_TRUNCATE
 	uint4			cur_total, old_total;
 #	endif
@@ -349,13 +382,17 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 				MUR_BACK_PROCESS_ERROR(jctl, jjctl, "Checksum validation failed");
 			if ((jnlrec->prefix.tn != rec_tn) && (jnlrec->prefix.tn != (rec_tn - 1)))
 			{
+				SNPRINTF(s, TRANS_OR_SEQ_NUM_CONT_CHK_FAILED_SZ, TRANS_NUM_CONT_CHK_FAILED,
+					jnlrec->prefix.tn, rec_tn);
 				rec_tn = jnlrec->prefix.tn;
-				MUR_BACK_PROCESS_ERROR(jctl, jjctl, "Transaction number continuty check failed");
+				MUR_BACK_PROCESS_ERROR_STR(jctl, jjctl, s);
 			}
 			if (mur_options.rollback && REC_HAS_TOKEN_SEQ(rectype) && (GET_JNL_SEQNO(jnlrec) > rec_token_seq))
 			{
+				SNPRINTF(s, TRANS_OR_SEQ_NUM_CONT_CHK_FAILED_SZ, SEQ_NUM_CONT_CHK_FAILED,
+					GET_JNL_SEQNO(jnlrec), rec_token_seq);
 				rec_token_seq = GET_JNL_SEQNO(jnlrec);
-				MUR_BACK_PROCESS_ERROR(jctl, jjctl, "Sequence number continuty check failed");
+				MUR_BACK_PROCESS_ERROR_STR(jctl, jjctl, s);
 			}
 			if (IS_SET_KILL_ZKILL_ZTRIG_ZTWORM(rectype))
 			{
@@ -365,13 +402,13 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 #				ifdef GTM_CRYPT
 				if (jctl->jfh->is_encrypted)
 				{
-					DECODE_SET_KILL_ZKILL_ZTRIG(keystr, jnlrec->prefix.forwptr,
-								    jctl->encr_key_handle, crypt_status);
-					if (0 != crypt_status)
+					MUR_DECRYPT_LOGICAL_RECS(keystr, jnlrec->prefix.forwptr, jctl->encr_key_handle,
+									gtmcrypt_errno);
+					if (0 != gtmcrypt_errno)
 					{
-						GC_GTM_PUTMSG(crypt_status, NULL);
+						GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, jctl->jnl_fn_len, jctl->jnl_fn);
 						*jjctl = jctl;
-						return crypt_status;
+						return gtmcrypt_errno;
 					}
 				}
 #				endif
@@ -390,7 +427,7 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 					if (IS_SET(rectype))
 					{
 						GET_MSTR_LEN(val_len, &keystr->text[keystr->length]);
-						if (keystr->length + 1 + SIZEOF(rec_hdr) + val_len > max_rec_size)
+						if (val_len > max_rec_size)
 							MUR_BACK_PROCESS_ERROR(jctl, jjctl, "Record size check failed");
 					}
 				}
@@ -524,7 +561,7 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 				(NULL != rctl->csd) && (rec_tn > rctl->csd->trans_hist.curr_tn))
 			{
 				assert(FALSE);
-				gtm_putmsg(VARLSTCNT(7) ERR_EPOCHTNHI, 5, jctl->rec_offset,
+				gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(7) ERR_EPOCHTNHI, 5, jctl->rec_offset,
 					jctl->jnl_fn_len, jctl->jnl_fn, &rec_tn, &rctl->csd->trans_hist.curr_tn);
 				MUR_BACK_PROCESS_ERROR(jctl, jjctl, "Epoch transaction number check failed");
 			}
@@ -532,10 +569,10 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 			{
 				if (mur_options.verbose)
 				{
-					gtm_putmsg(VARLSTCNT(6) ERR_MUINFOUINT4, 4,
+					gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(6) ERR_MUINFOUINT4, 4,
 						LEN_AND_LIT("    First Epoch Record Offset"),
 						jctl->rec_offset, jctl->rec_offset);
-					gtm_putmsg(VARLSTCNT(6) ERR_MUINFOUINT4, 4,
+					gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(6) ERR_MUINFOUINT4, 4,
 						LEN_AND_LIT("    First Epoch Record timestamp"), rec_time, rec_time);
 				}
 				first_epoch = FALSE;
@@ -786,7 +823,8 @@ uint4	mur_back_processing_one_region(mur_back_opt_t *mur_back_options)
 					save_turn_around_point(rctl, jctl, apply_pblk_this_region);
 				} else
 				{
-					gtm_putmsg(VARLSTCNT(4) ERR_NOPREVLINK, 2, jctl->jnl_fn_len, jctl->jnl_fn);
+					gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(4) ERR_NOPREVLINK,
+						2, jctl->jnl_fn_len, jctl->jnl_fn);
 					*jjctl = jctl;
 					return ERR_NOPREVLINK;
 				}
@@ -912,14 +950,14 @@ uint4 mur_back_processing(jnl_ctl_list **jjctl, boolean_t apply_pblk, seq_num *p
 			}
 		}
 		if (murgbl.resync_seqno)
-			gtm_putmsg(VARLSTCNT(4) ERR_RESOLVESEQNO, 2, &murgbl.resync_seqno, &murgbl.resync_seqno);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_RESOLVESEQNO, 2, &murgbl.resync_seqno, &murgbl.resync_seqno);
 		UNIX_ONLY(
 			if (murgbl.resync_strm_seqno_nonzero)
 			{
 				for (idx = 0; idx < MAX_SUPPL_STRMS; idx++)
 				{
 					if (murgbl.resync_strm_seqno[idx])
-						gtm_putmsg(VARLSTCNT(5) ERR_RESOLVESEQSTRM, 3, idx,
+						gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_RESOLVESEQSTRM, 3, idx,
 							&murgbl.resync_strm_seqno[idx], &murgbl.resync_strm_seqno[idx]);
 				}
 				/* If -resync=<strm_seqno> is specified, we dont yet know what jnl_seqno it maps back to.
@@ -980,8 +1018,8 @@ uint4 mur_back_processing(jnl_ctl_list **jjctl, boolean_t apply_pblk, seq_num *p
 		assert(jctl->reg_ctl == rctl);
 		assert(NULL == jctl->next_gen);
 		if (mur_options.verbose)
-			gtm_putmsg(VARLSTCNT(6) ERR_MUINFOSTR, 4, LEN_AND_LIT("Processing started for journal file"),
-				jctl->jnl_fn_len, jctl->jnl_fn);
+			gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(6) ERR_MUINFOSTR, 4,
+				LEN_AND_LIT("Processing started for journal file"), jctl->jnl_fn_len, jctl->jnl_fn);
 		jctl->rec_offset = jctl->lvrec_off;
 		status = mur_prev(jctl, jctl->rec_offset);
 		mur_desc = rctl->mur_desc;

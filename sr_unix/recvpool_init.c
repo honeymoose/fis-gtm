@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -46,6 +46,7 @@
 #include "repl_msg.h"
 #include "gtmsource.h"
 #include "repl_instance.h"
+#include "util.h"		/* For OUT_BUFF_SIZE */
 
 GBLREF	jnlpool_addrs		jnlpool;
 GBLREF	recvpool_addrs		recvpool;
@@ -65,7 +66,7 @@ error_def(ERR_TEXT);
 
 #define MAX_RES_TRIES		620 		/* Also defined in gvcst_init_sysops.c */
 
-#define REMOVE_OR_RELEASE_SEM(NEW_IPC, UDI)									\
+#define REMOVE_OR_RELEASE_SEM(NEW_IPC)									\
 {														\
 	if (NEW_IPC)												\
 		remove_sem_set(RECV);										\
@@ -78,6 +79,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	boolean_t	shm_created, new_ipc = FALSE;
 	char		instfilename[MAX_FN_LEN + 1];
         char           	machine_name[MAX_MCNAMELEN];
+	char		scndry_msg[OUT_BUFF_SIZE];
 	gd_region	*r_save, *reg;
 	int		status, save_errno;
 	union semun	semarg;
@@ -107,7 +109,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 		 * locks the same entity.
 		 * Should have already attached to journal pool only for receiver server startup or shutdown. Assert that.
 		 */
-		assert(gtmrecv_options.start || gtmrecv_options.shut_down);
+		assert(gtmrecv_options.start || gtmrecv_options.shut_down || (GTMZPEEK == pool_user));
 		reg = recvpool.recvpool_dummy_reg = jnlpool.jnlpool_dummy_reg;
 	}
 	udi = FILE_INFO(reg);
@@ -143,7 +145,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 			ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 			rts_error(VARLSTCNT(7) ERR_RECVPOOLSETUP, 0,
 				  ERR_TEXT, 2,
-			          RTS_ERROR_LITERAL("Error creating recv pool"), REPL_SEM_ERRNO);
+			          RTS_ERROR_LITERAL("Error creating recv pool"), errno);
 		}
 		/* Following will set semaphore RECV_ID_SEM value as GTM_ID. In case we have orphaned semaphore for some reason,
 		 * mupip rundown will be able to identify GTM semaphores checking the value and can remove.
@@ -173,17 +175,21 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	} else
 	{	/* find create time of semaphore from the file header and check if the id is reused by others */
 		semarg.buf = &semstat;
-		if (-1 == semctl(repl_instance.recvpool_semid, 0, IPC_STAT, semarg))
+		if (-1 == semctl(repl_instance.recvpool_semid, DB_CONTROL_SEM, IPC_STAT, semarg))
 		{
 			save_errno = errno;
 			ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
-			rts_error(VARLSTCNT(5) ERR_REPLREQROLLBACK, 2, full_len, udi->fn, save_errno);
+			SNPRINTF(scndry_msg, OUT_BUFF_SIZE, "Error with semctl on Receive Pool SEMID (%d)",
+					repl_instance.recvpool_semid);
+			rts_error(VARLSTCNT(9) ERR_REPLREQROLLBACK, 2, full_len, udi->fn,
+					ERR_TEXT, 2, LEN_AND_STR(scndry_msg), save_errno);
 		}
 		else if (semarg.buf->sem_ctime != repl_instance.recvpool_semid_ctime)
 		{
 			ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
-			rts_error(VARLSTCNT(8) ERR_REPLREQROLLBACK, 2, full_len, udi->fn,
-				ERR_TEXT, 2, RTS_ERROR_TEXT("recvpool sem_ctime does not match"));
+			SNPRINTF(scndry_msg, OUT_BUFF_SIZE, "Creation time for Receive Pool SEMID (%d) is %d; Expected %d",
+					repl_instance.recvpool_semid, semarg.buf->sem_ctime, repl_instance.recvpool_semid_ctime);
+			rts_error(VARLSTCNT(8) ERR_REPLREQROLLBACK, 2, full_len, udi->fn, ERR_TEXT, 2, LEN_AND_STR(scndry_msg));
 		}
 		udi->semid = repl_instance.recvpool_semid;
 		udi->gt_sem_ctime = repl_instance.recvpool_semid_ctime;
@@ -196,9 +202,10 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	{
 		ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 		rts_error(VARLSTCNT(7) ERR_RECVPOOLSETUP, 0, ERR_TEXT, 2,
-				RTS_ERROR_LITERAL("Error with receive pool semaphores"), REPL_SEM_ERRNO);
+				RTS_ERROR_LITERAL("Error with receive pool semaphores"), errno);
 	}
 	udi->grabbed_access_sem = TRUE;
+	udi->counter_acc_incremented = TRUE;
 	if (INVALID_SHMID == repl_instance.recvpool_shmid)
 	{	/* We have an INVALID shmid in the file header. There are three ways this can happen
 		 *
@@ -228,9 +235,10 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	} else if (-1 == shmctl(repl_instance.recvpool_shmid, IPC_STAT, &shmstat))
 	{	/* shared memory ID was removed form the system by an IPCRM command or we have a permission issue (or such) */
 		save_errno = errno;
-		REMOVE_OR_RELEASE_SEM(new_ipc, udi);
+		REMOVE_OR_RELEASE_SEM(new_ipc);
 		ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
-		rts_error(VARLSTCNT(5) ERR_REPLREQROLLBACK, 2, full_len, udi->fn, save_errno);
+		SNPRINTF(scndry_msg, OUT_BUFF_SIZE, "Error with shmctl on Receive Pool SHMID (%d)", repl_instance.recvpool_shmid);
+		rts_error(VARLSTCNT(9) ERR_REPLREQROLLBACK, 2, full_len, udi->fn, ERR_TEXT, 2, LEN_AND_STR(scndry_msg), save_errno);
 	} else if (shmstat.shm_ctime != repl_instance.recvpool_shmid_ctime)
 	{	/* shared memory was possibly reused (causing shm_ctime and jnlpool_shmid_ctime to be different. We can't rely
 		 * on the shmid as it could be connected to a valid instance file in a different environment. Create new IPCs
@@ -243,7 +251,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	}
 	if (new_ipc && (GTMRECV != pool_user || !gtmrecv_startup))
 	{
-		REMOVE_OR_RELEASE_SEM(new_ipc, udi);
+		REMOVE_OR_RELEASE_SEM(new_ipc);
 		ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 		rts_error(VARLSTCNT(4) ERR_NORECVPOOL, 2, full_len, udi->fn);
 	}
@@ -273,7 +281,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 		udi->gt_shm_ctime = shmstat.shm_ctime;
 		shm_created = TRUE;
 	}
-	assert((INVALID_SHMID != udi->shmid) && (0 != udi->gt_shm_ctime) && (0 != recvpool_shmid));
+	assert((INVALID_SHMID != udi->shmid) && (0 != udi->gt_shm_ctime) && (INVALID_SHMID != recvpool_shmid));
 	status_l = (sm_long_t)(recvpool.recvpool_ctl = (recvpool_ctl_ptr_t)do_shmat(recvpool_shmid, 0, 0));
 	if (-1 == status_l)
 	{
@@ -283,6 +291,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 		else
 			rel_sem_immediate(RECV, RECV_POOL_ACCESS_SEM);
 		udi->grabbed_access_sem = FALSE;
+		udi->counter_acc_incremented = FALSE;
 		ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 		rts_error(VARLSTCNT(7) ERR_RECVPOOLSETUP, 0, ERR_TEXT, 2,
 			RTS_ERROR_LITERAL("Error with receive pool shmat"), save_errno);
@@ -307,6 +316,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 			else
 				rel_sem_immediate(RECV, RECV_POOL_ACCESS_SEM);
 			udi->grabbed_access_sem = FALSE;
+			udi->counter_acc_incremented = FALSE;
 			ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 			rts_error(VARLSTCNT(6) ERR_RECVPOOLSETUP, 0, ERR_TEXT, 2,
 				RTS_ERROR_LITERAL("Receive pool has not been initialized"));
@@ -379,7 +389,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 		assert(NULL != jnlpool.repl_inst_filehdr);
 		DEBUG_ONLY(repl_csa = &FILE_INFO(jnlpool.jnlpool_dummy_reg)->s_addrs;)
 		assert(!repl_csa->hold_onto_crit);	/* so it is ok to invoke "grab_lock" and "rel_lock" unconditionally */
-		GRAB_LOCK(jnlpool.jnlpool_dummy_reg, ASSERT_NO_ONLINE_ROLLBACK);
+		grab_lock(jnlpool.jnlpool_dummy_reg, TRUE, ASSERT_NO_ONLINE_ROLLBACK);
 		jnlpool.repl_inst_filehdr->recvpool_shmid = udi->shmid;
 		jnlpool.repl_inst_filehdr->recvpool_semid = udi->semid;
 		jnlpool.repl_inst_filehdr->recvpool_shmid_ctime = udi->gt_shm_ctime;
@@ -397,6 +407,7 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	{
 		rel_sem(RECV, RECV_POOL_ACCESS_SEM);
 		udi->grabbed_access_sem = FALSE;
+		udi->counter_acc_incremented = FALSE;
 		if (!ftok_sem_release(recvpool.recvpool_dummy_reg, FALSE, FALSE))
 			rts_error(VARLSTCNT(1) ERR_RECVPOOLSETUP);
 	}
@@ -409,12 +420,13 @@ void recvpool_init(recvpool_user pool_user, boolean_t gtmrecv_startup)
 	 */
 	if ((GTMRECV == pool_user) && gtmrecv_options.start && (0 != grab_sem(RECV, RECV_SERV_OPTIONS_SEM)))
 	{
-		save_errno = REPL_SEM_ERRNO;
+		save_errno = errno;
 		if (new_ipc)
 			remove_sem_set(RECV);
 		else
 			rel_sem_immediate(RECV, RECV_POOL_ACCESS_SEM);
 		udi->grabbed_access_sem = FALSE;
+		udi->counter_acc_incremented = FALSE;
 		ftok_sem_release(recvpool.recvpool_dummy_reg, TRUE, TRUE);
 		rts_error(VARLSTCNT(7) ERR_RECVPOOLSETUP, 0, ERR_TEXT, 2,
  	  		  RTS_ERROR_LITERAL("Error with receive pool options semaphore"), save_errno);

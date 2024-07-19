@@ -14,7 +14,7 @@
  *
  *	Include file for the GTCM server (RC code).
  *
- *  $Header:$
+ *  $Header: /cvsroot/fis-gtm/gtm/sr_unix/rc.h,v 1.6 2013/10/23 03:49:30 tuskentower Exp $
  *
  */
 

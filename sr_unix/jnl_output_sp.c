@@ -1,6 +1,6 @@
 /***************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -12,7 +12,7 @@
 #include "mdef.h"
 
 #include <errno.h>
-#include "gtm_unistd.h"	/* fsync() needs this */
+#include "gtm_unistd.h"	/* DB_FSYNC macro needs this */
 #include "gtm_string.h"
 
 #include "gtmio.h"	/* this has to come in before gdsfhead.h, for all "open" to be defined
@@ -37,12 +37,14 @@
 #include "repl_sp.h"	/* for F_CLOSE used by the JNL_FD_CLOSE macro */
 #include "memcoherency.h"
 #include "gtm_dbjnl_dupfd_check.h"
+#include "anticipatory_freeze.h"
 
 GBLREF	volatile int4	db_fsync_in_prog;
 GBLREF	volatile int4	jnl_qio_in_prog;
 GBLREF	uint4		process_id;
 
 error_def(ERR_DBFSYNCERR);
+error_def(ERR_ENOSPCQIODEFER);
 error_def(ERR_JNLACCESS);
 error_def(ERR_JNLCNTRL);
 error_def(ERR_JNLRDERR);
@@ -63,6 +65,7 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 	jnl_buffer_ptr_t	jb;
 	int4			free_ptr;
 	sgmnt_addrs		*csa;
+	node_local_ptr_t	cnl;
 	sm_uc_ptr_t		base;
 	unix_db_info		*udi;
 	unsigned int		status;
@@ -72,9 +75,11 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 	int			aligned_tsz;
 	sm_uc_ptr_t		aligned_base;
 	uint4			jnl_fs_block_size;
+	gd_region		*reg;
 
 	assert(NULL != jpc);
-	udi = FILE_INFO(jpc->region);
+	reg = jpc->region;
+	udi = FILE_INFO(reg);
 	csa = &udi->s_addrs;
 	jb = jpc->jnl_buff;
 	if (jb->io_in_prog_latch.u.parts.latch_pid == process_id)	/* We already have the lock? */
@@ -86,6 +91,16 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 		assert(0 <= jnl_qio_in_prog);
 		return ERR_JNLWRTDEFER;
 	}
+#	ifdef DEBUG
+	/* When jnl_sub_qio_start() is called as part of WBTEST_SIGTSTP_IN_JNL_OUTPUT_SP white-box test case,
+	 * aligned_write should always be FALSE. But depending upon the filesystem block size, it is possible that
+	 * the function could also be called with aligned_write being TRUE. This could lead to sending SIGTSTP
+	 * twice. Hence ensure that SIGTSTP is sent only for the unaligned write.
+	 */
+	if (gtm_white_box_test_case_enabled && (WBTEST_SIGTSTP_IN_JNL_OUTPUT_SP == gtm_white_box_test_case_number)
+				&& !aligned_write)
+		kill(process_id, SIGTSTP);
+#	endif
 	if (jb->dsk != (jb->dskaddr % jb->size))
 	{
 		RELEASE_SWAPLOCK(&jb->io_in_prog_latch);
@@ -111,13 +126,16 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 	 */
 	if (jb->need_db_fsync)
 	{
-		DB_FSYNC(jpc->region, udi, csa, db_fsync_in_prog, save_errno);
+		DB_FSYNC(reg, udi, csa, db_fsync_in_prog, save_errno);
+		GTM_WHITE_BOX_TEST(WBTEST_ANTIFREEZE_DBFSYNCERR, save_errno, EIO);
 		if (0 != save_errno)
 		{
 			RELEASE_SWAPLOCK(&jb->io_in_prog_latch);
 			jnl_qio_in_prog--;
 			assert(0 <= jnl_qio_in_prog);
-			rts_error(VARLSTCNT(5) ERR_DBFSYNCERR, 2, DB_LEN_STR(jpc->region), save_errno);
+			/* DBFSYNCERR can potentially cause syslog flooding. Remove the following line if we it becomes an issue. */
+			send_msg_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_DBFSYNCERR, 2, DB_LEN_STR(reg), save_errno);
+			rts_error_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_DBFSYNCERR, 2, DB_LEN_STR(reg), save_errno);
 			assert(FALSE);	/* should not come here as the rts_error above should not return */
 			return ERR_DBFSYNCERR;	/* ensure we do not fall through to the code below as we no longer have the lock */
 		}
@@ -182,7 +200,8 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 		/* Assert that both ends of the source buffer for the write falls within journal buffer limits */
 		assert(aligned_base >= &jb->buff[jb->buff_off]);
 		assert(aligned_base + aligned_tsz <= &jb->buff[jb->buff_off + jb->size]);
-		LSEEKWRITE(jpc->channel, (off_t)aligned_dskaddr, aligned_base, aligned_tsz, jpc->status);
+		JNL_LSEEKWRITE(csa, csa->hdr->jnl_file_name, jpc->channel,
+			(off_t)aligned_dskaddr, aligned_base, (size_t)aligned_tsz, jpc->status);
 		status = jpc->status;
 		if (SS_NORMAL == status)
 		{	/* update jnl_buff pointers to reflect the successful write to the journal file */
@@ -201,15 +220,25 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 			jb->dsk = jpc->new_dsk;
 			jb->dskaddr = jpc->new_dskaddr;
 			jpc->dsk_update_inprog = FALSE;
+			cnl = csa->nl;
+			INCR_GVSTATS_COUNTER(csa, cnl, n_jfile_bytes, aligned_tsz);
+			INCR_GVSTATS_COUNTER(csa, cnl, n_jfile_writes, 1);
 		} else
 		{
-			assert(ENOSPC == status);
+			assert((ENOSPC == status) || (ERR_ENOSPCQIODEFER == status));
 			jb->errcnt++;
 			if (ENOSPC == status)
 				jb->enospc_errcnt++;
 			else
 				jb->enospc_errcnt = 0;
-			jnl_send_oper(jpc, ERR_JNLACCESS);
+
+			if (ERR_ENOSPCQIODEFER != status)
+			{
+				jnl_send_oper(jpc, ERR_JNLACCESS);
+				jpc->status = status;	/* set jpc->status back to original error as jnl_send_oper resets
+							 * jpc->status to SS_NORMAL. We need it in callers of this function
+							 * (e.g. jnl_write_attempt). */
+			}
 #			ifdef GTM_FD_TRACE
 			if ((EBADF == status) || (ESPIPE == status))
 			{	/* likely case of D9I11-002714. check if fd is valid */
@@ -219,13 +248,16 @@ uint4 jnl_sub_qio_start(jnl_private_control *jpc, boolean_t aligned_write)
 				 * if the fd in itself is valid and points back to the journal file. If not reset it to NOJNL.
 				 */
 				if (NOJNL != jpc->channel)
-					gtm_check_fd_is_valid(jpc->region, FALSE, jpc->channel);
+					gtm_check_fd_is_valid(reg, FALSE, jpc->channel);
 				/* If jpc->channel still did not get reset to NOJNL, it means the file descriptor is valid but
 				 * not sure why we are getting EBADF/ESPIPE errors. No further recovery attempted at this point.
 				 */
 			}
 #			endif
-			status = ERR_JNLACCESS;
+			if (ERR_ENOSPCQIODEFER == status)
+				status = ERR_JNLWRTDEFER;
+			else
+				status = ERR_JNLACCESS;
 		}
 	}
 	RELEASE_SWAPLOCK(&jb->io_in_prog_latch);

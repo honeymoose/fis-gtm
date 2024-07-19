@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2003, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2003, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -82,27 +82,28 @@
 #include "wcs_flu.h"
 #include "wcs_recover.h"
 #include "is_proc_alive.h"
+#include "anticipatory_freeze.h"
 
-#define RELEASE_ACCESS_CONTROL(REGLIST)								\
-{												\
-	unix_db_info		*lcl_udi;							\
-	gd_region		*lcl_reg;							\
-	reg_ctl_list		*lcl_rctl;							\
-	int			save_errno;							\
-												\
-	lcl_reg = REGLIST->reg;									\
-	lcl_rctl = REGLIST->rctl;								\
-	lcl_udi = FILE_INFO(lcl_reg);								\
-	assert(INVALID_SEMID != lcl_udi->semid);						\
-	assert(lcl_udi->grabbed_access_sem && lcl_rctl->standalone);				\
-	if (0 != (save_errno = do_semop(lcl_udi->semid, 0, -1, SEM_UNDO)))			\
-	{											\
-		assert(FALSE);	/* we hold it, so we should be able to release it*/		\
-		rts_error(VARLSTCNT(12) ERR_CRITSEMFAIL, 2, DB_LEN_STR(lcl_reg), ERR_SYSCALL, 5,\
-				RTS_ERROR_LITERAL("semop()"), CALLFROM, save_errno);		\
-	}											\
-	lcl_udi->grabbed_access_sem = FALSE;							\
-	lcl_rctl->standalone = FALSE;								\
+#define RELEASE_ACCESS_CONTROL(REGLIST)									\
+{													\
+	unix_db_info		*lcl_udi;								\
+	gd_region		*lcl_reg;								\
+	reg_ctl_list		*lcl_rctl;								\
+	int			save_errno;								\
+													\
+	lcl_reg = REGLIST->reg;										\
+	lcl_rctl = REGLIST->rctl;									\
+	lcl_udi = FILE_INFO(lcl_reg);									\
+	assert(INVALID_SEMID != lcl_udi->semid);							\
+	assert(lcl_udi->grabbed_access_sem && lcl_rctl->standalone);					\
+	if (0 != (save_errno = do_semop(lcl_udi->semid, DB_CONTROL_SEM, -1, SEM_UNDO)))			\
+	{												\
+		assert(FALSE);	/* we hold it, so we should be able to release it*/			\
+		rts_error(VARLSTCNT(12) ERR_CRITSEMFAIL, 2, DB_LEN_STR(lcl_reg), ERR_SYSCALL, 5,	\
+				RTS_ERROR_LITERAL("semop()"), CALLFROM, save_errno);			\
+	}												\
+	lcl_udi->grabbed_access_sem = FALSE;								\
+	lcl_rctl->standalone = FALSE;									\
 }
 
 #define GRAB_ACCESS_CONTROL(REGLIST)									\
@@ -131,7 +132,7 @@
 			rts_error(VARLSTCNT(12) ERR_CRITSEMFAIL, 2, DB_LEN_STR(lcl_reg), ERR_SYSCALL, 5,\
 					RTS_ERROR_LITERAL("semop()"), CALLFROM, save_errno);		\
 		}											\
-		lcl_udi->grabbed_access_sem = TRUE;							\
+		lcl_udi->grabbed_access_sem = TRUE;					\
 		lcl_rctl->standalone = TRUE;								\
 	}												\
 }
@@ -145,6 +146,7 @@ GBLREF 	mur_gbls_t		murgbl;
 GBLREF	gd_region		*gv_cur_region;
 GBLREF	jnlpool_addrs		jnlpool;
 GBLREF	gd_addr			*gd_header;
+GBLREF	sgmnt_data		*cs_data;
 #ifdef UNIX
 GBLREF	jnlpool_ctl_ptr_t	jnlpool_ctl;
 GBLREF	sgmnt_addrs		*cs_addrs;
@@ -152,7 +154,7 @@ GBLREF	boolean_t		holds_sem[NUM_SEM_SETS][NUM_SRC_SEMS];
 GBLREF	int4			strm_index;
 GBLREF	uint4			process_id;
 GBLREF	jnl_gbls_t		jgbl;
-GBLREF	sgmnt_data		*cs_data;
+GBLREF	boolean_t		jnlpool_init_needed;
 #endif
 
 
@@ -229,6 +231,7 @@ boolean_t mur_open_files()
 #	else /* ONLINE ROLLBACK specific variables */
 	onln_rlbk_reg_list		*reglist = NULL, *rl, *rl_last, *save_rl, *rl_new;
 	boolean_t			x_lock, wait_for_kip, replinst_file_corrupt = FALSE, inst_requires_rlbk;
+	boolean_t			jnlpool_sem_created;
 	sgmnt_addrs			*tmpcsa;
 	sgmnt_data			*tmpcsd;
 	gd_region			*reg;
@@ -244,6 +247,7 @@ boolean_t mur_open_files()
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
+	UNIX_ONLY(jnlpool_init_needed = !mur_options.update);
 	jnl_file_list_len = MAX_LINE;
 	if (FALSE == CLI_GET_STR_ALL("FILE", jnl_file_list, &jnl_file_list_len))
 		mupip_exit(ERR_MUPCLIERR);
@@ -269,11 +273,8 @@ boolean_t mur_open_files()
 	/* We assume recovery will be done only on current global directory.
 	 * That is, journal file names specified must be from current global directory.
 	 */
-	if (star_specified || mur_options.update && !mur_options.redirect)
-	{	/* "*" is specified or it is -recover or -rollback. We require gtmgbldir to be set in all these cases.
-		 * The only exception is "-redirect" in which case the target database is obtained from -redirect
-		 * instead of from the global directory.
-		 */
+	if (star_specified || mur_options.update)
+	{	/* "*" is specified or it is -recover or -rollback. We require gtmgbldir to be set in all these cases */
 		assert(NULL == gd_header);
 		gvinit();	/* read in current global directory */
 		assert(NULL != gd_header);
@@ -295,17 +296,17 @@ boolean_t mur_open_files()
 	{	/* Rundown the Jnlpool and Recvpool */
 #		if defined(UNIX)
 		if (!repl_inst_get_name((char *)replpool_id.instfilename, &full_len, SIZEOF(replpool_id.instfilename),
-			issue_gtm_putmsg))
+				issue_gtm_putmsg))
 		{	/* appropriate gtm_putmsg would have already been issued by repl_inst_get_name */
 			return FALSE;
 		}
 		assert(NUM_SRC_SEMS == NUM_RECV_SEMS);
 		ASSERT_DONOT_HOLD_REPLPOOL_SEMS;
 		assert(NULL == jnlpool.repl_inst_filehdr);
-		if (!mu_rndwn_repl_instance(&replpool_id, FALSE, TRUE))
+		if (!mu_rndwn_repl_instance(&replpool_id, FALSE, TRUE, &jnlpool_sem_created))
 			return FALSE;	/* mu_rndwn_repl_instance will have printed appropriate message in case of error */
 		assert(jnlpool.jnlpool_ctl == jnlpool_ctl);
-		assert(jgbl.onlnrlbk || (NULL == jnlpool_ctl));
+		assert(jgbl.onlnrlbk || ANTICIPATORY_FREEZE_AVAILABLE || (NULL == jnlpool_ctl));
 		ASSERT_HOLD_REPLPOOL_SEMS;
 		assert(NULL != jnlpool.repl_inst_filehdr);
 		assert(INVALID_SEMID != jnlpool.repl_inst_filehdr->jnlpool_semid);
@@ -317,9 +318,10 @@ boolean_t mur_open_files()
 		 */
 		if (jnlpool.repl_inst_filehdr->is_supplementary)
 		{
-			assert(INVALID_SUPPL_STRM == strm_index);
+			assert((INVALID_SUPPL_STRM == strm_index) || (0 == strm_index));
 			strm_index = 0;
 		}
+		ENABLE_FREEZE_ON_ERROR;
 #		elif defined(VMS)
 		gbldir_mstr.addr = GTM_GBLDIR;
 		gbldir_mstr.len = SIZEOF(GTM_GBLDIR) - 1;
@@ -411,11 +413,11 @@ boolean_t mur_open_files()
 			rctl->db_present = TRUE;
 			if (mur_options.update)
 			{
-				gv_cur_region = rctl->gd;	/* mu_rndwn_file() assumes gv_cur_region is set in VMS */
 #				ifdef UNIX
 				if (!jgbl.onlnrlbk)
 				{
 #				endif
+					VMS_ONLY(gv_cur_region = rctl->gd); /* VMS mu_rndwn_file() assumes gv_cur_region is set */
 					if (!STANDALONE(rctl->gd))	/* STANDALONE macro calls mu_rndwn_file() */
 					{
 						gtm_putmsg(VARLSTCNT(4) ERR_MUSTANDALONE, 2, DB_LEN_STR(rctl->gd));
@@ -429,10 +431,10 @@ boolean_t mur_open_files()
 			if (mur_options.update || mur_options.extr[GOOD_TN])
 			{
 	        		gvcst_init(rctl->gd);
+				TP_CHANGE_REG(rctl->gd);
 #				ifdef UNIX
 				if (jgbl.onlnrlbk)
 				{
-					TP_CHANGE_REG(rctl->gd);
 					if (!cs_data->fully_upgraded)
 					{
 						gtm_putmsg(VARLSTCNT(6) ERR_ORLBKNOV4BLK, 4, REG_LEN_STR(gv_cur_region),
@@ -485,12 +487,11 @@ boolean_t mur_open_files()
 			{	/* Get hold of all the gtmsource_srv_latch in all the source server slots in the journal pool. Hold
 				 * onto it until the end (in mur_close_files).
 				 */
-				if (!grab_gtmsource_srv_latch(&gtmsourcelocal_ptr->gtmsource_srv_latch, 2 * max_epoch_interval))
-				{
-					gtm_putmsg(VARLSTCNT(5) ERR_SRVLCKWT2LNG, 2, (2 * max_epoch_interval),
-							gtmsourcelocal_ptr->gtmsource_pid);
-					return FALSE;
-				}
+				jnlpool.gtmsource_local = gtmsourcelocal_ptr;
+				if (!grab_gtmsource_srv_latch(&gtmsourcelocal_ptr->gtmsource_srv_latch,
+						2 * max_reg_total * max_epoch_interval, GRAB_GTMSOURCE_SRV_LATCH_ONLY))
+					assertpro(FALSE); /* should not reach here due to rts_error in the above function */
+
 			}
 		}
 		/* For online rollback we need to grab crit on all the regions. But, this has to be done in the ftok order. To
@@ -564,7 +565,7 @@ boolean_t mur_open_files()
 		 */
 		if (NULL != jnlpool_ctl)
 		{	/* Validate the journal pool is accessible and the offsets of various structures within it are intact */
-			GRAB_LOCK(jnlpool.jnlpool_dummy_reg, GRAB_LOCK_ONLY);
+			grab_lock(jnlpool.jnlpool_dummy_reg, TRUE, GRAB_LOCK_ONLY);
 			csa->hold_onto_crit = TRUE;	/* No more unconditional rel_lock() */
 			assert(jnlpool.repl_inst_filehdr->crash); /* since we haven't removed the journal pool */
 			repl_inst_flush_jnlpool(FALSE, FALSE);
@@ -579,7 +580,7 @@ boolean_t mur_open_files()
 			TP_CHANGE_REG(reg);
 #			ifdef DEBUG
 			udi = FILE_INFO(reg);
-			assert(1 == (semval = semctl(udi->semid, 0, GETVAL)));
+			assert(1 == (semval = semctl(udi->semid, DB_CONTROL_SEM, GETVAL)));
 #			endif
 			assert(cs_addrs->now_crit);
 			cs_addrs->hold_onto_crit = TRUE; /* No more unconditional grab_crit/rel_crit on this region */
@@ -598,7 +599,7 @@ boolean_t mur_open_files()
 			if (!wcs_flu(WCSFLU_NONE))
 			{
 				assert(cs_addrs->nl->wcs_phase2_commit_pidcnt); /* only reason why wcs_flu can fail */
-				SET_TRACEABLE_VAR(cs_addrs->hdr->wc_blocked, TRUE);
+				SET_TRACEABLE_VAR(cs_addrs->nl->wc_blocked, TRUE);
 				BG_TRACE_PRO_ANY(cs_addrs, wc_blocked_onln_rlbk);
 				send_msg(VARLSTCNT(8) ERR_WCBLOCKED, 6, LEN_AND_LIT("wc_blocked_onln_rlbk"),
 						process_id, &cs_addrs->ti->curr_tn, DB_LEN_STR(gv_cur_region));
@@ -644,6 +645,7 @@ boolean_t mur_open_files()
 			if (mur_options.update || mur_options.extr[GOOD_TN])
 			{	/* NOTE: Only for collation info extract needs database access */
 				DEFER_INTERRUPTS(INTRPT_IN_MUR_OPEN_FILES); /* temporarily disable MUPIP STOP/signal handling. */
+				TP_CHANGE_REG(rctl->gd);
 
 				csa = rctl->csa = &FILE_INFO(rctl->gd)->s_addrs;
 				csd = rctl->csd = rctl->csa->hdr;
@@ -721,9 +723,13 @@ boolean_t mur_open_files()
 						}
 					} else
 					{
-						if (!REPL_ALLOWED(csd))
-						{
-							if (JNL_ENABLED(csd))
+						if (!REPL_ENABLED(csd))
+						{	/* Replication is either OFF or WAS_ON. Journaling could be ENABLED or not.
+							 * If replication is OFF and journaling is DISABLED, there is no issue.
+							 * Any other combination (including replication being WAS_ON) is an error
+							 * as we dont have the complete set of journal records to do the rollback.
+							 */
+							if (REPL_ALLOWED(csd) || JNL_ENABLED(csd))
 							{
 								gtm_putmsg(VARLSTCNT(4) ERR_REPLSTATEOFF, 2, DB_LEN_STR(rctl->gd));
 								return FALSE;
@@ -1109,6 +1115,19 @@ boolean_t mur_open_files()
 				}
 			}
 		} /* if mur_options.update */
+		if (mur_options.extr[GOOD_TN])
+		{
+			csa = rctl->csa;
+			if (NULL != csa)
+			{
+#				if (defined(DEBUG) && defined(VMS))
+				/* set wc_blocked as true to invoke wcs_recover */
+				GTM_WHITE_BOX_TEST(WBTEST_SET_WC_BLOCKED, csa->nl->wc_blocked, TRUE);
+#				endif
+				if (csa->nl->wc_blocked)
+					TREF(donot_write_inctn_in_wcs_recover) = TRUE;
+			}
+		}
 		while (NULL != jctl->next_gen) /* Check for continuity */
 		{
 			if (!mur_options.notncheck && (jctl->next_gen->jfh->bov_tn != jctl->jfh->eov_tn))

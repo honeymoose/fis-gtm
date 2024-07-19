@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2010, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2010, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -231,8 +231,8 @@ STATICFNDEF void write_out_trigger(char *gbl_name, uint4 gbl_name_len, uint4 fil
 			else
 			{
 				assert(FALSE);
-				rts_error(VARLSTCNT(8) ERR_TRIGDEFBAD, 6, gbl_name_len, gbl_name, gbl_name_len, gbl_name,
-					LEN_AND_LIT("\"#LABEL\""));
+				rts_error_csa(CSA_ARG(REG2CSA(gv_cur_region)) VARLSTCNT(8) ERR_TRIGDEFBAD, 6, gbl_name_len,
+						gbl_name, gbl_name_len, gbl_name, LEN_AND_LIT("\"#LABEL\""));
 			}
 		}
 		skip_chars = 1;
@@ -253,8 +253,8 @@ STATICFNDEF void write_out_trigger(char *gbl_name, uint4 gbl_name_len, uint4 fil
 			else
 			{
 				assert(FALSE);
-				rts_error(VARLSTCNT(8) ERR_TRIGDEFBAD, 6, gbl_name_len, gbl_name, gbl_name_len, gbl_name,
-					LEN_AND_LIT("\"#CYCLE\""));
+				rts_error_csa(CSA_ARG(REG2CSA(gv_cur_region)) VARLSTCNT(8) ERR_TRIGDEFBAD, 6, gbl_name_len,
+						gbl_name, gbl_name_len, gbl_name, LEN_AND_LIT("\"#CYCLE\""));
 			}
 		}
 		assert(MAX_DIGITS_IN_INT >= trigger_value.str.len);
@@ -544,7 +544,7 @@ STATICFNDEF void dump_all_triggers(uint4 file_name_len, mval *op_val)
 
 boolean_t trigger_select(char *select_list, uint4 select_list_len, char *file_name, uint4 file_name_len)
 {
-	char			*sel_ptr, *prev_ptr, *ptr1, *ptr2;
+	char			*sel_ptr, *strtok_ptr, *prev_ptr, *ptr1, *ptr2;
 	int			gbl_len, prev_len;
 	mstr			gbl_name;
 	sgmnt_addrs		*csa;
@@ -642,7 +642,7 @@ boolean_t trigger_select(char *select_list, uint4 select_list_len, char *file_na
 	else
 	{
 		len = select_list_len;
-		sel_ptr = strtok(save_select_list, ",");
+		sel_ptr = strtok_r(save_select_list, ",", &strtok_ptr);
 		do
 		{
 			trig_name = ('^' != *sel_ptr);
@@ -696,7 +696,7 @@ boolean_t trigger_select(char *select_list, uint4 select_list_len, char *file_na
 			if (0 != gv_target->root)
 				write_gbls_or_names(gbl_name.addr, gbl_name.len, file_name_len, &op_val, trig_name);
 			RESTORE_TRIGGER_REGION_INFO;
-		} while (NULL != (sel_ptr = strtok(NULL, ",")));	/* Embedded assignment is intended */
+		} while (NULL != (sel_ptr = strtok_r(NULL, ",", &strtok_ptr)));	/* Embedded assignment is intended */
 	}
 	if (0 != file_name_len)
 	{

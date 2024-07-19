@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -14,7 +14,7 @@
 #include "compiler.h"
 #include "opcode.h"
 #include "toktyp.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "mv_stent.h"
 #include "release_name.h"
 #include "gdsroot.h"		/* needed for tp.h & gv_trigger.h */
@@ -31,11 +31,13 @@
 #include "tp.h"
 #include "gtmimagename.h"
 #include "arit.h"
-
+#include "gtm_conv.h"
+#include "gtm_caseconv.h"
 #ifdef GTM_TRIGGER
-#include "trigger.h"
-#include "gv_trigger.h"
+# include "trigger.h"
+# include "gv_trigger.h"
 #endif
+#include "mtables.h"
 
 LITDEF char ctypetab[NUM_CHARS] =
 {
@@ -129,7 +131,8 @@ LITDEF toktabtype tokentable[] =
 	tokdef("TK_VBAR", 0, 0, 0),
 	tokdef("TK_EXPONENT", OC_EXP, 0, OCT_MVAL),
 	tokdef("TK_SORTS_AFTER", OC_SORTS_AFTER, 0, OCT_MVAL),
-	tokdef("TK_NSORTS_AFTER", OC_NSORTS_AFTER, 0, OCT_MVAL)
+	tokdef("TK_NSORTS_AFTER", OC_NSORTS_AFTER, 0, OCT_MVAL),
+	tokdef("TK_ATHASH", 0, 0, 0)
 };
 
 GBLREF mv_stent *mv_chain;	/* Needed for MV_SIZE macro */
@@ -157,8 +160,8 @@ LITDEF unsigned char mvs_size[] =
 };
 
 /* All mv_stent types that need to be preserved are indicated by the mvs_save[] array.
- * MVST_STCK_SP (which is the same as the MVST_STCK type everywhere else is handled specially here.
- * This entry is created by mdb_condition_handler to stack the "stackwarn" global variable.
+ * MVST_STCK_SP (which is the same as the MVST_STCK type everywhere else) is handled specially here.
+ * The MVST_STCK_SP entry is created by mdb_condition_handler to stack the "stackwarn" global variable.
  * This one needs to be preserved since our encountering this type in flush_jmp.c indicates that we are currently
  * in the error-handler of a STACKCRIT error which in turn has "GOTO ..." in the $ZTRAP/$ETRAP that is
  * causing us to mutate the current frame we are executing in with the contents pointed to by the GOTO.
@@ -172,14 +175,14 @@ LITDEF boolean_t mvs_save[] =
 	TRUE,	/* MVST_STAB */
 	FALSE,	/* MVST_IARR */
 	TRUE,	/* MVST_NTAB */
-	FALSE,	/* MVST_ZINTCMD */
+	TRUE,	/* MVST_ZINTCMD */
 	TRUE,	/* MVST_PVAL */
 	FALSE,	/* MVST_STCK */
 	TRUE,	/* MVST_NVAL */
 	TRUE,	/* MVST_TVAL */
 	TRUE,	/* MVST_TPHOLD */
 	TRUE,	/* MVST_ZINTR */
-	FALSE,	/* MVST_ZINTDEV */
+	TRUE,	/* MVST_ZINTDEV */
 	TRUE,	/* MVST_STCK_SP */
 	TRUE,	/* MVST_LVAL */
 	FALSE,	/* MVST_TRIGR */
@@ -188,16 +191,16 @@ LITDEF boolean_t mvs_save[] =
 	FALSE	/* MVST_MRGZWRSV */
 };
 
-static readonly unsigned char localpool[7] = {'1', '1' , '1' , '0', '1', '0', '0'};
+static readonly unsigned char localpool[7] = {'1', '1', '1', '0', '1', '0', '0'};
 LITDEF mval literal_null	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT | MV_NUM_APPROX | MV_UTF_LEN, 0, 0, 0, 0, 0, 0);
-LITDEF mval literal_zero	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 1, (char *)&localpool[3], 0,      0 );
-LITDEF mval literal_one 	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 1, (char *)&localpool[0], 0,   1000 );
-LITDEF mval literal_ten 	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 2, (char *)&localpool[2], 0,  10000 );
-LITDEF mval literal_eleven	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 2, (char *)&localpool[0], 0,  11000 );
-LITDEF mval literal_oneohoh	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[4], 0, 100000 );
-LITDEF mval literal_oneohone	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[2], 0, 101000 );
-LITDEF mval literal_oneten	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[1], 0, 110000 );
-LITDEF mval literal_oneeleven	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[0], 0, 111000 );
+LITDEF mval literal_zero	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 1, (char *)&localpool[3], 0,   0);
+LITDEF mval literal_one 	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 1, (char *)&localpool[0], 0,   1 * MV_BIAS);
+LITDEF mval literal_ten 	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 2, (char *)&localpool[2], 0,  10 * MV_BIAS);
+LITDEF mval literal_eleven	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 2, (char *)&localpool[0], 0,  11 * MV_BIAS);
+LITDEF mval literal_oneohoh	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[4], 0, 100 * MV_BIAS);
+LITDEF mval literal_oneohone	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[2], 0, 101 * MV_BIAS);
+LITDEF mval literal_oneten	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[1], 0, 110 * MV_BIAS);
+LITDEF mval literal_oneeleven	= DEFINE_MVAL_LITERAL(MV_STR | MV_NM | MV_INT, 0, 0, 3, (char *)&localpool[0], 0, 111 * MV_BIAS);
 
 /* --------------------------------------------------------------------------------------------------------------------------
  * All string mvals defined in this module using LITDEF need to have MV_NUM_APPROX bit set. This is because these mval
@@ -296,7 +299,7 @@ LITDEF int4 gtm_version_len      = SIZEOF(GTM_VERSION) - 1;
 LITDEF char *gtm_dbversion_table[] =
 {
 	"V4",
-	"V5"
+	"V6"
 };
 
 LITDEF int4 ten_pwr[NUM_DEC_DG_1L+1] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
@@ -401,6 +404,40 @@ LITDEF char 	alphanumeric_table[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
 					't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7',
 					'8', '9', '\0'};
 LITDEF int	alphanumeric_table_len = (SIZEOF(alphanumeric_table) - 1);
+
+LITDEF mstr chset_names[CHSET_MAX_IDX_ALL] =
+{ /* Supported character set (CHSET) codes for the 3-argument form of $ZCONVERT.
+   *  Note: Update the *_CHSET_LEN macros below if new CHSETs are added.
+   */
+	{1, 1, "M"},	/* "M" should be the first CHSET (0th index of "chset_names" array). verify_chset() callers rely on this.
+			 * $ZCONVERT doesn't support M, but I/O does */
+	{5, 5, "UTF-8"},
+	{6, 6, "UTF-16"},
+	{8, 8, "UTF-16LE"},
+	{8, 8, "UTF-16BE"},
+	{5, 5, "ASCII"},
+	{6, 6, "EBCDIC"},
+	{6, 6, "BINARY"}
+};
+/* This array holds the ICU converter handles corresponding to the respective
+ * CHSET name in the table chset_names[]
+ */
+GBLDEF	UConverter	*chset_desc[CHSET_MAX_IDX];
+GBLDEF casemap_t casemaps[MAX_CASE_IDX] =
+{ /* Supported case mappings and their disposal conversion routines for both $ZCHSET modes.
+   * Note: since UTF-8 disposal functions for "U" and "L" are ICU "function pointers" rather
+   * rather than their direct addresses, they are initialized in gtm_utf8_init() instead
+   */
+	{"U", &lower_to_upper, NULL},
+	{"L", &upper_to_lower, NULL},
+	{"T", NULL,            NULL}
+};
+#endif
+
+#ifdef UNIX
+/* Used as the value for "regular" key (i.e., the one with no hidden subscripts) of a spanning node. */
+LITDEF mstr	nsb_dummy = {0, 1, "\0"};
+/*LITDEF mstr	nsb_dummy = {0, LEN_AND_LIT("dummy")};*/
 #endif
 
 #ifdef DEBUG
@@ -917,4 +954,13 @@ LITDEF char vxi_opcode[][6] =
 	"CVTHD "
 };
 
+/* Routine invoked in debug mode by init_gtm() on UNIX to verify certain assumptions about some of the
+ * tables in this routine. Routine must be resident in this module to do these checks since dimensions
+ * are not known in other routines using a LITREF.
+ */
+void mtables_chk(void)
+{
+	assert(SIZEOF(mvs_size) == (MVST_LAST + 1));
+	assert(SIZEOF(mvs_save) == (SIZEOF(boolean_t) * (MVST_LAST + 1)));
+}
 #endif

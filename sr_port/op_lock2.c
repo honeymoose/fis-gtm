@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -17,6 +17,7 @@
 #include "cmmdef.h"
 #include "gdsroot.h"
 #include "gt_timer.h"
+#include "gtm_threadgbl.h"
 #include "iotimer.h"
 #include "locklits.h"
 #include "mlkdef.h"
@@ -28,6 +29,7 @@
 #include "mlk_unpend.h"
 #include "outofband.h"
 #include "lk_check_own.h"
+#include "lock_str_to_buff.h"
 #include "gvcmx.h"
 #include "gvcmz.h"
 #include "rel_quant.h"
@@ -36,23 +38,65 @@
 #include "op.h"
 #include "mv_stent.h"
 #include "find_mvstent.h"
+#include "gdskill.h"
+#include "gdsbt.h"
+#include "gtm_facility.h"
+#include "gtm_maxstr.h"
+#include "fileinfo.h"
+#include "gdsfhead.h"
+#include "gdscc.h"
+#include "filestruct.h"
+#include "buddy_list.h"		/* needed for tp.h */
+#include "io.h"
+#include "jnl.h"
+#include "hashtab_int4.h"	/* needed for tp.h */
+#include "tp.h"
+#include "send_msg.h"
+#include "gtmmsg.h"		/* for gtm_putmsg() prototype */
+#include "change_reg.h"
+#include "setterm.h"
+#include "getzposition.h"
+#ifdef DEBUG
+#include "have_crit.h"		/* for the TPNOTACID_CHECK macro */
+#endif
 
-GBLREF	bool		out_of_time;
-GBLREF	bool		remlkreq;
 GBLREF	unsigned char	cm_action;
-GBLREF	unsigned short	lks_this_cmd;
 GBLREF	uint4		dollar_tlevel;
-GBLREF	unsigned int	t_tries;
-GBLREF	uint4		process_id;
-GBLREF	int4		outofband;
+GBLREF	uint4		dollar_trestart;
+GBLREF	unsigned short	lks_this_cmd;
 GBLREF	mlk_pvtblk	*mlk_pvt_root;
 GBLREF	mlk_stats_t	mlk_stats;			/* Process-private M-lock statistics */
-GBLREF	unsigned char	*restart_pc, *restart_ctxt;
 GBLREF	mv_stent	*mv_chain;
+GBLREF	int4		outofband;
+GBLREF	bool		out_of_time;
+GBLREF	uint4		process_id;
+GBLREF	bool		remlkreq;
+GBLREF	unsigned char	*restart_ctxt, *restart_pc;
+GBLREF	unsigned int	t_tries;
+
+error_def(ERR_LOCKINCR2HIGH);
+error_def(ERR_LOCKIS);
+
+#define LOCKTIMESTR "LOCK time too long"
+#define ZALLOCTIMESTR "ZALLOCATE time too long"
+
+/* We made this a error seperate function because we did not wanted to do the MAXSTR_BUFF_DECL(buff) declartion in op_lock2,
+ * because  MAXSTR_BUFF_DECL macro would allocate a huge stack every time op_lock2 is called.
+ */
+STATICFNDCL void level_err(mlk_pvtblk *pvt_ptr); /* This definition is made here because there is no appropriate place to
+						  * put this prototype. This will not be used anywhere else so we did not
+						  * wanted to create a op_lock2.h just for this function.
+						  */
+STATICFNDCL void level_err(mlk_pvtblk *pvt_ptr)
+{
+	MAXSTR_BUFF_DECL(buff);
+	MAXSTR_BUFF_INIT;
+	lock_str_to_buff(pvt_ptr, buff, MAX_STRBUFF_INIT);
+	rts_error(VARLSTCNT(7) ERR_LOCKINCR2HIGH, 1, pvt_ptr->level, ERR_LOCKIS, 2, LEN_AND_STR(buff));
+}
 
 /*
  * -----------------------------------------------
- * Maintain in parallel with op_zalloc2
  * Arguments:
  *	timeout	- max. time to wait for locks before giving up
  *      laflag - passed to gvcmx* routines as "laflag" argument;
@@ -72,11 +116,11 @@ GBLREF	mv_stent	*mv_chain;
  */
 int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 {
-	bool		blocked, timer_on;
+	boolean_t	blocked, timer_on;
 	signed char	gotit;
 	unsigned short	locks_bckout, locks_done;
 	int4		msec_timeout;	/* timeout in milliseconds */
-	mlk_pvtblk	*pvt_ptr1, *pvt_ptr2, **prior;
+	mlk_pvtblk	*pvt_ptr1, *pvt_ptr2, **prior, *already_locked;
 	unsigned char	action;
 	ABS_TIME	cur_time, end_time, remain_time;
 	mv_stent	*mv_zintcmd;
@@ -85,9 +129,17 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 	SETUP_THREADGBL_ACCESS;
 	gotit = -1;
 	cm_action = laflag;
-	timer_on = (NO_M_TIMEOUT != timeout);
 	out_of_time = FALSE;
-	if (!timer_on)
+	if (timeout < 0)
+		timeout = 0;
+	else if (TREF(tpnotacidtime) < timeout)
+	{
+		if (CM_ZALLOCATES == cm_action)
+			TPNOTACID_CHECK(ZALLOCTIMESTR)
+		else
+			TPNOTACID_CHECK(LOCKTIMESTR)
+	}
+	if (!(timer_on = (NO_M_TIMEOUT != timeout)))	/* NOTE assignment */
 		msec_timeout = NO_M_TIMEOUT;
 	else
 	{
@@ -133,6 +185,8 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 		}
 	}
 	lckclr();
+	TREF(mlk_yield_pid) = 0;
+	already_locked = NULL;
 	for (blocked = FALSE;  !blocked;)
 	{	/* if this is a request for a remote node */
 		if (remlkreq)
@@ -147,10 +201,15 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 				break;
 			}
 		}
+		/* If we gave up the fairness algorithm at least once during this invocation of op_lock2(), continue with that until
+		 * the end of op_lock2()
+		 */
 		for (pvt_ptr1 = mlk_pvt_root, locks_done = 0;  locks_done < lks_this_cmd;  pvt_ptr1 = pvt_ptr1->next, locks_done++)
 		{	/* Go thru the list of all locks to be obtained attempting to lock
-			 * each one. If any lock could not be obtained, break out of the loop */
-			if (!mlk_lock(pvt_ptr1, 0, TRUE))
+			 * each one. If any lock could not be obtained, break out of the loop
+			 * If the lock is already obtained, then skip that lock.
+			 */
+			if ((pvt_ptr1 == already_locked) || !mlk_lock(pvt_ptr1, 0, TRUE))
 			{	/* If lock is obtained */
 				pvt_ptr1->granted = TRUE;
 				switch (laflag)
@@ -159,7 +218,13 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 					pvt_ptr1->level = 1;
 					break;
 				case INCREMENTAL:
-					pvt_ptr1->level += pvt_ptr1->translev;
+					if (pvt_ptr1->level < 511) /* The same lock can not be incremented more than 511 times. */
+						pvt_ptr1->level += pvt_ptr1->translev;
+					else
+						level_err(pvt_ptr1);
+					break;
+				case CM_ZALLOCATES:
+					pvt_ptr1->zalloc = TRUE;
 					break;
 				default:
 					GTMASSERT;
@@ -183,7 +248,8 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 			action = LOCKED;
 			break;
 		case INCREMENTAL:
-			action = INCREMENTAL;
+		case CM_ZALLOCATES:
+			action = cm_action;
 			break;
 		default:
 			GTMASSERT;
@@ -196,14 +262,12 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 			mlk_bckout(pvt_ptr2, action);
 		}
 		if (dollar_tlevel && (CDB_STAGNATE <= t_tries))
-		{
-			mlk_unpend(pvt_ptr1);		/* Eliminated the dangling request block */
-			if (timer_on && !out_of_time)
-			{
-				cancel_timer((TID)&timer_on);
-				timer_on = FALSE;
-			}
-			t_retry(cdb_sc_needlock);	/* release crit to prevent a deadlock */
+		{	/* upper TPNOTACID_CHECK conditioned on no short timeout; this one rel_crits to avoid potential deadlock */
+			assert(TREF(tpnotacidtime) >= timeout);
+			if (CM_ZALLOCATES == action)
+				TPNOTACID_CHECK(ZALLOCTIMESTR)
+			else
+				TPNOTACID_CHECK(LOCKTIMESTR)
 		}
 		for (;;)
 		{
@@ -220,14 +284,14 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 						gvcmz_clrlkreq();
 						remlkreq = FALSE;
 					}
-					if (outofband)
+					if (outofband  && !out_of_time)
 					{
-						if (timer_on && !out_of_time)
+						if (timer_on)
 						{
 							cancel_timer((TID)&timer_on);
 							timer_on = FALSE;
 						}
-						if (!out_of_time && (NO_M_TIMEOUT != timeout))
+						if (NO_M_TIMEOUT != timeout)
 						{	/* get remain = end_time - cur_time */
 							sys_get_curr_time(&cur_time);
 							remain_time = sub_abs_time(&end_time, &cur_time);
@@ -242,41 +306,59 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 								timer_on = FALSE;	/* as if LOCK :0 */
 								break;
 							}
-							PUSH_MV_STENT(MVST_ZINTCMD);
-							mv_chain->mv_st_cont.mvs_zintcmd.end_or_remain = remain_time;
-							mv_chain->mv_st_cont.mvs_zintcmd.restart_ctxt_check = restart_ctxt;
-							mv_chain->mv_st_cont.mvs_zintcmd.restart_pc_check = restart_pc;
-							/* save current information from zintcmd_active */
-							mv_chain->mv_st_cont.mvs_zintcmd.restart_ctxt_prior
-								= TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_ctxt_last;
-							mv_chain->mv_st_cont.mvs_zintcmd.restart_pc_prior
-								= TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_pc_last;
-							TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_pc_last = restart_pc;
-							TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_ctxt_last = restart_ctxt;
-							TAREF1(zintcmd_active, ZINTCMD_LOCK).count++;
-							mv_chain->mv_st_cont.mvs_zintcmd.command = ZINTCMD_LOCK;
+							if ((tptimeout != outofband) && (ctrlc != outofband))
+							{
+								PUSH_MV_STENT(MVST_ZINTCMD);
+								mv_chain->mv_st_cont.mvs_zintcmd.end_or_remain = remain_time;
+								mv_chain->mv_st_cont.mvs_zintcmd.restart_ctxt_check = restart_ctxt;
+								mv_chain->mv_st_cont.mvs_zintcmd.restart_pc_check = restart_pc;
+								/* save current information from zintcmd_active */
+								mv_chain->mv_st_cont.mvs_zintcmd.restart_ctxt_prior
+									= TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_ctxt_last;
+								mv_chain->mv_st_cont.mvs_zintcmd.restart_pc_prior
+									= TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_pc_last;
+								TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_pc_last = restart_pc;
+								TAREF1(zintcmd_active, ZINTCMD_LOCK).restart_ctxt_last
+									= restart_ctxt;
+								TAREF1(zintcmd_active, ZINTCMD_LOCK).count++;
+								mv_chain->mv_st_cont.mvs_zintcmd.command = ZINTCMD_LOCK;
+							}
 							outofband_action(FALSE);	/* no return */
-						}
+						} else
+							outofband_action(FALSE);	/* no return */
 					}
 					break;
 				}
 			}
+			/* Sleep first before reattempting a blocked lock. Note: this is used by the lock fairness algorithm
+			 * in mlk_shrblk_find. If mlk_lock is invoked for the second (or higher) time in op_lock2 for the
+			 * same lock resource, "mlk_shrblk_find" assumes a sleep has happened in between two locking attempts.
+			 */
+			hiber_start_wait_any(LOCK_SELF_WAKE);
+			/* Note that "TREF(mlk_yield_pid)" is not initialized here as we want to use any value inherited
+			 * from previous calls to mlk_lock for this lock.
+			 */
 			if (!mlk_lock(pvt_ptr1, 0, FALSE))
 			{	/* If we got the lock, break out of timer loop */
 				blocked = FALSE;
+				if (MLK_FAIRNESS_DISABLED != TREF(mlk_yield_pid))
+					TREF(mlk_yield_pid) = 0; /* Allow yielding for the other locks */
 				if (pvt_ptr1 != mlk_pvt_root)
 				{
 					rel_quant();		/* attempt to get a full timeslice for maximum chance to get all */
 					mlk_unlock(pvt_ptr1);
-				}
+					already_locked = NULL;
+				} else
+					already_locked = pvt_ptr1;
 				break;
 			}
 			if (pvt_ptr1->nodptr)
 				lk_check_own(pvt_ptr1);		/* clear an abandoned owner */
-			hiber_start_wait_any(LOCK_SELF_WAKE);
 		}
 		if (blocked && out_of_time)
 			break;
+		if (locks_bckout)
+			TREF(mlk_yield_pid) = MLK_FAIRNESS_DISABLED; /* Disable fairness to avoid livelocks */
 	}
 	if (remlkreq)
 	{
@@ -304,3 +386,4 @@ int	op_lock2(int4 timeout, unsigned char laflag)	/* timeout is in seconds */
 	mlk_stats.n_user_locks_success++;
 	return (TRUE);
 }
+

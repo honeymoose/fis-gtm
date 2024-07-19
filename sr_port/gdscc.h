@@ -65,6 +65,29 @@
 #define	GDS_WRITE_PLAIN		0
 #define	GDS_WRITE_KILLTN	1
 #define	GDS_WRITE_BLOCK_SPLIT	2
+/* blk_prior_state's last bit indicates whether the block was free before update
+ * BLOCK FREE:          0b*******1, BLOCK NOT FREE:     0b*******0
+ */
+#define BIT_SET_FREE(X)		((X) |= 0x00000001)
+#define BIT_CLEAR_FREE(X)		((X) &= 0xfffffffe)
+#define WAS_FREE(X)		((X) & 0x00000001)
+/* blk_prior_state's last but one bit indicates whether the block was recycled before update
+ * BLOCK RECYCLED:  	0b******1*, BLOCK NOT RECYCLED: 0b******0*
+ */
+#define BIT_SET_RECYCLED_AND_CLEAR_FREE(X)      ((X) = ((X) & 0xfffffffc) + 0x00000002)
+#define BIT_CLEAR_RECYCLED_AND_SET_FREE(X)	((X) = ((X) & 0xfffffffc) + 0x00000001)
+#define BIT_CLEAR_RECYCLED(X)	((X) &= 0xfffffffd)
+#define BIT_SET_RECYCLED(X)	((X) |= 0x00000002)
+#define WAS_RECYCLED(X)		(((X) & 0x00000002))
+/* blk_prior_state's last but two bit indicates whether the block was in directory tree or global variable tree
+ * IN_GV_TREE:         0b*****1**,  IN_DIR_TREE:        0b*****0**
+ */
+#define IN_GV_TREE 4
+#define IN_DIR_TREE 0
+#define BIT_SET_DIR_TREE(X)	((X) &= 0xfffffffb)
+#define BIT_SET_GV_TREE(X)	((X) |= 0x00000004)
+#define KEEP_TREE_STATUS 0x00000004
+
 
 /* macro to traverse to the end of an horizontal cw_set_element list */
 
@@ -189,7 +212,8 @@ typedef struct cw_set_element_struct
 	block_offset	undo_next_off[2];
 	block_offset	undo_offset[2];
 	uint4		blk_checksum;
-	uint4		was_free;
+	/*blk_prior_state:the block was in global variable tree/directory tree and was free/busy before update*/
+	uint4		blk_prior_state;
 } cw_set_element;
 
 #endif

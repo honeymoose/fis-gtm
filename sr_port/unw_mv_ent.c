@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -18,7 +18,7 @@
 #include "gtm_string.h"
 
 #include "lv_val.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "error.h"
 #include "mv_stent.h"
 #include "find_mvstent.h"	/* for zintcmd_active */
@@ -366,7 +366,7 @@ void unw_mv_ent(mv_stent *mv_st_ent)
 					if (NULL != mv_st_ent->mv_st_cont.mvs_zintdev.io_ptr)
 					{	/* This mv_stent has not been processed yet */
 						rm_ptr = (d_rm_struct *)(mv_st_ent->mv_st_cont.mvs_zintdev.io_ptr->dev_sp);
-						assert(rm_ptr->pipe || rm_ptr->fifo);
+						assert(rm_ptr->pipe || rm_ptr->fifo || rm_ptr->follow);
 						rm_ptr->mupintr = FALSE;
 						rm_ptr->pipe_save_state.who_saved = pipewhich_invalid;
 						mv_st_ent->mv_st_cont.mvs_zintdev.buffer_valid = FALSE;
@@ -465,10 +465,18 @@ void unw_mv_ent(mv_stent *mv_st_ent)
 				dollar_ztrap = mv_st_ent->mv_st_cont.mvs_trigr.dollar_ztrap_save;
 				ztrap_explicit_null = mv_st_ent->mv_st_cont.mvs_trigr.ztrap_explicit_null_save;
 			}
-			assert(ctxt >= mv_st_ent->mv_st_cont.mvs_trigr.ctxt_save);
+			CHECKHIGHBOUND(mv_st_ent->mv_st_cont.mvs_trigr.ctxt_save);
+			CHECKLOWBOUND(mv_st_ent->mv_st_cont.mvs_trigr.ctxt_save);
 			ctxt = mv_st_ent->mv_st_cont.mvs_trigr.ctxt_save;
-			assert(((0 == gtm_trigger_depth) && (ch_at_trigger_init == ctxt->ch))
-			       || (0 < gtm_trigger_depth) && (&mdb_condition_handler == ctxt->ch));
+			/* same assert as in gtm_trigger.c */
+			assert(((0 == gtm_trigger_depth)
+				&& (((ch_at_trigger_init == ctxt->ch)
+				     || ((ch_at_trigger_init == (ctxt - 1)->ch)
+					 && ((&gvcst_put_ch == ctxt->ch) || (&gvcst_kill_ch == ctxt->ch))))))
+			       || ((0 < gtm_trigger_depth)
+				   && (((&mdb_condition_handler == ctxt->ch)
+					|| ((&mdb_condition_handler == (ctxt - 1)->ch)
+					    && ((&gvcst_put_ch == ctxt->ch) || (&gvcst_kill_ch == ctxt->ch)))))));
 			active_ch = ctxt;
 			ctxt->ch_active = FALSE;
 			if (tp_timeout_deferred && !((0 < dollar_ecode.index) && (ETRAP_IN_EFFECT))

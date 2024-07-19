@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -77,6 +77,10 @@ typedef int 		int4;		/* 4-byte signed integer */
 typedef unsigned int 	uint4;		/* 4-byte unsigned integer */
 
 #define sssize_t	size_t
+
+/* If ever the following macro (SHMDT) is expanded to a multi-line macro, care should be taken to save the errno immediately after
+ * the "shmdt" system call invocation to avoid errno from being mutated by subsequent system calls.
+ */
 #define SHMDT(X)	shmdt((void *)(X))
 
 /* constant needed for FIFO - OS390 redefines in mdefsp.h */
@@ -84,7 +88,8 @@ typedef unsigned int 	uint4;		/* 4-byte unsigned integer */
 
 #include <inttypes.h>
 #include "mdefsa.h"
-#include "mdefsp.h"
+#include "gtm_common_defs.h"
+#include <mdefsp.h>
 #include "gtm_sizeof.h"
 #include "gtm_threadgbl.h"
 /* Anchor for thread-global structure rather than individual global vars */
@@ -92,9 +97,13 @@ GBLREF void	*gtm_threadgbl;		/* Accessed through TREF macro in gtm_threadgbl.h *
 
 #ifdef DEBUG
 error_def(ERR_ASSERT);
-#define assert(x) ((x) ? 1 : rts_error(VARLSTCNT(7) ERR_ASSERT, 5, LEN_AND_LIT(__FILE__), __LINE__, (SIZEOF(#x) - 1), (#x)))
+# define assert(x) ((x) ? 1 : rts_error_csa(CSA_ARG(NULL) VARLSTCNT(7) ERR_ASSERT, 5, LEN_AND_LIT(__FILE__), __LINE__,		\
+						(SIZEOF(#x) - 1), (#x)))
+# ifdef UNIX
+#  define GTMDBGFLAGS_ENABLED
+# endif
 #else
-#define assert(x)
+# define assert(x)
 #endif
 
 #ifdef GTM64
@@ -123,22 +132,22 @@ error_def(ERR_ASSERT);
 #	define	FD_INVALID_NONPOSIX	 0	/* fd of 0 is invalid in VMS if using RMS sys$open calls (non-posix interface) */
 #endif
 
-/* Now that mdefsp.h is included, GBLDEF should have been #defined. Use it to define STATICDEF for variables
- * and STATICFNDEF, STATICFNDCL for functions. Define STATICDEF to "GBLDEF". This way we know such usages are intended
- * to be "static" but yet can effectively debug these variables since they are externally visible.
- * For functions, do not use the "static" keyword to make them externally visible.
- * Note that a STATICREF for variables does not make sense since statics are supposed to be used only within one module.
- */
-#define	STATICDEF	GBLDEF
-#define	STATICFNDCL	extern
-#define	STATICFNDEF
+#if defined(UNIX)
+#	define	USE_POLL
+#	define	POLL_ONLY(X)	X
+#	define	SELECT_ONLY(X)
+#else
+#	define	USE_SELECT
+#	define	POLL_ONLY(X)
+#	define	SELECT_ONLY(X)	X
+#endif
 
 /* INTPTR_T is an integer that has the same length as a pointer on each platform.  Its basic use is for arithmetic
-   or generic parameters.  For all platforms except Tru64/VMS (alpha platforms), the [U]INTPTR_T types will be
-   equivalenced to [u]intptr_t.  But since this type is used for alignment and other checking, and since Tru64/VMS
-   (implemented as a 32 bit platform) unconditionally sets this type to its 8 char variant, on Tru64/VMS we will
-   explicitly make [U]INTPTR_T a 4 byte creature.
-*/
+ * or generic parameters.  For all platforms except Tru64/VMS (alpha platforms), the [U]INTPTR_T types will be
+ * equivalenced to [u]intptr_t.  But since this type is used for alignment and other checking, and since Tru64/VMS
+ * (implemented as a 32 bit platform) unconditionally sets this type to its 8 char variant, on Tru64/VMS we will
+ * explicitly make [U]INTPTR_T a 4 byte creature.
+ */
 #if !defined(__alpha)
 typedef intptr_t INTPTR_T;
 typedef uintptr_t UINTPTR_T;
@@ -157,8 +166,6 @@ typedef UINTPTR_T uintszofptr_t;
 
 #ifdef GTM64
 #	define USER_STACK_SIZE  8192
-#	define GTM64_ONLY(X)	X
-#	define NON_GTM64_ONLY(X)
 #	define VA_ARG_TYPE long
 #	define VA_ARG_TYPE_BOOL int
 #	define GTM_IS_64BIT		TRUE
@@ -166,8 +173,6 @@ typedef UINTPTR_T uintszofptr_t;
 #	define GTM_BITNESS_OTHER	"32-bit"
 #else
 #       define USER_STACK_SIZE  4096
-#	define GTM64_ONLY(X)
-#	define NON_GTM64_ONLY(X)	X
 #	define VA_ARG_TYPE int
 #	define VA_ARG_TYPE_BOOL int
 #	define GTM_IS_64BIT		FALSE
@@ -205,6 +210,13 @@ typedef UINTPTR_T uintszofptr_t;
 #	define UNALIGNED_ACCESS_SUPPORTED
 #endif
 
+#if defined(__i386) || defined(__x86_64__) || defined(_AIX) || defined (__sun)
+#	define GTM_PTHREAD
+#	define GTM_PTHREAD_ONLY(X) X
+#else
+#	define GTM_PTHREAD_ONLY(X)
+#endif
+
 #if defined(__ia64)
 #	define IA64_ONLY(X)	X
 #	define NON_IA64_ONLY(X)
@@ -219,20 +231,6 @@ typedef UINTPTR_T uintszofptr_t;
 #	define	IA64_DEBUG_ONLY(X)
 #endif/* __ia64 */
 
-#if defined(__ia64) || defined(__MVS__)
-#	define INTCAST(X) ((int)(X))
-#	define UINTCAST(X) ((uint4)(X))
-#	define STRLEN(X) ((int)(strlen(X)))
-#	define USTRLEN(X) ((unsigned int)(strlen(X)))
-#	define OFFSETOF(X,Y) ((int)(offsetof(X,Y)))
-#else
-#	define  INTCAST(X) X
-#	define  UINTCAST(X) X
-#	define 	STRLEN(X) strlen(X)
-#	define 	USTRLEN(X) strlen(X)
-#	define	OFFSETOF(X,Y) offsetof(X,Y)
-#endif
-
 /* macro to check that the OFFSET & SIZE of TYPE1.MEMBER1 is identical to that of TYPE2.MEMBER2 */
 #define	IS_OFFSET_AND_SIZE_MATCH(TYPE1, MEMBER1, TYPE2, MEMBER2)		\
 	(SIZEOF(((TYPE1 *)NULL)->MEMBER1) == SIZEOF(((TYPE2 *)NULL)->MEMBER2))	\
@@ -240,10 +238,6 @@ typedef UINTPTR_T uintszofptr_t;
 
 #define	IS_OFFSET_MATCH(TYPE1, MEMBER1, TYPE2, MEMBER2)	(OFFSETOF(TYPE1, MEMBER1) == OFFSETOF(TYPE2, MEMBER2))
 
-#define	ARRAYSIZE(arr)	SIZEOF(arr)/SIZEOF(arr[0])	/* # of elements defined in the array */
-#define	ARRAYTOP(arr)	(&arr[0] + ARRAYSIZE(arr))	/* address of the TOP of the array (first byte AFTER array limits).
-							 * use &arr[0] + size instead of &arr[size] to avoid compiler warning.
-							 */
 #ifdef __x86_64__
 #define X86_64_ONLY(x)		x
 #define NON_X86_64_ONLY(x)
@@ -302,7 +296,7 @@ typedef struct
 #define MAX_MIDENT_LEN		31	/* Maximum length of an mident/mname */
 typedef mstr		mident;
 typedef struct
-{ /* Although we use 31 chars, the extra byte is to keep things aligned */
+{ /* Although we use 31 chars, the extra byte is to keep things aligned AND to keep a null terminator byte for places that care */
 	char	c[MAX_MIDENT_LEN + 1];
 } mident_fixed;
 #define mid_len(name)		strlen(&(name)->c[0])	/* callers of mid_len should include gtm_string.h as well */
@@ -380,15 +374,6 @@ typedef long		ulimit_t;	/* NOT int4; the Unix ulimit function returns a value of
 #define MV_BIAS_PWR	 3
 
 #define NR_REG		16
-#ifndef TRUE
-#	define TRUE		 1
-#endif
-#ifndef FALSE
-#	define FALSE		 0
-#endif
-#ifndef NULL
-#	define NULL		((void *) 0)
-#endif
 #define NUL		 0x00
 #define SP		 0x20
 #define DEL		 0x7f
@@ -403,9 +388,19 @@ typedef long		ulimit_t;	/* NOT int4; the Unix ulimit function returns a value of
 #define MAX_NUM_SIZE			64
 #define MAX_FORM_NUM_SUBLEN		128	/* this is enough to hold the largest numeric subscript */
 #define PERIODIC_FLUSH_CHECK_INTERVAL	(30 * 1000)
-#define MAX_ARGS			256 /* in formallist */
 
-#define MAX_KEY_SZ	255		/* maximum database key size */
+#ifndef __sparc
+# define MAX_ARGS			256 /* in formallist */
+#else	/* Sparc super frame has room for 256 args, but functions or concatenate are limited to somewhat fewer */
+# define MAX_ARGS			242
+#endif
+
+#ifdef UNIX
+# define MAX_KEY_SZ	1023		/* maximum database key size */
+#else
+# define MAX_KEY_SZ	255
+#endif
+# define OLD_MAX_KEY_SZ	255		/* For V5 and earlier, when only 1 byte was used for compression count */
 /* The macro ZWR_EXP_RATIO returns the inflated length when converting the internal subscript
  * representation (byte) length to ZWR representation.
  * In "M" mode,
@@ -444,6 +439,7 @@ GBLREF	boolean_t		gtm_utf8_mode;
 unsigned char *n2s(mval *mv_ptr);
 char *s2n(mval *u);
 mval *underr (mval *start, ...);
+mval *underr_strict(mval *start, ...);
 
 #ifdef DEBUG
 #	define	DBG_ASSERT(X)	assert(X),
@@ -464,9 +460,9 @@ mval *underr (mval *start, ...);
 #define MV_FORCE_MVAL(M,I)	(((I) >= 1000000 || (I) <= -1000000) ? i2mval((M),(int)(I)) : \
 				(void)( (M)->mvtype = MV_NM | MV_INT , (M)->m[1] = (int)(I)*MV_BIAS ))
 #ifdef GTM64
-#define MV_FORCE_ULMVAL(M,L)	(((L) >= 1000000) ? ul2mval((M),(unsigned long)(L)) : \
+#define MV_FORCE_ULMVAL(M,L)	(((L) >= 1000000) ? ui82mval((M),(gtm_uint64_t)(L)) : \
 				(void)( (M)->mvtype = MV_NM | MV_INT , (M)->m[1] = (int)(L)*MV_BIAS ))
-#define MV_FORCE_LMVAL(M,L)	(((L) >= 1000000 || (L) <= -1000000) ? l2mval((M),(long)(L)) : \
+#define MV_FORCE_LMVAL(M,L)	(((L) >= 1000000 || (L) <= -1000000) ? i82mval((M),(gtm_int64_t)(L)) : \
 				(void)( (M)->mvtype = MV_NM | MV_INT , (M)->m[1] = (int)(L)*MV_BIAS ))
 #else
 #define MV_FORCE_ULMVAL		MV_FORCE_UMVAL
@@ -554,11 +550,6 @@ mval *underr (mval *start, ...);
 #define DISK_BLOCK_SIZE		512
 #define LOG2_DISK_BLOCK_SIZE	9
 
-#define DIVIDE_ROUND_UP(VALUE, MODULUS)		(((VALUE) + ((MODULUS) - 1)) / (MODULUS))
-#define DIVIDE_ROUND_DOWN(VALUE, MODULUS)	((VALUE) / (MODULUS))
-#define ROUND_UP(VALUE, MODULUS)		(DIVIDE_ROUND_UP(VALUE, MODULUS) * (MODULUS))
-#define ROUND_DOWN(VALUE, MODULUS)		(DIVIDE_ROUND_DOWN(VALUE, MODULUS) * (MODULUS))
-
 #ifdef DEBUG
 #  define CHECKPOT(MODULUS)			((MODULUS) & ((MODULUS) - 1)) ? GTMASSERT, 0 :
 #  define BREAK_IN_PRO__CONTINUE_IN_DBG		continue
@@ -602,9 +593,26 @@ int gtm_assert2(int condlen, char *condtext, int file_name_len, char file_name[]
 #define GTMASSERT	(gtm_assert(CALLFROM))
 #define assertpro(x) ((x) ? 1 : gtm_assert2((SIZEOF(#x) - 1), (#x), CALLFROM))
 #ifdef UNIX
-int rts_error(int argcnt, ...);
-void dec_err(uint4 argcnt, ...);
+#ifdef DEBUG
+/* The below debug only macros are always used in pairs to indicate a window where the code doesn't expect rts_errors to happen.
+ * One reason why the code doesn't expect rts_errors is if the logic is complicated enough that having a condition handler for
+ * the window is tricky and will not undo the state of various global variables that were modified. An example of such a window
+ * is in gvcst_init. If an rts_error happens in this window, an assert will trip in rts_error at which point, the window as well
+ * as the rts_error can be re-examined to see whether the rts_error can be removed or the range of the window can be changed.
+ */
+#define	DBG_MARK_RTS_ERROR_USABLE	{ assert(TREF(rts_error_unusable)); TREF(rts_error_unusable) = FALSE; }
+#define	DBG_MARK_RTS_ERROR_UNUSABLE	{ assert(!TREF(rts_error_unusable)); TREF(rts_error_unusable) = TRUE; }
+#else
+#define	DBG_MARK_RTS_ERROR_USABLE
+#define	DBG_MARK_RTS_ERROR_UNUSABLE
+#endif
+int	rts_error(int argcnt, ...);
+int	rts_error_csa(void *csa, int argcnt, ...);		/* Use CSA_ARG(CSA) for portability */
+#define CSA_ARG(CSA)	(CSA),
+void	dec_err(uint4 argcnt, ...);
 #elif defined(VMS)
+#define rts_error_csa	rts_error
+#define CSA_ARG(CSA)	/* no csa arg on VMS */
 void dec_err(int4 msgnum, ...);
 #else
 #error unsupported platform
@@ -621,63 +629,11 @@ int4 timeout2msec(int4 timeout);
 #define	RTS_ERROR_LITERAL(LITERAL)	LENGTH_AND_LITERAL(LITERAL)
 #define	RTS_ERROR_STRING(STRING)	LENGTH_AND_STRING(STRING)
 
-/* the LITERAL version of the macro should be used over STRING whenever possible for efficiency reasons */
-#define	STR_LIT_LEN(LITERAL)		(SIZEOF(LITERAL) - 1)
-#define	LITERAL_AND_LENGTH(LITERAL)	(LITERAL), (SIZEOF(LITERAL) - 1)
-#define	LENGTH_AND_LITERAL(LITERAL)	(SIZEOF(LITERAL) - 1), (LITERAL)
-#define	STRING_AND_LENGTH(STRING)	(STRING), (STRLEN((char *)(STRING)))
-#define	LENGTH_AND_STRING(STRING)	(strlen((char *)(STRING))), (STRING)
-
-#define	LEN_AND_LIT(LITERAL)		LENGTH_AND_LITERAL(LITERAL)
-#define	LIT_AND_LEN(LITERAL)		LITERAL_AND_LENGTH(LITERAL)
-#define	STR_AND_LEN(STRING)		STRING_AND_LENGTH(STRING)
-#define	LEN_AND_STR(STRING)		LENGTH_AND_STRING(STRING)
-
-#define	MEMCMP_LIT(SOURCE, LITERAL)	memcmp(SOURCE, LITERAL, SIZEOF(LITERAL) - 1)
-#define MEMCPY_LIT(TARGET, LITERAL)	memcpy(TARGET, LITERAL, SIZEOF(LITERAL) - 1)
-
 #define	SET_PROCESS_EXITING_TRUE				\
 {								\
 	GBLREF	int		process_exiting;		\
 								\
 	process_exiting = TRUE;					\
-}
-
-/* Macro to copy a source string to a malloced area that is set to the destination pointer.
- * Since it is possible that DST might have multiple pointer dereferences in its usage, we
- * use a local pointer variable and finally assign it to DST thereby avoiding duplication of
- * those pointer dereferences (one for the malloc and one for the strcpy).
- * There are two macros depending on whether a string or literal is passed.
- */
-#define	MALLOC_CPY_STR(DST, SRC)		\
-{						\
-	char	*mcs_ptr;			\
-	int	mcs_len;			\
-						\
-	mcs_len = STRLEN(SRC) + 1;		\
-	mcs_ptr = malloc(mcs_len);		\
-	memcpy(mcs_ptr, SRC, mcs_len);		\
-	DST = mcs_ptr;				\
-}
-
-#define	MALLOC_CPY_LIT(DST, SRC)		\
-{						\
-	char	*mcs_ptr;			\
-	int	mcs_len;			\
-						\
-	mcs_len = SIZEOF(SRC);			\
-	mcs_ptr = malloc(mcs_len);		\
-	memcpy(mcs_ptr, SRC, mcs_len);		\
-	DST = mcs_ptr;				\
-}
-
-#define MALLOC_INIT(DST, SIZ)			\
-{						\
-	void	*lcl_ptr;			\
-						\
-	lcl_ptr = malloc(SIZ);			\
-	memset(lcl_ptr, 0, SIZ);		\
-	DST = lcl_ptr;				\
 }
 
 /* *********************************************************************************************************** */
@@ -711,67 +667,12 @@ int m_usleep(int useconds);
 #	define SHORT_SLEEP(x) hiber_start(x);
 #endif
 
-/* The following "MSYNC" defines are for the MM access method
- *    NO_MSYNC		-- minimum number of msyncs -- only in run down
- *    UNTARGETED_MSYNC	-- msync the entire file
- *    TARGETED_MSYNC	-- keep track of changed buffers and only msync them
- *    REGULAR_MSYNC	-- do regular file I/O on the mapped file (ignoring the fact it is mapped)
- *
- * If none of the MSYNCs are explicitly defined, the ifdef and elif defined sequence will fall through
- * to the else case, defining NO_MSYNC as the default.
- */
 #ifdef UNIX
 #	define UNIX_ONLY(X)		X
 #	define UNIX_ONLY_COMMA(X)	X,
-#	if defined UNTARGETED_MSYNC
-#		define UNTARGETED_MSYNC_ONLY(X)		X
-#		define NON_UNTARGETED_MSYNC_ONLY(X)
-#		define TARGETED_MSYNC_ONLY(X)
-#		define NON_TARGETED_MSYNC_ONLY(X)	X
-#		define REGULAR_MSYNC_ONLY(X)
-#		define NON_REGULAR_MSYNC_ONLY(X)	X
-#		define NO_MSYNC_ONLY(X)
-#		define NON_NO_MSYNC_ONLY(X)
-#	elif defined TARGETED_MSYNC
-#		define UNTARGETED_MSYNC_ONLY(X)
-#		define NON_UNTARGETED_MSYNC_ONLY(X)	X
-#		define TARGETED_MSYNC_ONLY(X)		X
-#		define NON_TARGETED_MSYNC_ONLY(X)
-#		define REGULAR_MSYNC_ONLY(X)
-#		define NON_REGULAR_MSYNC_ONLY(X)	X
-#		define NO_MSYNC_ONLY(X)
-#		define NON_NO_MSYNC_ONLY(X)
-#	elif defined REGULAR_MSYNC
-#		define UNTARGETED_MSYNC_ONLY(X)
-#		define NON_UNTARGETED_MSYNC_ONLY(X)	X
-#		define TARGETED_MSYNC_ONLY(X)
-#		define NON_TARGETED_MSYNC_ONLY(X)	X
-#		define REGULAR_MSYNC_ONLY(X)		X
-#		define NON_REGULAR_MSYNC_ONLY(X)
-#		define NO_MSYNC_ONLY(X)
-#		define NON_NO_MSYNC_ONLY(X)
-#	else
-#		define NO_MSYNC
-#		define UNTARGETED_MSYNC_ONLY(X)
-#		define NON_UNTARGETED_MSYNC_ONLY(X)
-#		define TARGETED_MSYNC_ONLY(X)
-#		define NON_TARGETED_MSYNC_ONLY(X)
-#		define REGULAR_MSYNC_ONLY(X)
-#		define NON_REGULAR_MSYNC_ONLY(X)
-#		define NO_MSYNC_ONLY(X)			X
-#		define NON_NO_MSYNC_ONLY(X)
-#	endif
 #else
 #	define UNIX_ONLY(X)
 #	define UNIX_ONLY_COMMA(X)
-#	define UNTARGETED_MSYNC_ONLY(X)
-#	define TARGETED_MSYNC_ONLY(X)
-#	define REGULAR_MSYNC_ONLY(X)
-#	define NON_UNTARGETED_MSYNC_ONLY(X)
-#	define NON_TARGETED_MSYNC_ONLY(X)
-#	define NON_REGULAR_MSYNC_ONLY(X)
-#	define NO_MSYNC_ONLY(X)
-#	define NON_NO_MSYNC_ONLY(X)
 #endif
 
 /* HP-UX on PA-RISC and z/OS are not able to have dynamic file extensions while running in MM access mode
@@ -891,6 +792,24 @@ typedef struct
 #define GLOBAL_LATCH_HELD_BY_US(latch) (process_id == (latch)->u.parts.latch_pid \
 					VMS_ONLY(&& image_count == (latch)->u.parts.latch_image_count))
 
+typedef struct compswap_time_field_struct
+{	/* This structure is used where we want to do a compare-n-swap (CAS) on a time value. The CAS interfaces
+	 * need an instance of global_latch_t to operate on. We will utilize the "latch_pid" field to hold the
+	 * time and the latch_word is unused except on VMS where it will hold 0. Since this structure must be of
+	 * a constant size (size of global_latch_t varies), pad the latch with sufficient space to match the
+	 * size of global_latch_t's largest size (on HPUX).
+	 */
+global_latch_t	time_latch;
+#ifndef __hppa
+int4		hp_latch_space[4];	/* padding only on non-hpux systems */
+#endif
+} compswap_time_field;
+/* takes value of time() but needs to be 4 byte so can use compswap on it. Not using time_t, as that is an indeterminate size on
+ * various platforms. Value is time (in seconds) in a compare/swap updated field so only one process performs a given task in a
+ * given interval
+ */
+#define cas_time time_latch.u.parts.latch_pid
+
 typedef	union gtm_time8_struct
 {
 	time_t	ctime;		/* For current GTM code sem_ctime field corresponds to creation time */
@@ -911,7 +830,7 @@ typedef struct
 	sm_off_t bl; /* backward link - relative offset from beginning of this element to previous element in queue */
 	global_latch_t	latch;	/* required for platforms without atomic operations to modify both fl and bl concurrently;
 				 * unused on platforms with such instructions. */
-} que_head, cache_que_head, mmblk_que_head;
+} que_head, cache_que_head;
 
 #define	IS_PTR_ALIGNED(ptr, ptr_base, elemSize)					\
 	(0 == ((((sm_uc_ptr_t)(ptr)) - ((sm_uc_ptr_t)(ptr_base))) % elemSize))
@@ -1276,11 +1195,11 @@ typedef INTPTR_T  ptroff_t;
 #  define CACHELINE_PAD_COND(fieldSize, fillnum)
 #endif
 
-#define MEMCP(dst,src,start,count,limit){ \
-	if (start+count > limit) \
-		rts_error(VARLSTCNT(1) ERR_CPBEYALLOC); \
-	else	\
-		memcpy(dst+start,src,count); \
+#define MEMCP(dst,src,start,count,limit){					\
+	if (start+count > limit)						\
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_CPBEYALLOC);	\
+	else									\
+		memcpy(dst+start,src,count);					\
 }
 
 #ifndef USING_ICONV
@@ -1321,7 +1240,8 @@ uchar_ptr_t i2asc(uchar_ptr_t p, unsigned int n);
 /* ascii conversion functions */
 int4 asc2i(uchar_ptr_t p, int4 len);
 qw_num asc2l(uchar_ptr_t p, int4 len);
-unsigned int asc_hex2i(char *p, int len);
+unsigned int asc_hex2i(uchar_ptr_t p, int len);
+gtm_uint64_t asc_hex2l(uchar_ptr_t p, int len);
 
 /* This macro converts an integer to a decimal string (a more efficient alternative to i2asc).
  * It is used by format2zwr() which is called a lot during MUPIP EXTRACT (which can be time-consuming
@@ -1389,7 +1309,7 @@ int val_iscan(mval *v);
 void mcfree(void);
 int4 getprime(int4 n);
 void push_parm(UNIX_ONLY_COMMA(unsigned int totalcnt) int truth_value, ...);
-void suspend(void);
+UNIX_ONLY(void suspend(int sig);)
 mval *push_mval(mval *arg1);
 void mval_lex(mval *v, mstr *output);
 
@@ -1829,5 +1749,43 @@ enum
 #define	MAX_ACTUALS	32	/* Maximum number of arguments allowed in an actuallist. This value also determines
 				 * how many parameters are allowed to be passed between M and C.
 				 */
+#if defined(DEBUG) && defined(UNIX)
+#define OPERATOR_LOG_MSG												\
+{															\
+	error_def(ERR_TEXT);	/* BYPASSOK */										\
+	if (gtm_white_box_test_case_enabled && (WBTEST_OPER_LOG_MSG == gtm_white_box_test_case_number))			\
+	{														\
+		send_msg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_TEXT, 2, LEN_AND_LIT("Send message to operator log"));	\
+	}														\
+}
+#else
+#define OPERATOR_LOG_MSG
+#endif
+
+#ifdef GTM_PTHREAD
+/* If we detect a case when the signal came to a thread other than the main GT.M thread, this macro will redirect the signal to the
+ * main thread if such is defined. Such scenarios is possible, for instance, if we are running along a JVM, which, upon receiving a
+ * signal, dispatches a new thread to invoke signal handlers other than its own. The ptrhead_kill() enables us to target the signal
+ * to a specific thread rather than rethrow it to the whole process.
+ */
+#define FORWARD_SIG_TO_MAIN_THREAD_IF_NEEDED(SIG)								\
+{														\
+	GBLREF pthread_t	gtm_main_thread_id;								\
+	GBLREF boolean_t	gtm_main_thread_id_set;								\
+														\
+	if (gtm_main_thread_id_set && !pthread_equal(gtm_main_thread_id, pthread_self()))			\
+	{	/* Only redirect the signal if the main thread ID has been defined, and we are not that. */	\
+		pthread_kill(gtm_main_thread_id, SIG);								\
+		return;												\
+	}													\
+}
+#else
+#define FORWARD_SIG_TO_MAIN_THREAD_IF_NEEDED(SIG)
+#endif
+
+#ifdef DEBUG
+# define MVAL_IN_RANGE(V, START, END)	(((char *)(V) >= (char *)(START))					\
+				      && ((char *)(V) < ((char *)(START) + (INTPTR_T)(END) * SIZEOF(mval))))
+#endif
 
 #endif /* MDEF_included */

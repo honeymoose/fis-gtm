@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -27,11 +27,6 @@
 */
 
 #include "hashtab_mname.h"
-
-typedef struct saved_for_indx_array_struct
-{
-	mval	*saved_for_indx[1];
-} saved_for_indx;
 
 typedef struct stack_frame_struct	/* contents of the GT.M MUMPS stack frame */
 {
@@ -76,7 +71,8 @@ typedef struct stack_frame_struct	/* contents of the GT.M MUMPS stack frame */
 	unsigned short	type;
 	unsigned char	flags;
 	bool		dollar_test;
-	saved_for_indx	*for_ctrl_stack;	/* anchor for array of FOR control variable indices */
+	/*uint4		glvn_indx;*/	/* state of glvn pool at frame creation time. For use when gtmpcat is changed. */
+	unsigned char	*for_ctrl_stack;/* NOTE: temporarily using this field for glvn_indx so that gtmpcat works */
 	mval		*ret_value;
 } stack_frame;
 
@@ -91,6 +87,8 @@ typedef struct stack_frame_struct	/* contents of the GT.M MUMPS stack frame */
 #define SFT_ZSTEP_ACT	(1 << 7)	/* 0x0080 action frame for a zstep */
 #define SFT_ZINTR	(1 << 8)	/* 0x0100 $zinterrupt frame */
 #define SFT_TRIGR	(1 << 9)	/* 0x0200 Trigger base frame */
+
+#define SFT_ZINTR_OFF	~(SFT_ZINTR)	/* Mask to turn off SFF_ZINTR */
 
 /* The following definition identifies a frame that is running a line of code - either in a routine or what amounts to an XECUTE
  * it excludes frames dealing with @ indirection and frames generated for various nefarious internal purposes.
@@ -108,17 +106,18 @@ typedef struct stack_frame_struct	/* contents of the GT.M MUMPS stack frame */
 					 *      cause the getframe macro to invoke error_return() for further error processing.
 					 */
 #define SFF_UNW_SYMVAL	(1 << 5)	/* 0x20 Unwound a symval in this stackframe (relevant to tp_restart) */
-#define SFF_TRIGR_CALLD	(1 << 6)	/* 0x40 This frame initiated a trigger call - checked by MUM_TSTART to prevent error
-					 *	returns to the frame which would cause a restart of error handling.
-					 */
+#define SFF_IMPLTSTART_CALLD	(1 << 6)	/* 0x40 This frame initiated a trigger call or spanning node transaction
+						 * 	- checked by MUM_TSTART to prevent error returns to the frame
+						 * 	which would cause a restart of error handling.
+						 */
 
-#define SFF_INDCE_OFF   	~(SFF_INDCE)		/* Mask to turn off SFF_INDCE */
-#define SFF_ZTRAP_ERR_OFF	~(SFF_ZTRAP_ERR)	/* Mask to turn off SFF_ZTRAP_ERR */
-#define SFF_DEV_ACT_ERR_OFF	~(SFF_DEV_ACT_ERR)	/* Mask to turn off SFF_DEV_ACT_ERR */
-#define SFF_CI_OFF		~(SFF_CI)		/* Mask to turn off SFF_CI */
-#define SFF_ETRAP_ERR_OFF	~(SFF_ETRAP_ERR)	/* Mask to turn off SFF_ETRAP_ERR */
-#define SFF_UNW_SYMVAL_OFF	~(SFF_UNW_SYMVAL)	/* Mask to turn off SFF_UNW_SYMVAL */
-#define SFF_TRIGR_CALLD_OFF	~(SFF_TRIGR_CALLD)	/* Mask to turn off SFF_TRIGR_CALLD */
+#define SFF_INDCE_OFF   		~(SFF_INDCE)		/* Mask to turn off SFF_INDCE */
+#define SFF_ZTRAP_ERR_OFF		~(SFF_ZTRAP_ERR)	/* Mask to turn off SFF_ZTRAP_ERR */
+#define SFF_DEV_ACT_ERR_OFF		~(SFF_DEV_ACT_ERR)	/* Mask to turn off SFF_DEV_ACT_ERR */
+#define SFF_CI_OFF			~(SFF_CI)		/* Mask to turn off SFF_CI */
+#define SFF_ETRAP_ERR_OFF		~(SFF_ETRAP_ERR)	/* Mask to turn off SFF_ETRAP_ERR */
+#define SFF_UNW_SYMVAL_OFF		~(SFF_UNW_SYMVAL)	/* Mask to turn off SFF_UNW_SYMVAL */
+#define SFF_IMPLTSTART_CALLD_OFF	~(SFF_IMPLTSTART_CALLD)	/* Mask to turn off SFF_IMPLTSTART_CALLD */
 
 #define	ADJUST_FRAME_POINTER(fptr, shift)			\
 {								\
@@ -132,50 +131,6 @@ typedef struct stack_frame_struct	/* contents of the GT.M MUMPS stack frame */
 		assert(error_frame >= frame_pointer);		\
 		error_frame = fptr;				\
 	}							\
-}
-
-/* the following macro ensures there's an array of FOR pointers and frees any old entry that's about to get overlaid */
-#define MANAGE_FOR_INDX(FPTR, LEVEL, NEW_INDX)									\
-{														\
-	assert(NULL != NEW_INDX);										\
-	if (NULL == FPTR->for_ctrl_stack)									\
-	{													\
-		FPTR->for_ctrl_stack = (saved_for_indx *)malloc(SIZEOF(mval *) * MAX_FOR_STACK);		\
-		memset(FPTR->for_ctrl_stack, 0, SIZEOF(mval *) * MAX_FOR_STACK);				\
-	} else													\
-		FREE_INDX_AND_CLR_SIBS(FPTR, LEVEL, NEW_INDX);							\
-	assert(NULL == FPTR->for_ctrl_stack->saved_for_indx[LEVEL]);						\
-	FPTR->for_ctrl_stack->saved_for_indx[LEVEL] = NEW_INDX;							\
-}
-
-/* the following macro runs the FOR pointer array, freeing anything it finds before freeing the array
- * in theory it could work down the array, but since the above macro needs FREE_INDX_AND_CLR_SIBS to work up, this does too
- */
-#define	FREE_SAVED_FOR_INDX(FPTR)								\
-{												\
-	uint4 Level;										\
-												\
-	assert(NULL != FPTR->for_ctrl_stack);							\
-	for (Level = 1; Level < MAX_FOR_STACK; Level++)	/* level 0 never holds a pointer */	\
-		FREE_INDX_AND_CLR_SIBS(FPTR, Level, NULL);					\
-	free((char *)FPTR->for_ctrl_stack);							\
-}
-
-/* the following macro, currentl only used by the above 2 macros,
- * deals with the possibility of the same control variable at multiple nesting levels and clears higher nesting levels
- */
-#define	FREE_INDX_AND_CLR_SIBS(FPTR, LEVEL, NEW_INDX)									\
-{															\
-	uint4	Lvl;													\
-	mval	*Ptr;													\
-															\
-	if (NULL != (Ptr = FPTR->for_ctrl_stack->saved_for_indx[LEVEL])) /* NOTE assignment */				\
-	{														\
-		free((char *)Ptr);											\
-		for (Lvl = 1; Lvl < MAX_FOR_STACK; Lvl++)	/* level 0 never holds a pointer */			\
-			if (Ptr == FPTR->for_ctrl_stack->saved_for_indx[Lvl])						\
-				FPTR->for_ctrl_stack->saved_for_indx[Lvl] = (mval *)(Lvl < LEVEL ? NEW_INDX : NULL);	\
-	}														\
 }
 
 void new_stack_frame(rhdtyp *rtn_base, unsigned char *context, unsigned char *transfer_addr);

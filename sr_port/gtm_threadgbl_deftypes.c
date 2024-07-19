@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2010, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2010, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -39,7 +39,7 @@
 #include "hashtab_str.h"
 #include "hashtab_objcode.h"
 #include "error.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "gdsroot.h"
 #include "gdskill.h"
 #include "ccp.h"
@@ -95,6 +95,8 @@
 #include "zroutines.h"
 #include "trace_table.h"
 #include "parm_pool.h"
+#include "util.h"		/* for util_outbuff manipulations */
+#include "nametabtyp.h"
 
 /* FOR REPLICATION RELATED GLOBALS */
 #include "repl_msg.h"
@@ -110,7 +112,7 @@
 # include "cli.h"
 # include "invocation_mode.h"
 # include "fgncal.h"
-# include "parse_file.h"		/* for MAX_FBUFF */
+# include "parse_file.h"	/* for MAX_FBUFF */
 # include "repl_sem.h"
 # include "gtm_zlib.h"
 # include "zro_shlibs.h"

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2004, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2004, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -46,13 +46,31 @@
 #include "jnl.h"
 #include "replgbl.h"
 #include "gtm_semutils.h"
+#ifdef __linux__
+#include "hugetlbfs_overrides.h"
+#endif
 
 #define	DEFAULT_NON_BLOCKED_WRITE_RETRIES	10	/* default number of retries */
 #ifdef __MVS__
 #  define PUTENV_BPXK_MDUMP_PREFIX 		"_BPXK_MDUMP="
 #endif
-
+#ifdef DEBUG
+/* Note the var below is NOT located in gtm_logicals because it is DEBUG-only which would screw-up
+ * regresion test v53003/D9I10002703.
+ */
+# define GTM_USESECSHR				"$gtm_usesecshr"
+/* GTM_TEST_FAKE_ENOSPC is used only in debug code so it does not have to go in gtm_logicals.h */
+# define GTM_TEST_FAKE_ENOSPC			"$gtm_test_fake_enospc"
+#endif
 #define DEFAULT_MUPIP_TRIGGER_ETRAP 		"IF $ZJOBEXAM()"
+
+/* Only for this function, define MAX_TRANS_NAME_LEN to be equal to GTM_PATH_MAX as some of the environment variables can indicate
+ * path to files which is limited by GTM_PATH_MAX.
+ */
+#ifdef MAX_TRANS_NAME_LEN
+#undef MAX_TRANS_NAME_LEN
+#endif
+#define MAX_TRANS_NAME_LEN			GTM_PATH_MAX
 
 GBLREF	int4			gtm_shmflags;			/* Shared memory flags for shmat() */
 GBLREF	uint4			gtm_principal_editing_defaults;	/* ext_cap flags if tt */
@@ -63,6 +81,8 @@ GBLREF	boolean_t		gtm_quiet_halt;
 GBLREF	int			gtm_non_blocked_write_retries;	/* number for retries for non_blocked write to pipe */
 GBLREF	char			*gtm_core_file;
 GBLREF	char			*gtm_core_putenv;
+GBLREF	mval			dollar_etrap;
+GBLREF	mval			dollar_ztrap;
 ZOS_ONLY(GBLREF	char		*gtm_utf8_locale_object;)
 ZOS_ONLY(GBLREF	boolean_t	gtm_tag_utf8_as_ascii;)
 GTMTRIG_ONLY(GBLREF	mval	gtm_trigger_etrap;)
@@ -75,17 +95,19 @@ LITDEF mval default_mupip_trigger_etrap = DEFINE_MVAL_LITERAL(MV_STR, 0 , 0 , (S
 static readonly nametabent editing_params[] =
 {
 	{7, "EDITING"},
+	{7, "EMPTERM"},
 	{6, "INSERT"},
 	{9, "NOEDITING"},
+	{9, "NOEMPTERM"},
 	{8, "NOINSERT"}
 };
-
 static readonly unsigned char editing_index[27] =
 {
-	0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
-	2, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-	4, 4, 4
+	0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 3,
+	3, 3, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+	6, 6, 6
 };
+static readonly unsigned char init_break[1] = {'B'};
 
 void	gtm_env_init_sp(void)
 {	/* Unix only environment initializations */
@@ -98,6 +120,9 @@ void	gtm_env_init_sp(void)
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
+#	ifdef HUGETLB_SUPPORTED
+	libhugetlbfs_init();
+#	endif
 #	ifdef __MVS__
 	/* For now OS/390 only. Eventually, this will be added to all UNIX platforms along with the
 	 * capability to specify the desired directory to put a core file in.
@@ -174,13 +199,19 @@ void	gtm_env_init_sp(void)
 				case 0:	/* EDITING */
 					gtm_principal_editing_defaults |= TT_EDITING;
 					break;
-				case 1:	/* INSERT */
+				case 1:	/* EMPTERM */
+					gtm_principal_editing_defaults |= TT_EMPTERM;
+					break;
+				case 2:	/* INSERT */
 					gtm_principal_editing_defaults &= ~TT_NOINSERT;
 					break;
-				case 2:	/* NOEDITING */
+				case 3:	/* NOEDITING */
 					gtm_principal_editing_defaults &= ~TT_EDITING;
 					break;
-				case 3:	/* NOINSERT */
+				case 4:	/* NOEMPTERM */
+					gtm_principal_editing_defaults &= ~TT_EMPTERM;
+					break;
+				case 5:	/* NOINSERT */
 					gtm_principal_editing_defaults |= TT_NOINSERT;
 					break;
 				}
@@ -261,4 +292,62 @@ void	gtm_env_init_sp(void)
 		TREF(dbinit_max_hrtbt_delta) = (ROUND_UP2(hrtbt_cntr_delta, 8)) / 8;
 	else
 		TREF(dbinit_max_hrtbt_delta) = hrtbt_cntr_delta;
+	/* Initialize variable that controls the location of GT.M custom errors file (used for anticipatory freeze) */
+	val.addr = GTM_CUSTOM_ERRORS;
+	val.len = SIZEOF(GTM_CUSTOM_ERRORS) - 1;
+	if (SS_NORMAL == (status = TRANS_LOG_NAME(&val, &trans, buf, SIZEOF(buf), do_sendmsg_on_log2long)))
+	{
+		assert(GTM_PATH_MAX > trans.len);
+		(TREF(gtm_custom_errors)).addr = malloc(trans.len + 1); /* +1 for '\0'; This memory is never freed */
+		(TREF(gtm_custom_errors)).len = trans.len;
+		/* For now, we assume that if the environment variable is defined to NULL, anticipatory freeze is NOT in effect */
+		if (0 < trans.len)
+		{
+			memcpy((TREF(gtm_custom_errors)).addr, buf, trans.len);
+			((TREF(gtm_custom_errors)).addr)[trans.len] = '\0';
+		}
+	}
+	/* Initialize which ever error trap we are using (ignored in the utilities except the update process) */
+	val.addr = GTM_ETRAP;
+	val.len = SIZEOF(GTM_ETRAP) - 1;
+	if (SS_NORMAL == (status = TRANS_LOG_NAME(&val, &trans, buf, SIZEOF(buf), do_sendmsg_on_log2long)))
+	{
+		if (MAX_SRCLINE >= trans.len)
+		{	/* Only set $ETRAP if the length is usable (may be NULL) */
+			dollar_etrap.str.addr = malloc(trans.len + 1); /* +1 for '\0'; This memory is never freed */
+			memcpy(dollar_etrap.str.addr, trans.addr, trans.len);
+			*(dollar_etrap.str.addr + trans.len + 1) = '\0';
+			dollar_etrap.str.len = trans.len;
+			dollar_etrap.mvtype = MV_STR;
+		}
+	} else if (0 == dollar_etrap.mvtype)
+	{	/* If didn't setup $ETRAP, set default $ZTRAP instead */
+		dollar_ztrap.mvtype = MV_STR;
+		dollar_ztrap.str.len = SIZEOF(init_break);
+		dollar_ztrap.str.addr = (char *)init_break;
+	}
+#	ifdef DEBUG
+	/* DEBUG-only option to bypass 'easy' methods of things and always use gtmsecshr for IPC cleanups, wakeups, file removal,
+	 * etc. Basically use gtmsecshr for anything where it is an option - helps with testing gtmsecshr for proper operation.
+	 */
+	val.addr = GTM_USESECSHR;
+	val.len = SIZEOF(GTM_USESECSHR) - 1;
+	TREF(gtm_usesecshr) = logical_truth_value(&val, FALSE, &is_defined);
+	if (!is_defined)
+		TREF(gtm_usesecshr) = FALSE;
+	/* DEBUG-only option to enable/disable anticipatory freeze fake ENOSPC testing */
+	val.addr = GTM_TEST_FAKE_ENOSPC;
+	val.len = SIZEOF(GTM_TEST_FAKE_ENOSPC) - 1;
+	TREF(gtm_test_fake_enospc) = logical_truth_value(&val, FALSE, &is_defined);
+	if (!is_defined)
+		TREF(gtm_test_fake_enospc) = FALSE;
+#	endif
+#	ifdef GTMDBGFLAGS_ENABLED
+	val.addr = GTMDBGFLAGS;
+	val.len = SIZEOF(GTMDBGFLAGS) - 1;
+	TREF(gtmdbgflags) = trans_numeric(&val, &is_defined, TRUE);
+	val.addr = GTMDBGFLAGS_FREQ;
+	val.len = SIZEOF(GTMDBGFLAGS_FREQ) - 1;
+	TREF(gtmdbgflags_freq) = trans_numeric(&val, &is_defined, TRUE);
+#	endif
 }

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -33,9 +33,6 @@ GBLREF bool 			dec_nofac;
 GBLREF boolean_t		run_time;
 GBLREF char			cg_phase;
 GBLREF io_pair			io_curr_device, io_std_device;
-#ifdef UNIX
-GBLREF va_list			last_va_list_ptr;	/* set by util_format */
-#endif
 
 error_def(ERR_ACTLSTTOOLONG);
 error_def(ERR_BADCASECODE);
@@ -49,7 +46,6 @@ error_def(ERR_CEUSRERROR);
 error_def(ERR_FMLLSTMISSING);
 error_def(ERR_FMLLSTPRESENT);
 error_def(ERR_FOROFLOW);
-error_def(ERR_INVCMD);
 error_def(ERR_INVDLRCVAL);
 error_def(ERR_LABELMISSING);
 error_def(ERR_SRCLIN);
@@ -72,8 +68,8 @@ void stx_error(int in_error, ...)
 	va_start(args, in_error);
 	/* In case of a IS_STX_WARN type of parsing error, we resume parsing so it is important NOT to reset
 	 * the following global variables
-	 * 	a) saw_side_effect
-	 * 	b) shift_side_effects
+	 *	a) saw_side_effect
+	 *	b) shift_side_effects
 	 *	c) source_error_found
 	 */
 	is_stx_warn = (CGP_PARSE == cg_phase) && IS_STX_WARN(in_error) GTMTRIG_ONLY( && !TREF(trigger_compile));
@@ -86,8 +82,9 @@ void stx_error(int in_error, ...)
 		 * See IS_STX_WARN macro definition for details.
 		 */
 		if (is_stx_warn)
-		{
-			ins_errtriple(in_error);
+		{	/* merrors.msg defines INVCMD as a warning but compiler conditions can turn it into an error */
+			if (ERR_INVCMD != in_error)	/* if INVCMD has morphed into an error, it won't match here */
+				ins_errtriple(in_error);
 			return;
 		}
 		if (TREF(for_stack_ptr) > (oprtype **)TADR(for_stack))
@@ -101,7 +98,7 @@ void stx_error(int in_error, ...)
 			arg3 = va_arg(args, VA_ARG_TYPE);
 			arg4 = va_arg(args, VA_ARG_TYPE);
 			va_end(args);
-			rts_error(VARLSTCNT(6) in_error, cnt, arg1, arg2, arg3, arg4);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) in_error, cnt, arg1, arg2, arg3, arg4);
 		} else if ((ERR_LABELMISSING == in_error)
 			|| (ERR_FMLLSTMISSING == in_error)
 			|| (ERR_ACTLSTTOOLONG == in_error)
@@ -113,20 +110,20 @@ void stx_error(int in_error, ...)
 			arg1 = va_arg(args, VA_ARG_TYPE);
 			arg2 = va_arg(args, VA_ARG_TYPE);
 			va_end(args);
-			rts_error(VARLSTCNT(4) in_error, cnt, arg1, arg2);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) in_error, cnt, arg1, arg2);
 		} else if ((ERR_CEUSRERROR == in_error) || (ERR_INVDLRCVAL == in_error) || (ERR_FOROFLOW == in_error))
 		{
 			cnt = va_arg(args, VA_ARG_TYPE);
 			assert(cnt == 1);
 			arg1 = va_arg(args, VA_ARG_TYPE);
 			va_end(args);
-			rts_error(VARLSTCNT(3) in_error, cnt, arg1);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(3) in_error, cnt, arg1);
 		} else
 		{
 			va_end(args);
-			rts_error(VARLSTCNT(1) in_error);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) in_error);
 		}
-	} else if (CGP_PARSE == cg_phase && ERR_INVCMD != in_error)
+	} else if ((CGP_PARSE == cg_phase) && (ERR_INVCMD != in_error))	/* if INVCMD has morphed into an error, won't match here */
 		ins_errtriple(in_error);
 	assert(!run_time);	/* From here on down, should never go ahead with printing compile-error while in run_time */
 	flush_pio();
@@ -155,8 +152,7 @@ void stx_error(int in_error, ...)
 		warn = FALSE;		/* if listing is going to $P, don't double output */
 	if (ERR_BADCHAR == in_error)
 	{
-		memset(buf, ' ', LISTTAB);
-		show_source_line(&buf[LISTTAB], SIZEOF(buf), warn);
+		show_source_line(warn);
 		cnt = va_arg(args, VA_ARG_TYPE);
 		assert(cnt == 4);
 		arg1 = va_arg(args, VA_ARG_TYPE);
@@ -168,8 +164,6 @@ void stx_error(int in_error, ...)
 			dec_err(VARLSTCNT(6) in_error, 4, arg1, arg2, arg3, arg4);
 			dec_err(VARLSTCNT(4) ERR_SRCNAM, 2, source_name_len, source_file_name);
 		}
-		if (list)
-			list_line(buf);
 		arg1 = arg2 = arg3 = arg4 = 0;
 	} else if ((ERR_LABELMISSING == in_error)
 		|| (ERR_FMLLSTMISSING == in_error)
@@ -188,8 +182,7 @@ void stx_error(int in_error, ...)
 		}
 	} else
 	{
-		memset(buf, ' ', LISTTAB);
-		show_source_line(&buf[LISTTAB], SIZEOF(buf), warn);
+		show_source_line(warn);
 		if (warn)
 		{
 			if ((ERR_CEUSRERROR != in_error) && (ERR_INVDLRCVAL != in_error) && (ERR_FOROFLOW != in_error))
@@ -202,8 +195,6 @@ void stx_error(int in_error, ...)
 				dec_err(VARLSTCNT(3) in_error, 1, arg1);
 			}
 		}
-		if (list)
-			list_line(buf);
 		arg1 = arg2 = 0;
 	}
 	va_end(args);
@@ -217,7 +208,7 @@ void stx_error(int in_error, ...)
 #		ifdef UNIX
 		cnt = va_arg(args, VA_ARG_TYPE);
 		c = util_format(msgbuf, args, LIT_AND_LEN(buf), (int)cnt);
-		va_end(last_va_list_ptr);	/* set by util_format */
+		va_end(TREF(last_va_list_ptr));	/* set by util_format */
 #		else
 		c = util_format(msgbuf, args, LIT_AND_LEN(buf));
 #		endif

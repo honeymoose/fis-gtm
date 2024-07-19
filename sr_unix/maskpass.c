@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2009, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2009, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -16,6 +16,8 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/mman.h>
 #ifdef USE_OPENSSL
 # include <openssl/sha.h>
@@ -33,8 +35,6 @@
 #define GTM_DIST		"gtm_dist"
 #define HASH_LENGTH		64	/* 512 bits = 64 bytes */
 
-struct termios 			old_tty, no_echo_tty;
-
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #define HEX(a, b, len)						\
@@ -43,6 +43,33 @@ struct termios 			old_tty, no_echo_tty;
 	for (i = 0; i < len; i+=2)				\
 		sprintf(b + i, "%02X", (unsigned char)a[i/2]);	\
 }
+
+#define SIGPROCMASK(FUNC, NEWSET, OLDSET, RC)			\
+{								\
+        do							\
+        {							\
+          RC = sigprocmask(FUNC, NEWSET, OLDSET);		\
+        } while (-1 == RC && EINTR == errno);			\
+}
+
+#define Tcsetattr(FDESC, WHEN, TERMPTR, RC, ERRNO)		\
+{								\
+	sigset_t block_ttinout;					\
+	sigset_t oldset;					\
+	int rc;							\
+	sigemptyset(&block_ttinout);				\
+	sigaddset(&block_ttinout, SIGTTIN);			\
+	sigaddset(&block_ttinout, SIGTTOU);			\
+	SIGPROCMASK(SIG_BLOCK, &block_ttinout, &oldset, rc);	\
+	do							\
+	{							\
+	   RC = tcsetattr(FDESC, WHEN, TERMPTR);		\
+	} while(-1 == RC && EINTR == errno);			\
+	ERRNO = errno;						\
+	SIGPROCMASK(SIG_SETMASK, &oldset, NULL, rc);		\
+}
+
+struct termios 			old_tty, no_echo_tty;
 
 static void maskpass(char passwd[], size_t password_len, char hash[], size_t hash_length)
 {
@@ -53,7 +80,7 @@ static void maskpass(char passwd[], size_t password_len, char hash[], size_t has
 
 static int echo_off()
 {
-	int	fd, status;
+	int	fd, status, save_errno;
 
 	fd = fileno(stdin);
 	/* Save current TTY settings */
@@ -62,16 +89,16 @@ static int echo_off()
 		return 1;
 	no_echo_tty = old_tty;
 	no_echo_tty.c_lflag &= ~ECHO; /* Turn off echo */
-	status = tcsetattr(fd, TCSAFLUSH, &no_echo_tty);
+	Tcsetattr(fd, TCSAFLUSH, &no_echo_tty, status, save_errno);
 	return status;
 }
 
 static int echo_on()
 {
-	int	fd, status;
+	int	fd, status, save_errno;
 
 	fd = fileno(stdin);
-	status = tcsetattr(fd, TCSAFLUSH, &old_tty);
+	Tcsetattr(fd, TCSAFLUSH, &old_tty, status, save_errno);
 	return status;
 }
 
@@ -193,7 +220,7 @@ int main()
 	{
 		printf("libgcrypt version mismatch. %s or higher is required.\n",
 				GCRYPT_VERSION);
-				exit(1);
+				exit(EXIT_FAILURE);
 	}
 	/* Since we will just be hashing, secure memory is not needed. */
 	if (!(err = gcry_control(GCRYCTL_DISABLE_SECMEM,0)))
@@ -201,18 +228,18 @@ int main()
 	if (GPG_ERR_NO_ERROR != err)
 	{
 		printf("Libgcrypt error: %s\n", gcry_strerror(err));
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 #	endif
 
-	passwd_len = -1;
+	passwd_len = (size_t)-1;
 	memset(passwd, 0, MAX_LEN);
 	memset(out, 0, MAX_LEN * 2);
 
 	if (get_hash_via_env_var(hash))
 		if (get_hash_via_username_and_inode(hash, passwd, &passwd_len))
-			exit(1);
-	if (-1 == passwd_len)
+			exit(EXIT_FAILURE);
+	if ((size_t)-1 == passwd_len)
 	{
 		prompt_passwd(passwd);
 		passwd_len = strlen(passwd);

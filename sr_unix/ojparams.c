@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2007 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -33,6 +33,7 @@ MSTR_CONST(deferrext, ".mje");
 
 LITREF jp_datatype	job_param_datatypes[];
 
+error_def		(ERR_PARFILSPC);
 
 /*
  * ------------------------------------------------
@@ -47,7 +48,6 @@ void ojparams (char *p, job_params_type *job_params)
 	unsigned char		ch;
 	int4			status;
 
-	error_def		(ERR_PARFILSPC);
 
 		/* Initializations */
 	job_params->baspri = 0;
@@ -60,6 +60,8 @@ void ojparams (char *p, job_params_type *job_params)
 	job_params->logfile.len = 0;
 	job_params->directory.len = 0;
 	job_params->directory.addr = 0;
+	job_params->cmdline.len = 0;
+	job_params->cmdline.addr = 0;
 
 		/* Process parameter list */
 	while (*p != jp_eol)
@@ -69,7 +71,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_default:
 			if (*p != 0)
 			{
-				job_params->directory.len = *p;
+				job_params->directory.len = (int)((unsigned char) *p);
 				job_params->directory.addr = (p + 1);
 			}
 			break;
@@ -77,7 +79,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_error:
 			if (*p != 0)
 			{
-				job_params->error.len = *p;
+				job_params->error.len = (int)((unsigned char) *p);
 				job_params->error.addr = (p + 1);
 			}
 			break;
@@ -85,7 +87,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_gbldir:
 			if (*p != 0)
 			{
-				job_params->gbldir.len = *p;
+				job_params->gbldir.len = (int)((unsigned char) *p);
 				job_params->gbldir.addr = (p + 1);
 			}
 			break;
@@ -93,7 +95,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_input:
 			if (*p != 0)
 			{
-				job_params->input.len = *p;
+				job_params->input.len = (int)((unsigned char) *p);
 				job_params->input.addr = p + 1;
 			}
 			break;
@@ -101,7 +103,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_logfile:
 			if (*p != 0)
 			{
-				job_params->logfile.len = *p;
+				job_params->logfile.len = (int)((unsigned char) *p);
 				job_params->logfile.addr = p + 1;
 			}
 			break;
@@ -109,7 +111,7 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_output:
 			if (*p != 0)
 			{
-				job_params->output.len = *p;
+				job_params->output.len = (int)((unsigned char) *p);
 				job_params->output.addr = p + 1;
 			}
 			break;
@@ -121,8 +123,16 @@ void ojparams (char *p, job_params_type *job_params)
 		case jp_startup:
 			if (*p != 0)
 			{
-				job_params->startup.len = *p;
+				job_params->startup.len = (int)((unsigned char) *p);
 				job_params->startup.addr = p + 1;
+			}
+			break;
+
+		case jp_cmdline:
+			if(*p != 0)
+			{
+				job_params->cmdline.len = (int)((unsigned char) *p);
+				job_params->cmdline.addr = p + 1;
 			}
 			break;
 
@@ -146,11 +156,11 @@ void ojparams (char *p, job_params_type *job_params)
 			break;
 
 		case jpdt_num:
-			p += sizeof (int4);
+			p += SIZEOF(int4);
 			break;
 
 		case jpdt_str:
-			p += (unsigned)*p + 1;
+			p += ((int)((unsigned char)*p)) + 1;
 			break;
 		default:
 			GTMASSERT;
@@ -170,7 +180,7 @@ void ojparams (char *p, job_params_type *job_params)
 	else
 		if (!(status = ojchkfs (job_params->input.addr,
 		  job_params->input.len, TRUE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 5, "INPUT",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 5, "INPUT",
 			job_params->input.len, job_params->input.addr);
 
 /*
@@ -193,7 +203,7 @@ void ojparams (char *p, job_params_type *job_params)
 	else
 		if (!(status = ojchkfs (job_params->output.addr,
 		  job_params->output.len, FALSE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 6,
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 6,
 				"OUTPUT", job_params->output.len,
 				job_params->output.addr);
 /*
@@ -216,7 +226,7 @@ void ojparams (char *p, job_params_type *job_params)
 	else
 		if (!(status = ojchkfs (job_params->error.addr,
 		  job_params->error.len, FALSE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 5, "ERROR",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 5, "ERROR",
 			  job_params->error.len,
 			  job_params->error.addr);
 /*
@@ -225,7 +235,7 @@ void ojparams (char *p, job_params_type *job_params)
 	if (job_params->gbldir.len)
 		if (!(status = ojchkfs (job_params->gbldir.addr,
 		  job_params->gbldir.len, FALSE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 6, "GBLDIR",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 6, "GBLDIR",
 			  job_params->gbldir.len, job_params->gbldir.addr);
 /*
  * Startup
@@ -233,7 +243,7 @@ void ojparams (char *p, job_params_type *job_params)
 	if (job_params->startup.len)
 		if (!(status = ojchkfs (job_params->startup.addr,
 		  job_params->startup.len, TRUE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "STARTUP",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "STARTUP",
 			  job_params->startup.len, job_params->startup.addr);
 /*
  * Default Directory
@@ -241,7 +251,7 @@ void ojparams (char *p, job_params_type *job_params)
 	if (job_params->directory.len)
 		if (!(status = ojchkfs (job_params->directory.addr,
 		  job_params->directory.len, FALSE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "DEFAULT",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "DEFAULT",
 			  job_params->directory.len, job_params->directory.addr);
 /*
  * Logfile
@@ -254,7 +264,7 @@ void ojparams (char *p, job_params_type *job_params)
 	else
 		if (!(status = ojchkfs (job_params->logfile.addr,
 		  job_params->logfile.len, FALSE)))
-			rts_error(VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "LOGFILE",
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(6) ERR_PARFILSPC, 4, 7, "LOGFILE",
 			  job_params->logfile.len, job_params->logfile.addr);
 }
 

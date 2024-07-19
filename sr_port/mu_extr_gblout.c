@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -43,11 +43,12 @@
 #ifdef GTM_CRYPT
 #include "gtmcrypt.h"
 #endif
+#include "gvcst_protos.h"
 
-#define INTEG_ERROR_RETURN 							\
-{										\
-	gtm_putmsg(VARLSTCNT(4) ERR_EXTRFAIL, 2, gn->str.len, gn->str.addr); 	\
-	return FALSE;								\
+#define INTEG_ERROR_RETURN										\
+{													\
+	gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_EXTRFAIL, 2, gn->str.len, gn->str.addr);	\
+	return FALSE;											\
 }
 
 GBLREF	bool			mu_ctrlc_occurred;
@@ -62,8 +63,6 @@ GBLREF	sgmnt_data_ptr_t	cs_data;
 error_def(ERR_EXTRFAIL);
 error_def(ERR_RECORDSTAT);
 
-STATICDEF readonly unsigned char gt_lit[] = "TOTAL";
-
 #if defined(UNIX) && defined(GTM_CRYPT)
 boolean_t mu_extr_gblout(mval *gn, mu_extr_stats *st, int format, muext_hash_hdr_ptr_t hash_array,
 							boolean_t is_any_file_encrypted)
@@ -75,26 +74,30 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 #error UNSUPPORTED PLATFORM
 #endif
 {
-	blk_hdr_ptr_t 	bp;
-	boolean_t 	beg_key;
-	int		data_len, des_len, fmtd_key_len, gname_size;
-	rec_hdr_ptr_t 	rp, save_rp;
-	sm_uc_ptr_t 	blktop, cp1, rectop;
-	unsigned char  	*cp2, current, *keytop, last;
-	unsigned short	out_size, rec_size;
-	static gv_key	*beg_gv_currkey; 	/* this is used to check key out of order condition */
-	static int	max_zwr_len = 0;
-	static unsigned char	*private_blk = NULL, *zwr_buffer = NULL, *key_buffer = NULL;
-	static uint4	private_blksz = 0;
+	blk_hdr_ptr_t			bp;
+	boolean_t			beg_key;
+	int				data_len, des_len, fmtd_key_len, gname_size;
+	int				tmp_cmpc;
+	rec_hdr_ptr_t			rp, save_rp;
+	sm_uc_ptr_t			blktop, cp1, rectop;
+	unsigned char			*cp2, current, *keytop, last;
+	unsigned short			out_size, rec_size;
+	static gv_key			*beg_gv_currkey; 	/* this is used to check key out of order condition */
+	static int			max_zwr_len = 0;
+	static unsigned			char	*private_blk = NULL, *zwr_buffer = NULL, *key_buffer = NULL;
+	static uint4			private_blksz = 0;
+	mval				*val_span = NULL;
+	boolean_t			is_hidden, found_dummy = FALSE;
 
 #	ifdef GTM_CRYPT
-	char				*inbuf;
+	char				*in, *out;
 	gd_region			*reg, *reg_top;
-	int				crypt_status, init_status;
+	int				gtmcrypt_errno;
 	static gtmcrypt_key_t		encr_key_handle;
 	static int4			index, prev_allocated_size;
 	static sgmnt_data_ptr_t		prev_csd;
 	static unsigned char		*unencrypted_blk_buff;
+	gd_segment			*seg;
 #	endif
 
 	op_gvname(VARLSTCNT(1) gn);	/* op_gvname() must be done before any usage of cs_addrs or, gv_currkey */
@@ -126,24 +129,22 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 #	ifdef GTM_CRYPT
 	if (is_any_file_encrypted && (cs_data->is_encrypted) && (format == MU_FMT_BINARY))
 	{
-		INIT_PROC_ENCRYPTION(init_status);
-		if (0 != init_status)
-		{
-			GC_GTM_PUTMSG(init_status, gv_cur_region->dyn.addr->fname);
-			return FALSE;
-		}
+		ASSERT_ENCRYPTION_INITIALIZED;	/* due to op_gvname done from gv_select in mu_extract */
 		if (prev_csd != cs_data)
 		{
 			prev_csd = cs_data;
 			for (reg = gd_header->regions, reg_top = reg + gd_header->n_regions, index = 0;
 					reg < reg_top; reg++, index++)
+			{
 				if (gv_cur_region == reg)
 					break;
+			}
 			assert(gv_cur_region < reg_top);
-			GTMCRYPT_GETKEY(hash_array[index].gtmcrypt_hash, encr_key_handle, crypt_status);
-			if (0 != crypt_status)
+			GTMCRYPT_GETKEY(cs_addrs, hash_array[index].gtmcrypt_hash, encr_key_handle, gtmcrypt_errno);
+			if (0 != gtmcrypt_errno)
 			{
-				GC_GTM_PUTMSG(init_status, gv_cur_region->dyn.addr->fname);
+				seg = gv_cur_region->dyn.addr;
+				GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, seg->fname_len, seg->fname);
 				return FALSE;
 			}
 		}
@@ -155,7 +156,7 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 			return FALSE;
 		if (mu_ctrlc_occurred)
 		{
-			gtm_putmsg(VARLSTCNT(8) ERR_RECORDSTAT, 6, LEN_AND_LIT(gt_lit),
+			gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_RECORDSTAT, 6, LEN_AND_LIT("TOTAL"),
 				st->recknt, st->keylen, st->datalen, st->reclen);
 			mu_ctrlc_occurred = FALSE;
 		}
@@ -177,28 +178,26 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 #			ifdef GTM_CRYPT
 			if (is_any_file_encrypted)
 			{
-				/* Note that we are only encrypting data blocks */
 				if (cs_data->is_encrypted)
 				{
-					inbuf = (char *)(rp);
-
+					in = (char *)(rp);
 					*(int4 *)(cs_addrs->encrypted_blk_contents) = index;
-					GTMCRYPT_ENCODE_FAST(encr_key_handle,
-								inbuf,
-								out_size,
-								cs_addrs->encrypted_blk_contents + SIZEOF(int4),
-								crypt_status);
-					if (0 != crypt_status)
+					out = cs_addrs->encrypted_blk_contents + SIZEOF(int4);
+					GTMCRYPT_ENCRYPT(cs_addrs, encr_key_handle, in, out_size, out, gtmcrypt_errno)
+					if (0 != gtmcrypt_errno)
 					{
-						GC_GTM_PUTMSG(crypt_status, gv_cur_region->dyn.addr->fname);
+						seg = gv_cur_region->dyn.addr;
+						GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, seg->fname_len, seg->fname);
 						return FALSE;
 					}
+					rp = (rec_hdr_ptr_t)cs_addrs->encrypted_blk_contents;
 				} else
-				{
-					/* If we extract from a mix of encrypted and unencrypted databases, for the unencrypted
-					 * databases, cs_addrs->encrypted_blk_contents will not be initialized in db_init. Hence
-					 * we use a static buffer for this purpose. */
-					if (NULL == unencrypted_blk_buff || (prev_allocated_size < out_size))
+				{	/* For unencrypted database, we cannot use cs_addrs->encrypted_blk_contents. Instead, use
+					 * a static malloc'ed buffer. The malloc is needed because the buffer that's written out
+					 * to the extract file is prefixed with an int4 indicating the ith database that this block
+					 * corresponds to and -1 (if the database is unencrypted).
+					 */
+					if ((NULL == unencrypted_blk_buff) || (prev_allocated_size < out_size))
 					{
 						if (NULL != unencrypted_blk_buff)
 							free(unencrypted_blk_buff);
@@ -207,9 +206,8 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 					}
 					*(int4 *)(unencrypted_blk_buff) = -1;
 					memcpy(unencrypted_blk_buff + (SIZEOF(int4)), rp, out_size);
+					rp = (rec_hdr_ptr_t)unencrypted_blk_buff;
 				}
-				rp = (cs_data->is_encrypted) ? (rec_hdr_ptr_t)cs_addrs->encrypted_blk_contents
-							     : (rec_hdr_ptr_t)unencrypted_blk_buff;
 				out_size += SIZEOF(int4);
 			}
 #			endif
@@ -220,11 +218,12 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 		{ 	/* Start scanning a block */
 			GET_USHORT(rec_size, &rp->rsiz);
 			rectop = (sm_uc_ptr_t)rp + rec_size;
-			if (rectop > blktop || rp->cmpc > gv_currkey->end ||
-				(((unsigned char *)rp != private_blk + SIZEOF(blk_hdr)) && rp->cmpc < gname_size))
+			EVAL_CMPC2(rp, tmp_cmpc);
+			if (rectop > blktop || tmp_cmpc > gv_currkey->end ||
+				(((unsigned char *)rp != private_blk + SIZEOF(blk_hdr)) && (tmp_cmpc < gname_size)))
 				INTEG_ERROR_RETURN
 			cp1 = (sm_uc_ptr_t)(rp + 1);
-			cp2 = gv_currkey->base + rp->cmpc;
+			cp2 = gv_currkey->base + tmp_cmpc;
 			if (cp2 >= keytop || cp1 >= rectop)
 				INTEG_ERROR_RETURN
 			if (!beg_key && (*cp2 >= *cp1))
@@ -249,9 +248,14 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 				memcpy(beg_gv_currkey->base, gv_currkey->base, gv_currkey->end + 1);
 				beg_gv_currkey->end = gv_currkey->end;
 			}
-			st->recknt++;
 			if (st->reclen < rec_size)
 				st->reclen = rec_size;
+#			ifdef UNIX
+			CHECK_HIDDEN_SUBSCRIPT(gv_currkey, is_hidden);
+			if (is_hidden)
+				continue;
+#			endif
+			st->recknt++;
 			if (st->keylen < gv_currkey->end + 1)
 				st->keylen = gv_currkey->end + 1;
 			data_len = (int)(rec_size - (cp1 - (sm_uc_ptr_t)rp));
@@ -259,6 +263,22 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 				INTEG_ERROR_RETURN
 			if (st->datalen < data_len)
 				st->datalen = data_len;
+#			ifdef UNIX
+			if ((1 == data_len) && ('\0' == *cp1))
+			{	/* Possibly (probably) a spanning node. Need to read in more blocks to get the value */
+				if (!val_span)
+				{	/* protect val_span from stp_gcol in WRITE_EXTR_LINE/op_write */
+					PUSH_MV_STENT(MVST_MVAL);
+					val_span = &mv_chain->mv_st_cont.mvs_mval;
+				}
+				gvcst_get(val_span);
+				cp1 = (unsigned char *)val_span->str.addr;
+				data_len = val_span->str.len;
+				found_dummy = TRUE;
+				if (st->datalen < data_len)
+					st->datalen = data_len;
+			}
+#			endif
 			if (MU_FMT_BINARY != format)
 			{
 				cp2 = (unsigned char *)format_targ_key(key_buffer, MAX_ZWR_KEY_SZ, gv_currkey, TRUE);
@@ -277,6 +297,13 @@ boolean_t mu_extr_gblout(mval *gn, struct RAB *outrab, mu_extr_stats *st, int fo
 					WRITE_EXTR_LINE(cp1, data_len);
 				}
 			}
+#			ifdef UNIX
+			if (found_dummy)
+			{
+				val_span->mvtype = 0; /* so stp_gcol can free up any space */
+				found_dummy = FALSE;
+			}
+#			endif
 		} /* End scanning a block */
 		if ((sm_uc_ptr_t)rp != blktop ||
 			(memcmp(gv_currkey->base, beg_gv_currkey->base, MIN(gv_currkey->end, beg_gv_currkey->end)) < 0))

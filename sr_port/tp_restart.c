@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -30,7 +30,7 @@
 #include "error.h"
 #include "iosp.h"		/* for declaration of SS_NORMAL */
 #include "jnl.h"
-#include "rtnhdr.h"
+#include <rtnhdr.h>
 #include "mv_stent.h"
 #include "stack_frame.h"
 #include "hashtab_int4.h"	/* needed for tp.h */
@@ -55,11 +55,12 @@
 #include "wbox_test_init.h"
 #include "gtmimagename.h"
 #include "have_crit.h"
+#include "anticipatory_freeze.h"
 #ifdef GTM_TRIGGER
 #include "gv_trigger.h"
 #include "gtm_trigger.h"
 #endif
-#ifdef ENABLE_EXTENDED_RESTART_TRACE_HIST
+#ifdef DEBUG
 #include "caller_id.h"
 #endif
 
@@ -95,6 +96,7 @@ GBLREF	sgmnt_addrs		*cs_addrs;
 GBLREF	sgmnt_data		*cs_data;
 GBLREF	symval			*curr_symval;
 GBLREF	trans_num		tstart_local_tn;	/* copy of global variable "local_tn" at op_tstart time */
+GBLREF	boolean_t		mupip_jnl_recover;
 #ifdef VMS
 GBLREF	struct chf$signal_array	*tp_restart_fail_sig;
 GBLREF	boolean_t		tp_restart_fail_sig_used;
@@ -116,7 +118,6 @@ error_def(ERR_REPLONLNRLBK);
 #endif
 error_def(ERR_TLVLZERO);
 error_def(ERR_TPFAIL);
-error_def(ERR_TPLOCKRESTMAX);
 error_def(ERR_TPRESTART);
 error_def(ERR_TPRETRY);
 error_def(ERR_TRESTLOC);
@@ -155,7 +156,6 @@ CONDITION_HANDLER(tp_restart_ch)
 int tp_restart(int newlevel, boolean_t handle_errors_internally)
 {
 	unsigned char		*cp;
-	short			top;
 	unsigned int		hist_index;
 	tp_frame		*tf;
 	mv_stent		*mvc;
@@ -164,11 +164,11 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 	sgmnt_addrs		*csa;
 	int4			num_closed = 0;
 	boolean_t		tp_tend_status;
+	boolean_t		reset_clues_done = FALSE;
 	mstr			gvname_mstr, reg_mstr;
 	gd_region		*restart_reg, *reg;
 	int			tprestart_rc;
 	enum cdb_sc		status;
-	UNIX_ONLY(boolean_t	issue_REPLONLNRLBK;)
 	DCL_THREADGBL_ACCESS;
 
 	SETUP_THREADGBL_ACCESS;
@@ -202,11 +202,6 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 		rts_error(VARLSTCNT(1) ERR_TLVLZERO);
 		return 0; /* for the compiler only -- never executed */
 	}
-#	ifdef DEBUG
-	if (TREF(tp_restart_dont_counts) >= dollar_trestart)
-		TREF(tp_restart_dont_counts) = dollar_trestart;
-#	endif
-
 #	ifdef GTM_TRIGGER
 	DBGTRIGR((stderr, "tp_restart: Entry state: %d\n", tprestart_state));
 	if (TPRESTART_STATE_NORMAL == tprestart_state)
@@ -245,11 +240,12 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 			}
 		}
 		status = t_fail_hist[t_tries];
-		/* The only reason online rollback ends up restarting is if some process set wc_blocked outside crit or the prior
-		 * transaction had commit errors and secshr_db_clnup set wc_blocked to TRUE. But, that's possible only if white box
-		 * test cases to induce Phase 1 and Phase 2 commit errors are set. So, assert accordingly
+		TREF(prev_t_tries) = t_tries;
+		/* Even though rollback and recover operate standalone, there are certain kind of restarts that can still happen due
+		 * to white box test cases. Assert accordingly.
 		 */
-		UNIX_ONLY(assert(!jgbl.onlnrlbk || WB_COMMIT_ERR_ENABLED));
+		assert(!mupip_jnl_recover || WB_COMMIT_ERR_ENABLED ||
+				(WBTEST_TP_HIST_CDB_SC_BLKMOD == gtm_white_box_test_case_number));
 		if (TREF(tprestart_syslog_delta) && (((TREF(tp_restart_count))++ < TREF(tprestart_syslog_limit))
 			|| (0 == ((TREF(tp_restart_count) - TREF(tprestart_syslog_limit)) % TREF(tprestart_syslog_delta)))))
 		{
@@ -338,15 +334,17 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 					assert(dba_mm == csa->hdr->acc_meth);
 					wcs_recover(sgm_info_ptr->gv_cur_region);
 				}
-				DEBUG_ONLY((TREF(tp_restart_dont_counts))++);
 				if (CDB_STAGNATE > t_tries)
 				{
 					t_tries++;
 					break;
 				}
+#				ifdef DEBUG
+				if (0 <= TREF(tp_restart_dont_counts))	/* skip increment on negative from TPNOTACID */
+					(TREF(tp_restart_dont_counts))++;
+#				endif
 				/* WARNING - fallthrough !!! */
 			case cdb_sc_needcrit:
-			case cdb_sc_needlock:
 				/* Here when a final (4th) attempt has failed with a need for crit in some routine. The
 				 * assumption is that the previous attempt failed somewhere before transaction end
 				 * therefore tp_reg_list did not have a complete list of regions necessary to complete the
@@ -370,8 +368,8 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 				}
 				DEBUG_ONLY(
 					/* The journal pool crit lock is currently obtained only inside commit logic at
-					 * which point we will never signal a cdb_sc_needcrit or cdb_sc_needlock restart
-					 * code. So no need to verify if we need to release crit there. Assert this though.
+					 * which point we will never signal a cdb_sc_needcrit restart code.
+					 * So no need to verify if we need to release crit there. Assert this though.
 					 */
 					if ((NULL != jnlpool.jnlpool_dummy_reg) && jnlpool.jnlpool_dummy_reg->open)
 					{
@@ -380,23 +378,6 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 					}
 				)
 				/* If retry due to M-locks, sleep so needed locks have a chance to get released */
-				if (cdb_sc_needlock == status)
-				{	/* Since we are in the final retry and holding crit on at least one database, we want
-					 * to limit the # of times this transaction can restart due to a failed M-lock
-					 * attempt as a restart entails wasted work while holding crit on the db and
-					 * preventing others from accessing the same.
-					 */
-					if (TREF(tp_restart_needlock_tn) != tstart_local_tn)
-					{
-						TREF(tp_restart_needlock_cnt) = 0;	/* Restart counting */
-						TREF(tp_restart_needlock_tn) = tstart_local_tn;
-					}
-					(TREF(tp_restart_needlock_cnt))++;
-					assert(MAX_TP_FINAL_RETRY_MLOCKRESTART_CNT >= TREF(tp_restart_needlock_cnt));
-					if (MAX_TP_FINAL_RETRY_MLOCKRESTART_CNT <= TREF(tp_restart_needlock_cnt))
-						rts_error(VARLSTCNT(3) ERR_TPLOCKRESTMAX, 1, MAX_TP_FINAL_RETRY_MLOCKRESTART_CNT);
-					wcs_backoff(dollar_trestart * TP_DEADLOCK_FACTOR);
-				}
 				break;
 			/* Journaling might get turned off in the final retry INSIDE crit while trying to flush journal buffer or
 			 * during extending the journal file (due to possible disk issues) in which case we will come here with
@@ -416,13 +397,22 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 			 */
 			case cdb_sc_onln_rlbk1:
 			case cdb_sc_onln_rlbk2:
+			case cdb_sc_instancefreeze:
+			case cdb_sc_gvtrootmod2:
 #			endif
 			case cdb_sc_optrestart:
 				if (CDB_STAGNATE <= t_tries)
 				{
 					t_tries--;
-					DEBUG_ONLY((TREF(tp_restart_dont_counts))++);
+#					ifdef DEBUG
+					if (0 <= TREF(tp_restart_dont_counts))	/* skip increment on negative from TPNOTACID */
+						(TREF(tp_restart_dont_counts))++;
+#					endif
 				}
+#				ifdef UNIX
+				if (cdb_sc_instancefreeze == status)
+					WAIT_FOR_REPL_INST_UNFREEZE_NOCSA;
+#				endif
 				/* fall through */
 			default:
 				if (CDB_STAGNATE < ++t_tries)
@@ -497,7 +487,7 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 			 * unconditionally
 			 */
 #			ifdef UNIX
-			if (cs_addrs_list && (cs_addrs_list->onln_rlbk_cycle != cs_addrs_list->nl->onln_rlbk_cycle))
+			if (cs_addrs_list && MISMATCH_ONLN_RLBK_CYCLES(cs_addrs_list, cs_addrs_list->nl))
 			{	/* We came in to handle a different restart code in the penultimate retry and grab_crit before going
 				 * to final retry. As part of grabbing crit, we detected an online rollback. Although we could treat
 				 * this as just an online rollback restart and handle it by syncing cycles, but by doing so, we will
@@ -511,6 +501,7 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 				 * proceeds smoothly in the final retry.
 				 */
 				RESET_ALL_GVT_CLUES;
+				reset_clues_done = TRUE;
 			}
 #			endif
 			DEBUG_ONLY(TREF(ok_to_call_wcs_recover) = FALSE);
@@ -524,10 +515,19 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 					TP_CHANGE_REG_IF_NEEDED(reg);
 					MM_DBFILEXT_REMAP_IF_NEEDED(cs_addrs, gv_cur_region);
 				}
+#				ifdef UNIX
+				csa = (sgmnt_addrs *)&FILE_INFO(reg)->s_addrs;
+				if (MISMATCH_ROOT_CYCLES(csa, csa->nl) && !reset_clues_done)
+				{
+					RESET_ALL_GVT_CLUES;
+					reset_clues_done = TRUE;
+				}
+#				endif
 			}
 		}
 #	ifdef GTM_TRIGGER
-	}
+	} else
+		status = LAST_RESTART_CODE;
 	DBGTRIGR((stderr, "tp_restart: past initial normal state processing\n"));
 #	endif
 	/* The below code to determine the roll-back point depends on tp_frame sized blocks being pushed on the TP
@@ -537,7 +537,6 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 	tf = (tp_frame *)(tpstackbase - (newlevel * SIZEOF(tp_frame)));
 	assert(NULL != tf);
 	assert(tpstacktop < (unsigned char *)tf);
-	UNIX_ONLY(issue_REPLONLNRLBK = FALSE);
 #	ifdef GTM_TRIGGER
 	if (TPRESTART_STATE_NORMAL == tprestart_state)
 	{	/* Only if normal tp_restart call - else we've already done this for this tp_restart */
@@ -555,16 +554,19 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 		 */
 #		ifdef UNIX
 		assert(cdb_sc_normal != status);
-		if ((cdb_sc_onln_rlbk1 == status) || (cdb_sc_onln_rlbk2 == status))
-		{	/* restarted due to online rollback */
-			RESET_ALL_GVT_CLUES;
-			assert(!TREF(only_reset_clues_if_onln_rlbk));
-			if (IS_MCODE_RUNNING)
-			{
-				assert(!is_updproc);
-				(TREF(dollar_zonlnrlbk))++;
-			}
-			issue_REPLONLNRLBK = is_updproc;
+		switch (status)
+		{
+			case cdb_sc_gvtrootmod2:	/* restarted due to MUPIP REORG moving root blocks */
+				RESET_ALL_GVT_CLUES;
+				break;
+			case cdb_sc_onln_rlbk1:		/* restarted due to online rollback */
+			case cdb_sc_onln_rlbk2:
+				RESET_ALL_GVT_CLUES;
+				if (IS_MCODE_RUNNING && (cdb_sc_onln_rlbk2 == status))
+					(TREF(dollar_zonlnrlbk))++;
+				break;
+			default:
+				break;
 		}
 #		endif
 #	ifdef GTM_TRIGGER
@@ -580,40 +582,35 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 		 */
 		GTMTRIG_ONLY(DBGTRIGR((stderr, "tp_restart: Beginning state 0/1 processing (state %d)\n", tprestart_state)));
 		tp_unwind(newlevel, RESTART_INVOCATION, &tprestart_rc);
+		assert(dollar_tlevel == newlevel);	/* tp_unwind would have set this */
 		assert(tf == tp_pointer);	/* Needs to be true for now. Revisit when can restart to other than newlevel == 1 */
 		gd_header = tp_pointer->gd_header;
 		gv_target = tp_pointer->orig_gv_target;
 		gv_cur_region = tp_pointer->gd_reg;
 		TP_CHANGE_REG(gv_cur_region);
-		DBG_CHECK_GVTARGET_CSADDRS_IN_SYNC;
-		dollar_tlevel = newlevel;
-		top = gv_currkey->top;
-		/* ensure proper alignment before dereferencing tp_pointer->orig_key->end */
-		assert(0 == (((unsigned long)tp_pointer->orig_key) % SIZEOF(tp_pointer->orig_key->end)));
-		memcpy(gv_currkey, tp_pointer->orig_key, SIZEOF(*tp_pointer->orig_key) + tp_pointer->orig_key->end);
-		gv_currkey->top = top;
-		DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC;
+		COPY_KEY(gv_currkey, tp_pointer->orig_key);
+		DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC(CHECK_CSA_TRUE);
 #		ifdef GTM_TRIGGER
-		/* Maintenance of SFF_TRIGR_CALLD stack frame flag:
+		/* Maintenance of SFF_IMPLTSTART_CALLD stack frame flag:
 		 * - Set by gtm_trigger when trigger base frame is created. Purpose to prevent MUM_TSTART from restarting
 		 *   a frame making a call-in to a trigger (flag is checked in MUM_TSTART macro) because the mpc in the
 		 *   stack frame is not the return point to the frame, which is only available in the C stack.
 		 * - Both TP restart and error handling unwinds can use MUM_TSTART to restart frame.
 		 * - TP restart changes the mpc to the proper address (where TSTART was done) before invoking MUM_TSTART. We allow
-		 *   this by shutting the SFF_TRIGR_CALLD flag off when mpc is changed.
+		 *   this by shutting the SFF_IMPLTSTART_CALLD flag off when mpc is changed.
 		 * - For TSTARTs done implcitly by triggers, MUM_TSTART would break things so we do not turn off the flag
 		 *   for that type.
 		 */
 		if (!tp_pointer->implicit_tstart)
-		{	/* SFF_TRIGR_CALLD validation:
+		{	/* SFF_IMPLTSTART_CALLD validation:
 			 * - This is not a trigger-initiated implicit TSTART.
 			 * - If the flag is is not on, no further checks. Turning off flag is unconditional for best performance.
 			 * - If flag is on, verify the address in the stack frame is in fact being modified so it points to
 			 *   a TSTART instead of the (currently) trigger call point.
 			 */
-			assert(!(tp_pointer->fp->flags & SFF_TRIGR_CALLD) || (tp_pointer->fp->mpc != tp_pointer->restart_pc));
-			tp_pointer->fp->flags &= SFF_TRIGR_CALLD_OFF;
-			DBGTRIGR((stderr, "tp_restart: Removing SFF_TRIGR_CALLD in frame 0x"lvaddr"\n", tp_pointer->fp));
+			assert(!(tp_pointer->fp->flags & SFF_IMPLTSTART_CALLD) || (tp_pointer->fp->mpc != tp_pointer->restart_pc));
+			tp_pointer->fp->flags &= SFF_IMPLTSTART_CALLD_OFF;
+			DBGTRIGR((stderr, "tp_restart: Removing SFF_IMPLTSTART_CALLD in frame 0x"lvaddr"\n", tp_pointer->fp));
 		}
 #		endif
 		tp_pointer->fp->mpc = tp_pointer->restart_pc;
@@ -684,8 +681,8 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 			 * this frame, op_xnew creates a NEW symtab just for this frame. But when this code
 			 * unwound back to the TSTART, we also unwound the l_symtab this frame was using. So here
 			 * we verify this frame is a simple call frame from the previous and restore the use of its
-			 * l_symtab if so. If not, GTMASSERT. Note the outer SFF_UWN_SYMVAL check keeps us from having
-			 * non-existant l_symtab issues which is possible when we are MUPIP.
+			 * l_symtab if so. If not, assertpro/GTMASSERT2. Note the outer SFF_UWN_SYMVAL check keeps
+			 * us from having non-existant l_symtab issues which is possible when we are MUPIP.
 			 */
 			if ((frame_pointer->rvector == frame_pointer->old_frame_pointer->rvector)
 			    && (frame_pointer->vartab_ptr == frame_pointer->old_frame_pointer->vartab_ptr))
@@ -693,7 +690,7 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 				frame_pointer->l_symtab = frame_pointer->old_frame_pointer->l_symtab;
 				frame_pointer->flags &= SFF_UNW_SYMVAL_OFF;	/* No need to clear symtab now */
 			} else
-				GTMASSERT;
+				assertpro(FALSE);
 		} else
 		{	/* Otherwise the l_symtab needs to be cleared so its references get re-resolved to *this* symtab */
 			memset(frame_pointer->l_symtab, 0, frame_pointer->vartab_len * SIZEOF(ht_ent_mname *));
@@ -721,15 +718,24 @@ int tp_restart(int newlevel, boolean_t handle_errors_internally)
 		return 0; /* for the compiler only -- never executed */
 	}
 	++dollar_trestart;
+#	ifdef DEBUG
+	if (0 > TREF(tp_restart_dont_counts))	/* negative is a flag from TPNOTACID - do increment here */
+	{
+		TREF(tp_restart_dont_counts) = -TREF(tp_restart_dont_counts);
+		(TREF(tp_restart_dont_counts))++;
+	}
+	assert(0 <= TREF(tp_restart_dont_counts));	/* NOTE: should tp_restart_dont_counts wrap, asserts will fail */
 	assert(dollar_trestart >= TREF(tp_restart_dont_counts));
 	assert(MAX_TRESTARTS > (dollar_trestart - TREF(tp_restart_dont_counts))); /* a magic number limit for restarts */
+#	endif
 	if (!dollar_trestart)		/* in case of a wrap */
 		dollar_trestart--;
 	UNIX_ONLY(
 		/* Now that we are done with all the cleanup related to this restart, issue rts_error if we are update process.
 		 * updproc_ch knows to handle this SIGNAL.
 		 */
-		if (issue_REPLONLNRLBK)
+		assert(cdb_sc_normal != status);
+		if (is_updproc && ((cdb_sc_onln_rlbk1 == status) || (cdb_sc_onln_rlbk2 == status)))
 			rts_error(VARLSTCNT(1) ERR_REPLONLNRLBK);
 	)
 	if (handle_errors_internally)

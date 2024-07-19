@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2003, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2003, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -30,6 +30,7 @@
 #include "gdsbt.h"
 #include "gtm_facility.h"
 #include "fileinfo.h"
+#include "gtmio.h"
 #include "gdsfhead.h"
 #include "filestruct.h"
 #include "jnl.h"
@@ -40,8 +41,8 @@
 #include "muprec.h"
 #include "iosp.h"
 #include "jnl_typedef.h"
-#include "gtmio.h"
 #include "gtmmsg.h"
+#include "anticipatory_freeze.h"
 #include "wcs_flu.h"	/* for wcs_flu() prototype */
 #include "wbox_test_init.h"
 
@@ -53,7 +54,7 @@ GBLREF	gd_region		*gv_cur_region;
 GBLREF	sgmnt_addrs		*cs_addrs;
 GBLREF	sgmnt_data_ptr_t	cs_data;
 
-error_def(ERR_PREMATEOF); /* for DO_FILE_WRITE */
+error_def(ERR_PREMATEOF); /* for JNL_DO_FILE_WRITE */
 error_def(ERR_JNLNOCREATE);
 error_def(ERR_JNLWRERR);
 error_def(ERR_JNLFSYNCERR);
@@ -77,14 +78,14 @@ uint4 mur_process_intrpt_recov()
 		io_status_block_disk	iosb;
 	)
 	boolean_t			jfh_changed;
-	jnl_record		*jnlrec;
-	jnl_file_header		*jfh;
+	jnl_record			*jnlrec;
+	jnl_file_header			*jfh;
+	jnl_tm_t			now;
 
 	for (rctl = mur_ctl, rctl_top = mur_ctl + murgbl.reg_total; rctl < rctl_top; rctl++)
 	{
-		gv_cur_region = rctl->gd;	/* wcs_flu requires this to be set */
-		cs_addrs = rctl->csa;
-		csd = cs_data = rctl->csd;	/* MM logic after wcs_flu call requires this to be set */
+		TP_CHANGE_REG(rctl->gd);
+		csd = cs_data;	/* MM logic after wcs_flu call requires this to be set */
 		assert(csd == rctl->csa->hdr);
 		jctl = rctl->jctl_turn_around;
 		max_jnl_alq = max_jnl_deq = max_autoswitchlimit = 0;
@@ -218,8 +219,8 @@ uint4 mur_process_intrpt_recov()
 				 * is in progress
 				 */
 				bt_refresh(cs_addrs, FALSE); /* sets earliest bt TN to be the turn around TN */
-				db_csh_ref(cs_addrs, FALSE);
 			}
+			db_csh_ref(cs_addrs, FALSE);
 			assert(NULL != cs_addrs->jnl);
 			jpc = cs_addrs->jnl;
 			assert(NULL != jpc->jnl_buff);
@@ -238,22 +239,24 @@ uint4 mur_process_intrpt_recov()
 			jbp->prev_jrec_time = jctl->turn_around_time;
 		} else if (dba_bg == csd->acc_meth)
 		{	/* set earliest bt TN to be the turn-around TN (taken from bt_refresh()) */
-			((th_rec *)((uchar_ptr_t)cs_addrs->th_base + cs_addrs->th_base->tnque.fl))->tn = cs_addrs->ti->curr_tn - 1;
+			SET_OLDEST_HIST_TN(cs_addrs, cs_addrs->ti->curr_tn - 1);
 		}
 #		else
 		if (dba_bg == csd->acc_meth)
 		{	/* set earliest bt TN to be the turn-around TN (taken from bt_refresh()) */
-			((th_rec *)((uchar_ptr_t)cs_addrs->th_base + cs_addrs->th_base->tnque.fl))->tn = cs_addrs->ti->curr_tn - 1;
+			SET_OLDEST_HIST_TN(cs_addrs, cs_addrs->ti->curr_tn - 1);
 		}
 #		endif
 		csd->turn_around_point = FALSE;
-		assert(((th_rec *)((uchar_ptr_t)cs_addrs->th_base + cs_addrs->th_base->tnque.fl))->tn == cs_addrs->ti->curr_tn - 1);
+		assert(OLDEST_HIST_TN(cs_addrs) == (cs_addrs->ti->curr_tn - 1));
 		/* In case this is MM and wcs_flu() remapped an extended database, reset rctl->csd */
 		assert((dba_mm == cs_data->acc_meth) || (rctl->csd == cs_data));
 		rctl->csd = cs_data;
 	}
+	JNL_SHORT_TIME(now);
 	for (rctl = mur_ctl, rctl_top = mur_ctl + murgbl.reg_total; rctl < rctl_top; rctl++)
 	{
+		TP_CHANGE_REG_IF_NEEDED(rctl->gd);
 		if (!rctl->jfh_recov_interrupted)
 			jctl = rctl->jctl_turn_around;
 		else
@@ -273,7 +276,7 @@ uint4 mur_process_intrpt_recov()
 		assert(rctl->csd->jnl_file_len == jctl->jnl_fn_len); 			       /* latest gener file name */
 		assert(0 == memcmp(rctl->csd->jnl_file_name, jctl->jnl_fn, jctl->jnl_fn_len)); /* should match db header */
 		if (SS_NORMAL != (status = prepare_unique_name((char *)jctl->jnl_fn, jctl->jnl_fn_len, "", "",
-								rename_fn, &rename_fn_len, &status2)))
+								rename_fn, &rename_fn_len, now, &status2)))
 			return status;
 		jctl->jnl_fn_len = rename_fn_len;  /* change the name in memory to the proposed name */
 		memcpy(jctl->jnl_fn, rename_fn, rename_fn_len + 1);
@@ -325,29 +328,34 @@ uint4 mur_process_intrpt_recov()
 			}
 			if (jfh_changed)
 			{
-				DO_FILE_WRITE(jctl->channel, 0, jfh, REAL_JNL_HDR_LEN, jctl->status, jctl->status2);
+				/* Since overwriting the journal file header (an already allocated block
+				 * in the file) should not cause ENOSPC, we dont take the trouble of
+				 * passing csa or jnl_fn (first two parameters). Instead we pass NULL.
+				 */
+				JNL_DO_FILE_WRITE(NULL, NULL, jctl->channel, 0, jfh,
+					REAL_JNL_HDR_LEN, jctl->status, jctl->status2);
 				if (SS_NORMAL != jctl->status)
 				{
 					assert(FALSE);
 					if (SS_NORMAL == jctl->status2)
-						gtm_putmsg(VARLSTCNT(5) ERR_JNLWRERR, 2, jctl->jnl_fn_len,
+						gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(5) ERR_JNLWRERR, 2, jctl->jnl_fn_len,
 							jctl->jnl_fn, jctl->status);
 					else
-						gtm_putmsg(VARLSTCNT1(6) ERR_JNLWRERR, 2, jctl->jnl_fn_len,
+						gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT1(6) ERR_JNLWRERR, 2, jctl->jnl_fn_len,
 							jctl->jnl_fn, jctl->status, PUT_SYS_ERRNO(jctl->status2));
 					return jctl->status;
 				}
 				UNIX_ONLY(
-				GTM_FSYNC(jctl->channel, jctl->status);
-				if (-1 == jctl->status)
-				{
-					jctl->status2 = errno;
-					assert(FALSE);
-					gtm_putmsg(VARLSTCNT(9) ERR_JNLFSYNCERR, 2,
-						jctl->jnl_fn_len, jctl->jnl_fn,
-						ERR_TEXT, 2, RTS_ERROR_TEXT("Error with fsync"), jctl->status2);
-					return ERR_JNLFSYNCERR;
-				}
+					GTM_JNL_FSYNC(rctl->csa, jctl->channel, jctl->status);
+					if (-1 == jctl->status)
+					{
+						jctl->status2 = errno;
+						assert(FALSE);
+						gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(9) ERR_JNLFSYNCERR, 2,
+							jctl->jnl_fn_len, jctl->jnl_fn,
+							ERR_TEXT, 2, RTS_ERROR_TEXT("Error with fsync"), jctl->status2);
+						return ERR_JNLFSYNCERR;
+					}
 				)
 			}
 			jfh_changed = FALSE;
@@ -367,7 +375,7 @@ uint4 mur_process_intrpt_recov()
 		jgbl.gbl_jrec_time = rctl->jctl_turn_around->turn_around_time;	/* time needed for cre_jnl_file_common() */
 		if (EXIT_NRM != cre_jnl_file_common(&jnl_info, rename_fn, rename_fn_len))
 		{
-			gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+			gtm_putmsg_csa(CSA_ARG(rctl->csa) VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
 			return jnl_info.status;
 		}
 #		ifdef UNIX

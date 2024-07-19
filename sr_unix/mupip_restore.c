@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -67,6 +67,8 @@
 #include "min_max.h"
 #include "gtmxc_types.h"
 #include "gtmcrypt.h"
+#include "jnl.h"
+#include "anticipatory_freeze.h"
 
 GBLDEF	inc_list_struct		in_files;
 GBLREF	uint4			pipe_child;
@@ -102,7 +104,6 @@ error_def(ERR_TEXT);
 
 CONDITION_HANDLER(iob_io_error)
 {
-	int	dummy1, dummy2;
 	char 	s[80];
 	char 	*fgets_res;
 
@@ -115,7 +116,7 @@ CONDITION_HANDLER(iob_io_error)
 		CONTINUE;
 	}
 	PRN_ERROR;
-	UNWIND(dummy1, dummy2);
+	UNWIND(NULL, NULL);
 }
 
 
@@ -126,9 +127,8 @@ void mupip_restore(void)
 	inc_list_struct 	*ptr;
 	inc_header		inhead;
 	sgmnt_data		old_data;
-	short			iosb[4];
 	unsigned short		n_len;
-	int4			status, rsize, size, temp, save_errno, old_start_vbn;
+	int4			status, rsize, temp, save_errno, old_start_vbn;
 	uint4			rest_blks, totblks;
 	trans_num		curr_tn;
 	uint4			ii;
@@ -137,7 +137,7 @@ void mupip_restore(void)
 	uint4			cli_status;
 	BFILE			*in;
 	int			i, db_fd;
-	uint4			old_blk_size, old_tot_blks, bplmap, old_bit_maps, new_bit_maps;
+	uint4			old_blk_size, size, old_tot_blks, bplmap, old_bit_maps, new_bit_maps;
 	off_t			new_eof, offset;
 #	ifdef GTM_TRUNCATE
 	off_t			new_size;
@@ -150,15 +150,14 @@ void mupip_restore(void)
 	backup_type		type;
 	unsigned short		port;
 	int4			timeout, cut, match;
-	char			debug_info[256];
 	void			(*common_read)();
 	char			*errptr;
 	pid_t			waitpid_res;
 	muinc_blk_hdr_ptr_t	sblkh_p;
 	int			rc;
 #	ifdef GTM_CRYPT
-	char			bkup_hash[GTMCRYPT_HASH_LEN];
-	int			req_dec_blk_size, crypt_status;
+	char			bkup_hash[GTMCRYPT_HASH_LEN], *inptr;
+	int			in_len, gtmcrypt_errno;
 	gtmcrypt_key_t		bkup_key_handle, target_key_handle;
 	boolean_t		is_bkup_file_encrypted, is_same_hash = FALSE;
 #	endif
@@ -360,7 +359,7 @@ void mupip_restore(void)
 						+ ((off_t)inhead.db_total_blks * old_blk_size);
 				new_size = new_eof + DISK_BLOCK_SIZE;
 				memset(buff, 0, DISK_BLOCK_SIZE);
-				LSEEKWRITE(db_fd, new_eof, buff, DISK_BLOCK_SIZE, status);
+				DB_LSEEKWRITE(NULL, NULL, db_fd, new_eof, buff, DISK_BLOCK_SIZE, status);
 				if (0 != status)
 				{
 					util_out_print("Aborting restore!/", TRUE);
@@ -411,7 +410,7 @@ void mupip_restore(void)
 				new_eof = ((off_t)(old_start_vbn - 1) * DISK_BLOCK_SIZE)
 						+ ((off_t)inhead.db_total_blks * old_blk_size);
 				memset(buff, 0, DISK_BLOCK_SIZE);
-				LSEEKWRITE(db_fd, new_eof, buff, DISK_BLOCK_SIZE, status);
+				DB_LSEEKWRITE(NULL, NULL, db_fd, new_eof, buff, DISK_BLOCK_SIZE, status);
 				if (0 != status)
 				{
 					util_out_print("Aborting restore!/", TRUE);
@@ -422,7 +421,7 @@ void mupip_restore(void)
 					util_out_print("  Current input file is !AD with !UL (!XL hex) total blocks!/",
 						TRUE, ptr->input_file.len, ptr->input_file.addr,
 						inhead.db_total_blks, inhead.db_total_blks);
-					gtm_putmsg(VARLSTCNT(1) status);
+					gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) status);
 					CLNUP_AND_EXIT(ERR_MUPRESTERR, inbuf);
 				}
 				/* --- initialize all new bitmaps, just in case they are not touched later --- */
@@ -439,12 +438,12 @@ void mupip_restore(void)
 					for (ii = ROUND_UP(old_tot_blks, bplmap); ii < inhead.db_total_blks; ii += bplmap)
 					{
 						new_eof = (off_t)(old_start_vbn - 1) * DISK_BLOCK_SIZE + (off_t)ii * old_blk_size;
-						LSEEKWRITE(db_fd, new_eof, newmap, old_blk_size, status);
+						DB_LSEEKWRITE(NULL, NULL, db_fd, new_eof, newmap, old_blk_size, status);
 						if (0 != status)
 						{
 							util_out_print("Aborting restore!/", TRUE);
 							util_out_print("Bitmap 0x!XL initialization error!", TRUE, ii);
-							gtm_putmsg(VARLSTCNT(1) status);
+							gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) status);
 							free(newmap);
 							CLNUP_AND_EXIT(ERR_MUPRESTERR, inbuf);
 						}
@@ -459,31 +458,29 @@ void mupip_restore(void)
 #		ifdef GTM_CRYPT
 		if (is_bkup_file_encrypted || old_data.is_encrypted)
 		{
-			/* See if the backup file and the target file are going to have
-			 * the same hash thereby speeding up the most common case. */
+			/* See if the backup file and the target file have the same hash thereby speeding up the most common case */
 			if (!memcmp(bkup_hash, old_data.encryption_hash, GTMCRYPT_HASH_LEN))
 				is_same_hash = TRUE;
+			ASSERT_ENCRYPTION_INITIALIZED;	/* should have been done in mu_rndwn_file (called from STANDALONE) */
 			if (!is_same_hash)
 			{
-				INIT_PROC_ENCRYPTION(crypt_status);
-				if (0 != crypt_status)
-					CLNUP_AND_EXIT(crypt_status, inbuf);
 				if (is_bkup_file_encrypted)
 				{
-					GTMCRYPT_GETKEY(bkup_hash, bkup_key_handle, crypt_status);
-					if (0 != crypt_status)
+					GTMCRYPT_GETKEY(NULL, bkup_hash, bkup_key_handle, gtmcrypt_errno);
+					if (0 != gtmcrypt_errno)
 					{
-						GC_GTM_PUTMSG(crypt_status, ptr->input_file.addr);
-						CLNUP_AND_EXIT(crypt_status, inbuf);
+						GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, ptr->input_file.len,
+										ptr->input_file.addr);
+						CLNUP_AND_EXIT(gtmcrypt_errno, inbuf);
 					}
 				}
 				if (old_data.is_encrypted)
 				{
-					GTMCRYPT_GETKEY(old_data.encryption_hash, target_key_handle, crypt_status);
-					if (0 != crypt_status)
+					GTMCRYPT_GETKEY(NULL, old_data.encryption_hash, target_key_handle, gtmcrypt_errno);
+					if (0 != gtmcrypt_errno)
 					{
-						GC_GTM_PUTMSG(crypt_status, db_name);
-						CLNUP_AND_EXIT(crypt_status, inbuf);
+						GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, n_len, db_name);
+						CLNUP_AND_EXIT(gtmcrypt_errno, inbuf);
 					}
 				}
 			}
@@ -540,40 +537,35 @@ void mupip_restore(void)
 			}
 #			ifdef GTM_CRYPT
 			assert((size <= old_blk_size) && (size >= SIZEOF(blk_hdr)));
-			req_dec_blk_size = MIN(old_blk_size, size) - SIZEOF(blk_hdr);
-			if (!is_same_hash && (BLOCK_REQUIRE_ENCRYPTION(is_bkup_file_encrypted, (((blk_hdr_ptr_t)blk_ptr)->levl),
-							req_dec_blk_size)))
+			in_len = MIN(old_blk_size, size) - SIZEOF(blk_hdr);
+			if (!is_same_hash
+				&& (BLOCK_REQUIRE_ENCRYPTION(is_bkup_file_encrypted, (((blk_hdr_ptr_t)blk_ptr)->levl), in_len)))
 			{
-				GTMCRYPT_DECODE_FAST(bkup_key_handle,
-							blk_ptr + SIZEOF(blk_hdr),
-							req_dec_blk_size,
-							NULL,
-							crypt_status);
-				if (0 != crypt_status)
+				inptr = blk_ptr + SIZEOF(blk_hdr);
+				GTMCRYPT_DECRYPT(NULL, bkup_key_handle, inptr, in_len, NULL, gtmcrypt_errno);
+				if (0 != gtmcrypt_errno)
 				{
-					GC_GTM_PUTMSG(crypt_status, ptr->input_file.addr);
-					CLNUP_AND_EXIT(crypt_status, inbuf);
+					GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, ptr->input_file.len,
+									ptr->input_file.addr);
+					CLNUP_AND_EXIT(gtmcrypt_errno, inbuf);
 				}
 			}
 #			endif
 			offset = (old_start_vbn - 1) * DISK_BLOCK_SIZE + ((off_t)old_blk_size * blk_num);
 #			ifdef GTM_CRYPT
-			if (!is_same_hash && (BLOCK_REQUIRE_ENCRYPTION(old_data.is_encrypted,
-							(((blk_hdr_ptr_t)blk_ptr)->levl), req_dec_blk_size)))
+			if (!is_same_hash
+				&& (BLOCK_REQUIRE_ENCRYPTION(old_data.is_encrypted, (((blk_hdr_ptr_t)blk_ptr)->levl), in_len)))
 			{
-				GTMCRYPT_ENCODE_FAST(target_key_handle,
-							blk_ptr + SIZEOF(blk_hdr),
-							req_dec_blk_size,
-							NULL,
-							crypt_status);
-				if (0 != crypt_status)
+				inptr = blk_ptr + SIZEOF(blk_hdr);
+				GTMCRYPT_ENCRYPT(NULL, target_key_handle, inptr, in_len, NULL, gtmcrypt_errno);
+				if (0 != gtmcrypt_errno)
 				{
-					GC_GTM_PUTMSG(crypt_status, db_name);
-					CLNUP_AND_EXIT(crypt_status, inbuf);
+					GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, gtm_putmsg, n_len, db_name);
+					CLNUP_AND_EXIT(gtmcrypt_errno, inbuf);
 				}
 			}
 #			endif
-			LSEEKWRITE(db_fd, offset, blk_ptr, size, save_errno);
+			DB_LSEEKWRITE(NULL, NULL, db_fd, offset, blk_ptr, size, save_errno);
 			if (0 != save_errno)
 			{
 				util_out_print("Error accessing output file !AD. Aborting restore.",
@@ -605,7 +597,7 @@ void mupip_restore(void)
 		((sgmnt_data_ptr_t)inbuf)->gt_sem_ctime.ctime = old_data.gt_sem_ctime.ctime;
 		((sgmnt_data_ptr_t)inbuf)->shmid = old_data.shmid;
 		((sgmnt_data_ptr_t)inbuf)->gt_shm_ctime.ctime = old_data.gt_shm_ctime.ctime;
-		LSEEKWRITE(db_fd, 0, inbuf, rsize - SIZEOF(int4), save_errno);
+		DB_LSEEKWRITE(NULL, NULL, db_fd, 0, inbuf, rsize - SIZEOF(int4), save_errno);
 		if (0 != save_errno)
 		{
 			util_out_print("Error accessing output file !AD. Aborting restore.",
@@ -635,7 +627,7 @@ void mupip_restore(void)
 			COMMON_READ(in, inbuf, rsize, inbuf);
 			if (!MEMCMP_LIT(inbuf, MAP_MSG))
 				break;
-			LSEEKWRITE(db_fd,
+			DB_LSEEKWRITE(NULL, NULL, db_fd,
 				   offset,
 				   inbuf,
 				   rsize - SIZEOF(int4),
@@ -702,7 +694,7 @@ STATICFNDEF void exec_read(BFILE *bf, char *buf, int nbytes)
 		 */
 		else if ((EINTR != errno) && (EAGAIN != errno))
 		{
-			gtm_putmsg(VARLSTCNT(1) errno);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) errno);
 			if ((pipe_child > 0) && (FALSE != is_proc_alive(pipe_child, 0)))
 				WAITPID(pipe_child, (int *)&status, 0, waitpid_res);
 			CLOSEFILE_RESET(bf->fd, rc);	/* resets "bf->fd" to FD_INVALID */
@@ -752,7 +744,7 @@ STATICFNDEF void tcp_read(BFILE *bf, char *buf, int nbytes)
 		}
 		if ((status < 0) && (errno != EINTR))
 		{
-			gtm_putmsg(VARLSTCNT(1) errno);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) errno);
 			CLOSEFILE_RESET(bf->fd, rc);	/* resets "bf->fd" to FD_INVALID */
 			restore_read_errno = errno;
 			break;

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -16,8 +16,10 @@
 #include "gtm_unistd.h"
 #include "gtm_stat.h"
 #include "gtm_iconv.h"
+#include "gtm_netdb.h"
 #include "gtm_socket.h"
 #include "gtm_inet.h"
+#include "gtm_stdlib.h"
 
 #include <errno.h>
 #include <sys/ioctl.h>
@@ -59,6 +61,10 @@ GBLREF	int4			outofband;
 GBLREF	int4			write_filter;
 LITREF	mstr			chset_names[];
 
+error_def(ERR_GETNAMEINFO);
+error_def(ERR_GTMEISDIR);
+error_def(ERR_TEXT);
+
 bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mval *mspace)	/* timeout in seconds */
 {
 	uint4		status;
@@ -88,15 +94,18 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 	int		fstat_res;
 
 	int		p_offset, len;
-	boolean_t	mknod_err , stat_err;
+	boolean_t	mknod_err , stat_err, dir_err;
 	int 		save_mknod_err, save_stat_err;
 
 	int		sockstat, sockoptval;
 	in_port_t	sockport;
 	GTM_SOCKLEN_TYPE	socknamelen;
-	struct sockaddr_in	sockname;
+	struct sockaddr_storage	sockname;
 	GTM_SOCKLEN_TYPE	sockoptlen;
 	boolean_t	ichset_specified, ochset_specified;
+	int		errcode;
+	unsigned int	port_len;
+	char		port_buffer[NI_MAXSERV], *port_ptr;
 
 	mt_ptr = NULL;
 	char_or_block_special = FALSE;
@@ -105,6 +114,7 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 	oflag = 0;
 	mknod_err = FALSE;
 	stat_err = FALSE;
+	dir_err = FALSE;
 	tn.len = tl->len;
 	if (tn.len > LOGNAME_LEN)
 		tn.len = LOGNAME_LEN;
@@ -239,8 +249,10 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 					case S_IFIFO:
 						tl->iod->type = ff;
 						break;
-					case S_IFREG:
 					case S_IFDIR:
+						dir_err = TRUE;			/* directories should not be opened */
+						/* no break in order to set iod->type value */
+					case S_IFREG:
 						tl->iod->type = rm;
 						break;
 					case S_IFSOCK:
@@ -264,9 +276,19 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 							sockstat = getsockname(file_des,
 									       (struct sockaddr *)&sockname,
 									       (GTM_SOCKLEN_TYPE *)&socknamelen);
-							if (!sockstat && AF_INET == sockname.sin_family)
+							if (!sockstat && ((AF_INET == ((sockaddr_ptr)&sockname)->sa_family)
+									 || (AF_INET6 == ((sockaddr_ptr)&sockname)->sa_family)))
 							{
-								sockport = ntohs(sockname.sin_port);
+								port_len = NI_MAXSERV;
+								if (0 != (errcode = getnameinfo((struct sockaddr *)&sockname,
+												socknamelen, NULL, 0,
+												port_buffer, port_len,
+												NI_NUMERICHOST)))
+								{
+									RTS_ERROR_ADDRINFO(NULL, ERR_GETNAMEINFO, errcode);
+									return FALSE;
+								}
+								sockport=atoi(port_buffer);
 								if (RSHELL_PORT != sockport && KSHELL_PORT != sockport)
 								{
 									tl->iod->type = gtmsocket;
@@ -369,10 +391,14 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 		/* Check the saved error from mknod() for fifo, also saved error from fstat() or stat()
 		   so error handler (if set)  can handle it */
 		if (ff == tl->iod->type  && mknod_err)
-			rts_error(VARLSTCNT(1) save_mknod_err);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) save_mknod_err);
 		/* Error from either stat() or fstat() function */
 		if (stat_err)
-			rts_error(VARLSTCNT(1) save_stat_err);
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) save_stat_err);
+		/* Error from trying to open a dir */
+		if (dir_err)
+			rts_error_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_GTMEISDIR, 2, LEN_AND_STR(buf));
+
 
 		if (timed)
 			start_timer(timer_id, msec_timeout, wake_alarm, 0, NULL);
@@ -483,15 +509,24 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 	}
 #endif
 	if (-1 == file_des)
-		rts_error(VARLSTCNT(1) errno);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) errno);
 
 	if (n_io_dev_types == naml->iod->type)
 	{
-		if (isatty(file_des))
+		/* On AIX, /dev/{,*}random are of 'terminal type'.Hence define its type before
+		 * calling isatty()
+		 */
+		if ((0 == memvcmp(tn.addr, tn.len, LIT_AND_LEN("/dev/random")))
+			|| (0 == memvcmp(tn.addr, tn.len, LIT_AND_LEN("/dev/urandom"))))
+				tl->iod->type = rm;
+		else if (isatty(file_des))
 			naml->iod->type = tt;
-		else  if (char_or_block_special && file_des > 2)
-			/* assume mag tape */
-			naml->iod->type = mt;
+		else if (char_or_block_special && file_des > 2)
+			if (0 == memvcmp(tn.addr, tn.len, LIT_AND_LEN("/dev/zero")))
+				tl->iod->type = rm;
+			else
+				/* assume mag tape */
+				naml->iod->type = mt;
 		else
 			naml->iod->type = rm;
 	}
@@ -510,6 +545,8 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 		naml->iod->dollar.y = 0;
 		naml->iod->dollar.za = 0;
 		naml->iod->dollar.zb[0] = 0;
+		naml->iod->dollar.key[0] = 0;
+		naml->iod->dollar.device[0] = 0;
 	}
 #ifdef __MVS__
 	/*	copy over the content of tl->iod(naml->iod) to (tl->iod->pair.out)	*/
@@ -545,8 +582,18 @@ bool io_open_try(io_log_name *naml, io_log_name *tl, mval *pp, int4 timeout, mva
 	status = (naml->iod->disp_ptr->open)(naml, pp, file_des, mspace, timeout);
 	if (TRUE == status)
 		naml->iod->state = dev_open;
-	else if ((dev_open == naml->iod->state) && (gtmsocket != naml->iod->type))
-		naml->iod->state = dev_closed;
+	else
+	{
+		if ((dev_open == naml->iod->state) && (gtmsocket != naml->iod->type))
+			naml->iod->state = dev_closed;
+		if ((gtmsocket == naml->iod->type) && naml->iod->newly_created)
+		{
+			assert (naml->iod->state != dev_open);
+			iosocket_destroy(naml->iod);
+			active_device = 0;
+			return status;
+		}
+	}
 #ifdef __MVS__
 	d_rm_out = tl->iod->pair.out->dev_sp;
 	d_rm_in = tl->iod->pair.in->dev_sp;

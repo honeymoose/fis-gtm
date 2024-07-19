@@ -1,6 +1,6 @@
 /****************************************************************
  *                                                              *
- *    Copyright 2001, 2011 Fidelity Information Services, Inc   *
+ *    Copyright 2001, 2013 Fidelity Information Services, Inc   *
  *                                                              *
  *    This source code contains the intellectual property       *
  *    of its copyright holder(s), and is made available         *
@@ -13,10 +13,6 @@
 #define MDESP_included
 
 #include <sys/types.h>
-
-#if defined(__ia64) || defined(__x86_64__) || defined(__sparc) || defined(__s390__)
-#define GTM64
-#endif /* __ia64 */
 
 #ifdef GTM64
 typedef	long		int8;		/* 8-byte signed integer */
@@ -38,18 +34,6 @@ typedef uint2 mach_inst;
 #define	INT8_FMTX		"[0x%llx]"
 #define UNICODE_SUPPORTED
 
-/* Starting off life as debugging parms and now we need them for the
-	short term so define them here */
-#define DEBUG_LEAVE_SM
-#define DEBUG_NOMSYNC
-
-#define readonly
-#define GBLDEF
-#define GBLREF extern
-#define LITDEF const
-#define LITREF extern const
-#define error_def(x) LITREF int x
-
 #define UNIX 1
 #undef VMS
 #define BIGENDIAN 1
@@ -57,7 +41,6 @@ typedef uint2 mach_inst;
 
 #ifdef __sparc
 #define CACHELINE_SIZE	256
-#define MSYNC_ADDR_INCS	OS_PAGE_SIZE
 #define USHBIN_SUPPORTED
 #define LINKAGE_PSECT_BOUNDARY	8
 #define OFF_T_LONG
@@ -85,7 +68,6 @@ typedef uint4 mach_inst;
 #endif /* __ia64 */
 
 #ifdef __hpux
-#define MSYNC_ADDR_INCS	OS_PAGE_SIZE
 #define MUTEX_MSEM_WAKE
 #define POSIX_MSEM
 #define USHBIN_SUPPORTED
@@ -93,9 +75,12 @@ typedef uint4 mach_inst;
 /* Make sure linkage Psect is aligned on appropriate boundary. */
 #ifdef __ia64
 #define LINKAGE_PSECT_BOUNDARY	8
-#else
+#else /* parisc */
 #define LINKAGE_PSECT_BOUNDARY	4
-#endif //__ia64
+#ifdef __GNUC__
+typedef unsigned short	in_port_t; /* GCC needs this on PARISC */
+#endif
+#endif
 typedef uint4 mach_inst;	/* machine instruction */
 #endif /* __hpux */
 
@@ -117,15 +102,8 @@ typedef unsigned short	in_port_t;
 
 #ifdef __linux__
 #define SYS_ERRLIST_INCLUDE	"gtm_stdio.h"
-/* For 32-bit linux in i386, we noticed during the RHEL 5.5 upgrade that using msems affects process wakeup times
- * dramatically enough to cause test hangs/failures.  Not sure if it is a linux kernel or package issue.
- * Therefore disabling msems on that platform for now until we know better. The alternative is socket waits (using
- * select/poll system call). Performance differences, if any, is expected to be only a marginally slowdown.
- */
-#  ifndef __i386
-#  define MUTEX_MSEM_WAKE
-#  define POSIX_MSEM
-#  endif
+#define MUTEX_MSEM_WAKE
+#define POSIX_MSEM
 #endif
 
 #ifdef __CYGWIN__
@@ -141,16 +119,14 @@ typedef unsigned short	in_port_t;
 #define	GTM_CONTEXT(func)	(unsigned char *)func
 #define SSM_SIZE		256*1024*1024	/* Segments on 256M boundary */
 #define SHMAT_ADDR_INCS 	SSM_SIZE
-#define MSYNC_ADDR_INCS 	OS_PAGE_SIZE
 #define USHBIN_SUPPORTED
 #endif /* __s390__ */
 
 #ifdef __ia64
 #  ifdef __linux__
-#    define MSYNC_ADDR_INCS	OS_PAGE_SIZE
-#  undef BIGENDIAN
+#    undef BIGENDIAN
 #    define USHBIN_SUPPORTED
-	/* Make sure linkage Psect is aligned on appropriate boundary. */
+     /* Make sure linkage Psect is aligned on appropriate boundary. */
 #    define LINKAGE_PSECT_BOUNDARY  8
 typedef uint4 mach_inst;	/* machine instruction */
 #  elif defined(__hpux)
@@ -163,14 +139,12 @@ void dyncall();
 #ifdef __i386
 /* Through Pentium Pro/II/III, should use CPUID to get real value perhaps */
 #define CACHELINE_SIZE	32
-#define MSYNC_ADDR_INCS	OS_PAGE_SIZE
 #undef BIGENDIAN
 typedef char  mach_inst;	/* machine instruction */
 #endif /* __i386 */
 
 #ifdef __x86_64__
 #define CACHELINE_SIZE	64
-#define MSYNC_ADDR_INCS	OS_PAGE_SIZE
 #define USHBIN_SUPPORTED
 #define INO_T_LONG
 /*
@@ -229,6 +203,13 @@ typedef struct
 
 #define malloc gtm_malloc
 #define free gtm_free
+/* gtm_shmget calls either the native shmget or libhugetlbfs's shmget which uses Huge Pages
+ * to back the shared segment if possible. This is a Linux only library.
+ */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
+#	define shmget	gtm_shmget
+	extern int gtm_shmget(key_t , size_t , int);
+#endif
 
 #ifndef __ia64
 #define CODE_ADDRESS(func)	(unsigned char *)func

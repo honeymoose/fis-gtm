@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -54,7 +54,7 @@ void gtm_dump_core(void)
 			SPRINTF(&newname[0], "core%d", suffix);         /* Make new file name */
 			status = Stat(&newname[0], &fs1);               /* This file exist ? */
 			if (0 != status)
-				status = rename("core", &newname[0]);   /* No, attempt the rename */
+				status = RENAME("core", &newname[0]);   /* No, attempt the rename */
 			else
 				status = -1;                            /* Yes, reset status for another iteration */
 		}
@@ -66,5 +66,5 @@ void gtm_dump_core(void)
 	sigprocmask(SIG_UNBLOCK, &unblock_sigquit, NULL);
 	kill(getpid(), SIGQUIT);
 	sleep(60);	/* In case of async kill */
-	_exit(1);
+	_exit(EXIT_FAILURE);
 }

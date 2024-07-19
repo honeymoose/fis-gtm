@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc *
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc *
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -14,7 +14,7 @@
  *
  *	Include file for the GTCM server (OMI code).
  *
- *  $Header:$
+ *  $Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/omi.h,v 1.7 2013/10/23 03:49:31 tuskentower Exp $
  *
  */
 
@@ -57,23 +57,26 @@
 	{								\
 		extern FILE	*omi_debug;				\
 		time_t		clock;					\
+		char		*time_ptr;				\
+									\
 		if (omi_debug)						\
 		{							\
 			clock = time((time_t *)0);			\
-			FPRINTF(omi_debug, "%s", ctime(&clock));	\
+			GTM_CTIME(time_ptr, &clock);			\
+			FPRINTF(omi_debug, "%s", time_ptr);		\
 			FFLUSH(omi_debug);				\
 		}							\
 	} while (0)
 
-#define OMI_DBG(X)				\
-	do					\
-	{					\
-		extern FILE	*omi_debug;	\
-		if (omi_debug)			\
-		{				\
-			FPRINTF X ;		\
-			FFLUSH(omi_debug);	\
-		}				\
+#define OMI_DBG(X)							\
+	do								\
+	{								\
+		extern FILE	*omi_debug;				\
+		if (omi_debug)						\
+		{							\
+			FPRINTF X ;					\
+			FFLUSH(omi_debug);				\
+		}							\
 	} while (0)
 
 
@@ -301,7 +304,8 @@ typedef struct	omi_cn_stat
 {
 	int			id;
 	time_t			start;
-	struct sockaddr_in	sin;
+	struct addrinfo		ai;
+	struct sockaddr_storage sas;
 	int			bytes_recv;
 	int			bytes_send;
 	int			xact[OMI_OP_MAX];

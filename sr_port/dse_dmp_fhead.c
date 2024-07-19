@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -230,9 +230,7 @@ void dse_dmp_fhead (void)
 		/* Mutex Stuff */
 		util_out_print("  Mutex Hard Spin Count !19UL", FALSE, csd->mutex_spin_parms.mutex_hard_spin_count);
 		util_out_print("  Mutex Sleep Spin Count!12UL", TRUE, csd->mutex_spin_parms.mutex_sleep_spin_count);
-		util_out_print("  Mutex Spin Sleep Time !19UL", FALSE,
-			(csd->mutex_spin_parms.mutex_spin_sleep_mask == 0) ?
-				0 : (csd->mutex_spin_parms.mutex_spin_sleep_mask + 1));
+		util_out_print("  Mutex Queue Slots     !19UL", FALSE, NUM_CRIT_ENTRY(csd));
 		util_out_print("  KILLs in progress     !12UL", TRUE, (csd->kill_in_prog + csd->abandoned_kills));
 		util_out_print("  Replication State           !AD", FALSE, 13,
 			(csd->repl_state == repl_closed ? "          OFF"
@@ -250,7 +248,17 @@ void dse_dmp_fhead (void)
 		UNIX_ONLY(
 		util_out_print("  Commit Wait Spin Count!12UL", TRUE, csd->wcs_phase2_commit_wait_spincnt);
 		)
-		util_out_print("  Database file encrypted             !AD", TRUE, 5, csd->is_encrypted ? " TRUE" : "FALSE");
+		util_out_print("  Database file encrypted             !AD", UNIX_ONLY(FALSE) VMS_ONLY(TRUE), 5,
+				  csd->is_encrypted ? " TRUE" : "FALSE");
+		UNIX_ONLY(
+		util_out_print("  Inst Freeze on Error         !AD", TRUE, 5, csd->freeze_on_fail ? " TRUE" : "FALSE");
+		)
+		UNIX_ONLY(
+		util_out_print("  Spanning Node Absent                !AD", FALSE, 5, csd->span_node_absent ? " TRUE" : "FALSE");
+		)
+		UNIX_ONLY(
+		util_out_print("  Maximum Key Size Assured     !AD", TRUE, 5, csd->maxkeysz_assured ? " TRUE" : "FALSE");
+		)
 	}
 	if (CLI_PRESENT == cli_present("ALL"))
 	{	/* Only dump if -/ALL as if part of above display */
@@ -271,8 +279,14 @@ void dse_dmp_fhead (void)
 		util_out_print("  Write cache timer count 0x!XL", TRUE, cnl->wcs_timers);
 		util_out_print("  Free  Global Buffers           0x!XL", FALSE, cnl->wc_in_free);
 		util_out_print("  wcs_wtstart pid count   0x!XL", TRUE, cnl->in_wtstart);
-		util_out_print("  Write Cache is Blocked              !AD", FALSE, 5, (csd->wc_blocked ? " TRUE" : "FALSE"));
+		util_out_print("  Write Cache is Blocked              !AD", FALSE, 5, (cnl->wc_blocked ? " TRUE" : "FALSE"));
 		util_out_print("  wcs_wtstart intent cnt  0x!XL", TRUE, cnl->intent_wtstart);
+#		ifdef UNIX
+		util_out_print(0, TRUE);
+		util_out_print("  Quick database rundown is active    !AD", TRUE, 5, (csd->mumps_can_bypass ? " TRUE" : "FALSE"));
+		util_out_print("  Access control rundown bypasses !9UL", FALSE, cnl->dbrndwn_access_skip);
+		util_out_print("  FTOK rundown bypasses   !10UL", TRUE, cnl->dbrndwn_ftok_skip);
+#		endif
 		new_line = FALSE;
 		for (index = 0; MAX_WTSTART_PID_SLOTS > index; index++)
 		{

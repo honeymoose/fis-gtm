@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2010 Fidelity Information Services, Inc *
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc *
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -21,20 +21,21 @@
 #include "gtm_string.h"
 #include "gtm_stdio.h"
 #include "gtm_unistd.h"		/* for close() used by CLOSEFILE_RESET */
-#include "gtm_time.h"		/* for ctime() and time() */
+#include "gtm_time.h"		/* for ctime and time */
 
 #include "gtcm.h"
 #include "rc_oflow.h"
 #include "eintr_wrappers.h"
 #include "gtm_socket.h"
 #include "gtmio.h"
+#include "have_crit.h"
 
 #ifdef BSD_TCP
 #include "gtm_inet.h"
 #endif /* defined(BSD_TCP) */
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/gtcm_cn_acpt.c,v 1.7 2013/10/23 03:49:31 tuskentower Exp $";
 #endif
 
 GBLREF	char	*omi_pklog;
@@ -47,15 +48,17 @@ int gtcm_cn_acpt(omi_conn_ll *cll, int now)		/* now --> current time in seconds 
 	omi_conn	*cptr;
 	omi_fd		fd;
 	int		rc;
+	char 		*tmp_time;
 
 #ifdef BSD_TCP
-	GTM_SOCKLEN_TYPE			sln;
-	struct sockaddr_in	sin;
-	int			option, optsize;
+	GTM_SOCKLEN_TYPE	sln;
+	struct sockaddr_storage	sas;
+	int			optsize;
+	const boolean_t		keepalive = TRUE;
 
 	/*  Accept the connection from the network layer */
-	sln = SIZEOF(sin);
-	if ((fd = accept(cll->nve, (struct sockaddr *)&sin, (GTM_SOCKLEN_TYPE *)&sln)) < 0)
+	sln = SIZEOF(sas);
+	if ((fd = accept(cll->nve, (struct sockaddr *)&sas, (GTM_SOCKLEN_TYPE *)&sln)) < 0)
 		return -1;
 #endif				/* defined(BSD_TCP) */
 
@@ -83,7 +86,9 @@ int gtcm_cn_acpt(omi_conn_ll *cll, int now)		/* now --> current time in seconds 
 	memset(cptr->of, 0, SIZEOF(struct rc_oflow));
 	cptr->pklog = FD_INVALID;
 	/*  Initialize the statistics */
-	memcpy(&cptr->stats.sin,&sin,SIZEOF(sin));
+	memcpy(&cptr->stats.sas, &sas, sln);
+	cptr->stats.ai.ai_addr = (struct sockaddr *)&cptr->stats.sas;
+	cptr->stats.ai.ai_addrlen = sln;
 	cptr->stats.bytes_recv = 0;
 	cptr->stats.bytes_send = 0;
 	cptr->stats.start      = time((time_t *)0);
@@ -99,7 +104,7 @@ int gtcm_cn_acpt(omi_conn_ll *cll, int now)		/* now --> current time in seconds 
 
 		for (prev = NULL, this = cll->head; this; prev = this, this = this->next)
 		{
-			if (this->stats.sin.sin_addr.s_addr == sin.sin_addr.s_addr)
+			if (0 == memcmp((sockaddr_ptr)(&this->stats.sas), (sockaddr_ptr)&sas, sln))
 			{
 				if (cll->tail == this)
 				    cll->tail = cptr;
@@ -110,7 +115,7 @@ int gtcm_cn_acpt(omi_conn_ll *cll, int now)		/* now --> current time in seconds 
 				cptr->next = this->next;
 				OMI_DBG_STMP;
 				OMI_DBG((omi_debug, "%s: dropping old connection to %s\n",
-					SRVR_NAME, gtcm_hname(&cptr->stats.sin)));
+					SRVR_NAME, gtcm_hname(&cptr->stats.ai)));
 				gtcm_cn_disc(this, cll);
 				break;
 			}
@@ -153,10 +158,10 @@ int gtcm_cn_acpt(omi_conn_ll *cll, int now)		/* now --> current time in seconds 
 			}
 		}
 	)
+	GTM_CTIME(tmp_time, &cptr->stats.start);
 	OMI_DBG((omi_debug, "%s: connection %d from %s by user <%s> at %s", SRVR_NAME,
-		cptr->stats.id, gtcm_hname(&cptr->stats.sin), cptr->ag_name, GTM_CTIME(&cptr->stats.start)));
-	option = -1;
-	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&option, SIZEOF(option)) < 0)
+		cptr->stats.id, gtcm_hname(&cptr->stats.ai), cptr->ag_name, tmp_time));
+	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&keepalive, SIZEOF(keepalive)) < 0)
 	{
 		PERROR("setsockopt:");
 		return -1;

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -42,6 +42,7 @@
 #include "gdsfhead.h"
 #include "filestruct.h"
 #include "dpgbldir.h"
+#include "fork_init.h"
 
 GBLREF boolean_t	created_core;		/* core file was created */
 GBLREF unsigned int	core_in_progress;
@@ -135,7 +136,7 @@ DEBUG_ONLY( struct rlimit rlim;)
 
 					status = stat(newname, &fs1);		/* This file exist ? */
 					if (0 != status)
-						status = rename(oldname, newname); /* No, attempt the rename */
+						status = RENAME(oldname, newname); /* No, attempt the rename */
 					else
 						status = -1;			/* Yes, reset status for another iteration */
 				}
@@ -150,8 +151,8 @@ DEBUG_ONLY( struct rlimit rlim;)
 	{
 		if (1 == core_in_progress)
 		{	/* only report once */
-			send_msg(VARLSTCNT(1) ERR_COREINPROGRESS, 0);
-			gtm_putmsg(VARLSTCNT(1) ERR_COREINPROGRESS, 0);
+			send_msg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_COREINPROGRESS, 0);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_COREINPROGRESS, 0);
 		}
 		return;
 	}
@@ -165,14 +166,14 @@ DEBUG_ONLY( struct rlimit rlim;)
 	/* block SIGALRM signal */
 	sigprocmask(SIG_BLOCK, &blockalrm, &savemask);
 
-	childid = fork();	/* BYPASSOK: we exit immediately, no FORK_CLEAN needed */
+	FORK(childid);	/* BYPASSOK: we exit immediately, no FORK_CLEAN needed */
 	if (childid)
 	{
 		if (-1 == childid)
 		{	/* restore interrupt handler */
 			sigaction(SIGINT, &intr, 0);
 			sigprocmask(SIG_SETMASK, &savemask, NULL);
-			gtm_putmsg(VARLSTCNT(3) ERR_NOFORKCORE, 0, errno);
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(3) ERR_NOFORKCORE, 0, errno);
 			return;		/* Fork failed, no core done */
 		}
 		WAITPID(childid, &status, 0, waitrc);
@@ -189,29 +190,6 @@ DEBUG_ONLY( struct rlimit rlim;)
 			created_core = TRUE;
 	} else
 	{
-		for (addr_ptr = get_next_gdr(NULL); addr_ptr; addr_ptr = get_next_gdr(addr_ptr))
-		{
-			for (reg = addr_ptr->regions, r_top = reg + addr_ptr->n_regions;  reg < r_top;  reg++)
-			{
-				if (reg->open && !reg->was_open && (dba_mm == reg->dyn.addr->acc_meth))
-				{	/* Because most OSs don't include mapped memory in the core file, copy file header
-					 * to temporary location that'll show up in the core.
-					 */
-					csa = (sgmnt_addrs *)&FILE_INFO(reg)->s_addrs;
-					tmp_csd = csa->hdr;
-					if ((NULL != tmp_csd) && (MM_MALLOC_ALREADY_TRIED != csa->mm_core_hdr))
-					{
-						csa->mm_core_hdr = MM_MALLOC_ALREADY_TRIED;
-						csd = (sgmnt_data_ptr_t)malloc(SIZEOF(*csd));
-						if (NULL != csd)
-						{
-							memcpy((sm_uc_ptr_t)csd, (uchar_ptr_t)tmp_csd, SIZEOF(*csd));
-							csa->mm_core_hdr = csd;
-						}
-					}
-				}
-			}
-		}
 		DUMP_CORE;	/* This will (should) not return */
 		_exit(-1);	/* Protection to kill fork'd process with no rundown by exit handler(s) */
 	}

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -47,6 +47,7 @@
 #include "interlock.h"
 #include "muextr.h"
 #include "mu_reorg.h"
+#include "anticipatory_freeze.h"
 
 /* Include prototypes */
 #include "t_end.h"
@@ -65,13 +66,26 @@
 #include "wcs_sleep.h"
 #include "memcoherency.h"
 
+#ifdef UNIX
+#include "repl_msg.h"
+#include "gtmsource.h"
+#endif
+#ifdef GTM_TRIGGER
+#include "hashtab_mname.h"
+#include "gv_trigger.h"
+#include "gv_trigger_common.h"
+#include "targ_alloc.h"
+#endif
+
+GTMTRIG_ONLY(LITREF	mval	literal_hasht;)
+
 GBLREF	bool			mu_ctrlc_occurred;
 GBLREF	bool			mu_ctrly_occurred;
 GBLREF	sgmnt_data_ptr_t	cs_data;
 GBLREF	sgmnt_addrs		*cs_addrs;
 GBLREF	gv_key			*gv_currkey_next_reorg;
 GBLREF	gd_region		*gv_cur_region;
-GBLREF	gv_key			*gv_currkey;
+GBLREF	gv_key			*gv_currkey, *gv_altkey;
 GBLREF	gv_namehead		*gv_target;
 GBLREF	gv_namehead		*reorg_gv_target;
 GBLREF	unsigned char		cw_map_depth;
@@ -92,6 +106,19 @@ error_def(ERR_GBLNOEXIST);
 error_def(ERR_MAXBTLEVEL);
 error_def(ERR_MUREORGFAIL);
 
+#define SAVE_REORG_RESTART													\
+{																\
+	cs_data->reorg_restart_block = dest_blk_id;										\
+	if (OLD_MAX_KEY_SZ >= gv_currkey->end)											\
+		memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], gv_currkey->end + 1);				\
+	else															\
+	{	/* Save only so much of gv_currkey as will fit in reorg_restart_key. Expect this to be no more than a very	\
+		 * minor inconvenience for those using -RESUME */								\
+		memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], OLD_MAX_KEY_SZ + 1);				\
+		cs_data->reorg_restart_key[OLD_MAX_KEY_SZ] = 0;									\
+		cs_data->reorg_restart_key[OLD_MAX_KEY_SZ - 1] = 0;								\
+	}															\
+}
 
 #ifdef UNIX
 # define ABORT_TRANS_IF_GBL_EXIST_NOMORE_AND_RETURN(LCL_T_TRIES)								\
@@ -101,7 +128,7 @@ error_def(ERR_MUREORGFAIL);
 	ABORT_TRANS_IF_GBL_EXIST_NOMORE(LCL_T_TRIES, tn_aborted);								\
 	if (tn_aborted)														\
 	{															\
-		gtm_putmsg(VARLSTCNT(4) ERR_GBLNOEXIST, 2, gn->str.len, gn->str.addr);						\
+		gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_GBLNOEXIST, 2, gn->str.len, gn->str.addr);			\
 		reorg_finish(dest_blk_id, blks_processed, blks_killed, blks_reused, file_extended, lvls_reduced, blks_coalesced,\
 				blks_split, blks_swapped);									\
 		return TRUE; /* It is not an error if the global (that once existed) doesn't exist anymore (due to ROLLBACK) */	\
@@ -194,7 +221,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 	 */
 	int			pre_order_successor_level, level;
 	static block_id		dest_blk_id = 0;
-	int			tkeysize;
+	int			tkeysize, altkeylen;
 	int			blks_killed, blks_processed, blks_reused, blks_coalesced, blks_split, blks_swapped,
 				count, file_extended, lvls_reduced;
 	int			d_max_fill, i_max_fill, blk_size, cur_blk_size, max_fill, toler, d_toler, i_toler;
@@ -203,21 +230,42 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 	sm_uc_ptr_t		rPtr1;
 	enum cdb_sc		status;
 	srch_hist		*rtsib_hist;
+	super_srch_hist		super_dest_hist; /* dir_hist combined with reorg_gv_target->hist */
 	jnl_buffer_ptr_t	jbp;
 	trans_num		ret_tn;
+	sgmnt_addrs		*csa;
 #	ifdef UNIX
 	DEBUG_ONLY(unsigned int	lcl_t_tries;)
 #	endif
+#	ifdef GTM_TRIGGER
+	gv_namehead		*hasht_tree;
+	mname_entry		gvent;
+#	endif
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
+	csa = cs_addrs;
 	t_err = ERR_MUREORGFAIL;
 	kill_set_tail = &kill_set_list;
-	/* Initialization for current global */
 	inctn_opcode = inctn_invalid_op; /* temporary reset; satisfy an assert in t_end() */
-	op_gvname(VARLSTCNT(1) gn);
+#	ifdef GTM_TRIGGER
+	if (IS_MNAME_HASHT_GBLNAME(gn->str))
+	{	/* Initialize ^#t global for this region. Maintain reorg_restart_key as usual since this exists per region. */
+		SETUP_TRIGGER_GLOBAL;
+		INITIAL_HASHT_ROOT_SEARCH_IF_NEEDED;
+		DBG_CHECK_GVTARGET_GVCURRKEY_IN_SYNC(CHECK_CSA_TRUE);
+		if (0 != gv_target->root)
+		{
+			util_out_print("   ", FLUSH);
+			util_out_print("Global: !AD (region !AD)", FLUSH, gn->str.len, gn->str.addr, REG_LEN_STR(gv_cur_region));
+		}
+	} else
+#	endif	/* Initialization for current global */
+		op_gvname(VARLSTCNT(1) gn);
 	/* Cannot proceed for read-only data files */
 	if (gv_cur_region->read_only)
 	{
-		gtm_putmsg(VARLSTCNT(4) ERR_DBRDONLY, 2, DB_LEN_STR(gv_cur_region));
+		gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_DBRDONLY, 2, DB_LEN_STR(gv_cur_region));
 		return FALSE;
 	}
 	if (0 == gv_target->root)
@@ -232,11 +280,13 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 	if (*resume && 0 != cs_data->reorg_restart_key[0])
 	{
 		/* resume from last key reorged in GVT */
-		GET_KEY_LEN(tkeysize, &cs_data->reorg_restart_key[0]);
+		tkeysize = get_key_len(NULL, &cs_data->reorg_restart_key[0]);
 		memcpy(gv_currkey->base, cs_data->reorg_restart_key, tkeysize);
 		gv_currkey->end = tkeysize - 1;
 		dest_blk_id = cs_data->reorg_restart_block;
- 		if (0 == memcmp(cs_data->reorg_restart_key, gn->str.addr, gn->str.len))
+		SET_GV_ALTKEY_TO_GBLNAME_FROM_GV_CURRKEY;
+		altkeylen = gv_altkey->end - 1;
+ 		if (altkeylen && (altkeylen == gn->str.len) && (0 == memcmp(gv_altkey->base, gn->str.addr, gn->str.len)))
 			/* Going to resume from current global, so it resumed and make it false */
 			*resume = FALSE;
 	} else
@@ -283,8 +333,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 		{
 			if (mu_ctrlc_occurred || mu_ctrly_occurred)
 			{
-				cs_data->reorg_restart_block = dest_blk_id;
-				memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], gv_currkey->end + 1);
+				SAVE_REORG_RESTART;
 				return FALSE;
 			}
 			complete_merge = FALSE;
@@ -326,7 +375,8 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 					status = mu_split(level, i_max_fill, d_max_fill, &cnt1, &cnt2);
 					if (cdb_sc_maxlvl == status)
 					{
-						gtm_putmsg(VARLSTCNT(4) ERR_MAXBTLEVEL, 2, gn->str.len, gn->str.addr);
+						gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_MAXBTLEVEL, 2, gn->str.len,
+								gn->str.addr);
 						reorg_finish(dest_blk_id, blks_processed, blks_killed, blks_reused,
 							file_extended, lvls_reduced, blks_coalesced, blks_split, blks_swapped);
 						return FALSE;
@@ -455,7 +505,8 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 					 *	here gv_currkey_next_reorg will be set from right sibling
 					 */
 					cw_set_depth = cw_map_depth = 0;
-					GET_KEY_LEN(tkeysize, rtsib_hist->h[0].buffaddr + SIZEOF(blk_hdr) + SIZEOF(rec_hdr));
+					tkeysize = get_key_len(rtsib_hist->h[0].buffaddr, rtsib_hist->h[0].buffaddr
+											+ SIZEOF(blk_hdr) + SIZEOF(rec_hdr));
 					if (2 < tkeysize && MAX_KEY_SZ >= tkeysize)
 					{
 						memcpy(&(gv_currkey_next_reorg->base[0]), rtsib_hist->h[0].buffaddr
@@ -495,8 +546,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 
 		if (mu_ctrlc_occurred || mu_ctrly_occurred)
 		{
-			cs_data->reorg_restart_block = dest_blk_id;
-			memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], gv_currkey->end+1);
+			SAVE_REORG_RESTART;
 			return FALSE;
 		}
 		/* Now swap the working block */
@@ -534,6 +584,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 				} else if (cdb_sc_normal == status)
 				{
 					UNIX_ONLY(DEBUG_ONLY(lcl_t_tries = t_tries));
+					MERGE_SUPER_HIST(&super_dest_hist, reorg_gv_target->alt_hist, &(reorg_gv_target->hist));
 					if (0 < kill_set_list.used)
 					{
 						need_kip_incr = TRUE;
@@ -564,7 +615,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 					/* gv_target->hist is for working block's history, and
 					   reorg_gv_target->hist is for destinition block's history.
 					   Note: gv_target and reorg_gv_target can be part of different GVT.  */
-					else if ((trans_num)0 == (ret_tn = t_end(&(gv_target->hist), &(reorg_gv_target->hist),
+					else if ((trans_num)0 == (ret_tn = t_end(&(gv_target->hist), (srch_hist *)&super_dest_hist,
 						TN_NOT_SPECIFIED)))
 					{
 						need_kip_incr = FALSE;
@@ -592,8 +643,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 		}
 		if (mu_ctrlc_occurred || mu_ctrly_occurred)
 		{
-			cs_data->reorg_restart_block = dest_blk_id;
-			memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], gv_currkey->end + 1);
+			SAVE_REORG_RESTART;
 			return FALSE;
 		}
 		if (end_of_tree)
@@ -605,8 +655,7 @@ boolean_t mu_reorg(mval *gn, glist *exclude_glist_ptr, boolean_t *resume, int in
 			level = pre_order_successor_level;
 			memcpy(&gv_currkey->base[0], &gv_currkey_next_reorg->base[0], gv_currkey_next_reorg->end + 1);
 			gv_currkey->end =  gv_currkey_next_reorg->end;
-			cs_data->reorg_restart_block = dest_blk_id;
-			memcpy(&cs_data->reorg_restart_key[0], &gv_currkey->base[0], gv_currkey->end + 1);
+			SAVE_REORG_RESTART;
 		}
 	}		/* ================ END MAIN LOOP ================ */
 

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -9,9 +9,12 @@
  *								*
  ****************************************************************/
 
+#ifndef SLEEP_CNT_H_INCLUDED
+#define SLEEP_CNT_H_INCLUDED
+
 #include "min_max.h"
 
-/* Note: GT.M code *MUST*NOT* make use of the sleep() function because use of the sleep() function
+/* Note: GT.M code *MUST*NOT* make use of the sleep() function because use of the sleep() function	(BYPASSOK - sleep())
    causes problems with GT.M's timers on some platforms. Specifically, the sleep() function
    causes the SIGARLM handler to be silently deleted on Solaris systems (through Solaris 9 at least).
    This leads to lost timer pops and has the potential for system hangs. The proper long sleep mechanism
@@ -39,12 +42,15 @@
 #define JNL_FLUSH_PROG_FACTOR	2
 #define JNL_FLUSH_PROG_TRIES	(JNL_MAX_FLUSH_TRIES * JNL_FLUSH_PROG_FACTOR)
 #define MAX_LCK_TRIES 		SLEEP_ONE_MIN	/* vms only: wait in mu_rndwn_file */
-#define MAX_FSYNC_WAIT_CNT     	(2 * SLEEP_ONE_MIN)	/* 2 mins of total wait for fsync, before GTMASSERTing */
-#define	MAX_TQREAD_WAIT		(4 * BUF_OWNER_STUCK)	/* 4 mins of total wait for t_qread, before GTMASSERTing */
+#define FSYNC_WAIT_TIME     	(2 * SLEEP_ONE_MIN)	/* 2 mins of wait for fsync between JNLFSYNCSTUCK complaints */
+#define FSYNC_WAIT_HALF_TIME    SLEEP_ONE_MIN	/* 1 min of wait for fsync between DEBUG JNLFSYNCSTUCK complaints */
 
 #define PHASE2_COMMIT_SLEEP	MAXSLPTIME	/* 10 msec inter-iteration sleep wait for active phase2 commits */
 #define	PHASE2_COMMIT_WAIT	SLEEP_ONE_MIN
 #define	PHASE2_COMMIT_WAIT_HTBT	8		/* = 8 heartbeats (each 8 seconds) = 64 seconds wait (used in Unix) */
+
+#define	SLEEP_INSTFREEZEWAIT	100		/* 100-msec wait between re-checks of instance freeze status */
+#define	SLEEP_IORETRYWAIT	500		/* 500-msec wait between retries of the same write operation */
 
 #define	SLEEP_JNLQIOLOCKWAIT	1		/* 1-msec wait */
 #define	MAXJNLQIOLOCKWAIT	4000		/* 4sec = 4000 1-msec waits to see if io_in_prog lock is free in wcs_flu */
@@ -76,3 +82,5 @@
  * the remaining crs. The value of 4 minutes was chosen because that is what t_qread currently has as its
  * maximum wait for reading a block from disk into the global buffer. */
 #define MAX_WAIT_FOR_RIP	4
+
+#endif

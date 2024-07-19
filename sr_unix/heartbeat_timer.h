@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -37,4 +37,13 @@ GBLREF boolean_t heartbeat_started;
 
 void heartbeat_timer(void);
 
+#endif
+
+#ifdef DEBUG
+#include "gdsroot.h"
+#include "gdsbt.h"
+#include "gdsfhead.h"
+void set_enospc_if_needed(void);
+void choose_random_reg_list(char *enospc_enable_list, int);
+void set_enospc_flags(gd_addr *addr_ptr, char enospc_enable_list[], boolean_t ok_to_interrupt);
 #endif

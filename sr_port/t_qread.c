@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -47,16 +47,15 @@
 #include "add_inter.h"
 #include "wbox_test_init.h"
 #include "memcoherency.h"
-
+#include "wcs_flu.h"		/* for SET_CACHE_FAIL_STATUS macro */
 #ifdef UNIX
+# ifdef GTM_CRYPT
+#  include "gtmcrypt.h"
+# endif
 #include "io.h"			/* needed by gtmsecshr.h */
 #include "gtmsecshr.h"		/* for continue_proc */
 #endif
 #include "wcs_phase2_commit_wait.h"
-
-#ifdef GTM_CRYPT
-#include "gtmcrypt.h"
-#endif
 #include "gtm_c_stack_trace.h"
 
 GBLDEF srch_blk_status	*first_tp_srch_status;	/* the first srch_blk_status for this block in this transaction */
@@ -96,7 +95,15 @@ GBLREF	boolean_t		mupip_jnl_recover;
 	(first_tp_srch_status)->cycle = (newcycle);							\
 	(first_tp_srch_status)->buffaddr = (sm_uc_ptr_t)GDS_REL2ABS((newcr)->buffaddr);
 
+#define REL_CRIT_IF_NEEDED(CSA, REG, WAS_CRIT, HOLD_ONTO_CRIT)						\
+{	/* If currently have crit, but didn't have it upon entering, release crit now. */		\
+	assert(!WAS_CRIT || CSA->now_crit);								\
+	if ((WAS_CRIT != CSA->now_crit) && !HOLD_ONTO_CRIT)						\
+		rel_crit(REG);										\
+}
+
 error_def(ERR_BUFOWNERSTUCK);
+error_def(ERR_CRYPTBADCONFIG);
 error_def(ERR_DBFILERR);
 error_def(ERR_DYNUPGRDFAIL);
 error_def(ERR_GVPUTFAIL);
@@ -115,7 +122,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 	register sgmnt_addrs	*csa;
 	register sgmnt_data_ptr_t	csd;
 	enum db_ver		ondsk_blkver;
-	int4			dummy_errno;
+	int4			dummy_errno, gtmcrypt_errno;
 	boolean_t		already_built, is_mm, reset_first_tp_srch_status, set_wc_blocked, sleep_invoked;
 	ht_ent_int4		*tabent;
 	srch_blk_status		*blkhist;
@@ -123,7 +130,13 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 	sm_uc_ptr_t		buffaddr;
 	uint4			stuck_cnt = 0;
 	boolean_t		lcl_blk_free;
+	node_local_ptr_t	cnl;
+#	ifdef GTM_CRYPT
+	gd_segment		*seg;
+#	endif
+	DCL_THREADGBL_ACCESS;
 
+	SETUP_THREADGBL_ACCESS;
 	lcl_blk_free = block_is_free;
 	block_is_free = FALSE;	/* Reset to FALSE so that if t_qread fails below, we don't have an incorrect state of this var */
 	first_tp_srch_status = NULL;
@@ -269,11 +282,13 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 			}
 		}
 	}
-	if ((blk >= csa->ti->total_blks) || (blk < 0))
-	{	/* requested block out of range; could occur because of a concurrency conflict */
-		if ((&FILE_INFO(gv_cur_region)->s_addrs != csa) || (csd != cs_data))
-			GTMASSERT;
-		assert(FALSE == csa->now_crit);
+	if ((uint4)blk >= (uint4)csa->ti->total_blks)
+	{	/* Requested block out of range; could occur because of a concurrency conflict. mm_read and dsk_read assume blk is
+		 * never negative or greater than the maximum possible file size. If a concurrent REORG truncates the file, t_qread
+		 * can proceed despite blk being greater than total_blks. But dsk_read handles this fine; see comments below.
+		 */
+		assert((&FILE_INFO(gv_cur_region)->s_addrs == csa) && (csd == cs_data));
+		assert(!csa->now_crit);
 		rdfail_detail = cdb_sc_blknumerr;
 		return (sm_uc_ptr_t)NULL;
 	}
@@ -284,14 +299,17 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 		return (sm_uc_ptr_t)(mm_read(blk));
 	}
 #	ifdef GTM_CRYPT
-	/* If database is encrypted, check if encryption initialization went fine for this database. If not,
-	 * do not let process proceed as it could now potentially get a peek at the desired data from the
-	 * decrypted shared memory global buffers (read in from disk by other processes) without having to go to disk.
-	 * If DSE, allow for a special case where it is trying to dump a local bitmap block. In this case, DSE
-	 * can continue to run fine (even if encryption initialization failed) since bitmap blocks are unencrypted.
-	 */
-	if (csa->encrypt_init_status && (!dse_running || !IS_BITMAP_BLK(blk)))
-		GC_RTS_ERROR(csa->encrypt_init_status, gv_cur_region->dyn.addr->fname);
+	if ((GTMCRYPT_INVALID_KEY_HANDLE == csa->encr_key_handle) && !IS_BITMAP_BLK(blk))
+	{	/* A non-GT.M process is attempting to read a non-bitmap block but doesn't have a valid encryption key handle. This
+		 * is an indication that the process encountered an error during db_init and reported it with a -W- severity. But,
+		 * since the block it is attempting to read can be in the unencrypted shared memory, we cannot let it access it
+		 * without a valid handle. So, issue an rts_error
+		 */
+		assert(!IS_GTM_IMAGE);	/* GT.M would have error'ed out in db_init */
+		gtmcrypt_errno = SET_REPEAT_MSG_MASK(SET_CRYPTERR_MASK(ERR_CRYPTBADCONFIG));
+		seg = gv_cur_region->dyn.addr;
+		GTMCRYPT_REPORT_ERROR(gtmcrypt_errno, rts_error, seg->fname_len, seg->fname);
+	}
 #	endif
 	assert(dba_bg == csd->acc_meth);
 	assert(!first_tp_srch_status || !first_tp_srch_status->cr
@@ -300,7 +318,8 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 		bt = NULL;
 	was_crit = csa->now_crit;
 	ocnt = 0;
-	set_wc_blocked = FALSE;	/* to indicate whether csd->wc_blocked was set to TRUE by us */
+	cnl = csa->nl;
+	set_wc_blocked = FALSE;	/* to indicate whether cnl->wc_blocked was set to TRUE by us */
 	hold_onto_crit = csa->hold_onto_crit;	/* note down in local to avoid csa-> dereference in multiple usages below */
 	do
 	{
@@ -316,7 +335,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 					assert(clustered);
 					wait_for_block_flush(bt, blk);	/* try for no other node currently writing the block */
 				}
-				if (csd->flush_trigger <= csa->nl->wcs_active_lvl  &&  FALSE == gv_cur_region->read_only)
+				if ((csd->flush_trigger <= cnl->wcs_active_lvl) && (FALSE == gv_cur_region->read_only))
 					JNL_ENSURE_OPEN_WCS_WTSTART(csa, gv_cur_region, 0, dummy_errno);
 						/* a macro that dclast's "wcs_wtstart" and checks for errors etc. */
 				grab_crit(gv_cur_region);
@@ -333,9 +352,9 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				cr = db_csh_getn(blk);
 				if (CR_NOTVALID == (sm_long_t)cr)
 				{
-					assert(csd->wc_blocked); /* only reason we currently know why wcs_get_space could fail */
+					assert(cnl->wc_blocked); /* only reason we currently know wcs_get_space could fail */
 					assert(gtm_white_box_test_case_enabled);
-					SET_TRACEABLE_VAR(cs_data->wc_blocked, TRUE);
+					SET_TRACEABLE_VAR(cnl->wc_blocked, TRUE);
 					BG_TRACE_PRO_ANY(csa, wc_blocked_t_qread_db_csh_getn_invalid_blk);
 					set_wc_blocked = TRUE;
 					break;
@@ -355,7 +374,8 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				assert(0 == cr->dirty);
 				assert(cr->read_in_progress >= 0);
 				CR_BUFFER_CHECK(gv_cur_region, csa, csd, cr);
-				if (SS_NORMAL != (status = dsk_read(blk, GDS_REL2ABS(cr->buffaddr), &ondsk_blkver, lcl_blk_free)))
+				buffaddr = (sm_uc_ptr_t)GDS_REL2ABS(cr->buffaddr);
+				if (SS_NORMAL != (status = dsk_read(blk, buffaddr, &ondsk_blkver, lcl_blk_free)))
 				{	/* buffer does not contain valid data, so reset blk to be empty */
 					cr->cycle++;	/* increment cycle for blk number changes (for tp_hist and others) */
 					cr->blk = CR_BLKEMPTY;
@@ -378,21 +398,45 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 						if (was_crit)
 						{
 							assert(FALSE);
-							rts_error(VARLSTCNT(5) status, 3, blk, DB_LEN_STR(gv_cur_region));
+							rts_error_csa(CSA_ARG(csa) VARLSTCNT(5) status, 3, blk,
+									DB_LEN_STR(gv_cur_region));
 						} else
 						{
 							rdfail_detail = cdb_sc_lostcr;
 							return (sm_uc_ptr_t)NULL;
 						}
 					}
-					if (-1 == status)
-					{
-						/* could have been concurrent truncate, and we read a blk >= csa->ti->total_blks */
-						/* restart */
+					if ((-1 == status) && !was_crit)
+					{	/* LSEEKREAD and, consequently, dsk_read return -1 in case pread is unable to fetch
+						 * a full database block's length of data. This can happen if the requested read is
+						 * past the end of the file, which can happen if a concurrent truncate occurred
+						 * after the blk >= csa->ti->total_blks comparison above. Allow for this scenario
+						 * by restarting. However, if we've had crit the whole time, no truncate could have
+						 * happened. -1 indicates a problem with the file, so fall through to DBFILERR.
+						 */
 						rdfail_detail = cdb_sc_truncate;
 						return (sm_uc_ptr_t)NULL;
-					} else
-						rts_error(VARLSTCNT(5) ERR_DBFILERR, 2, DB_LEN_STR(gv_cur_region), status);
+					}
+#					ifdef GTM_CRYPT
+					else if (IS_CRYPTERR_MASK(status))
+					{
+						seg = gv_cur_region->dyn.addr;
+						GTMCRYPT_REPORT_ERROR(status, rts_error, seg->fname_len, seg->fname);
+					}
+#					endif
+					else
+					{	/* A DBFILERR can be thrown for two possible reasons:
+						 * (1) LSEEKREAD returned an unexpected error due to a filesystem problem; or
+						 * (2) csa/cs_addrs/csd/cs_data are out of sync, and we're trying to read a block
+						 * number for one region from another region with fewer total_blks.
+						 *    We suspect the former is what happened in GTM-7623. Apparently the latter
+						 * has been an issue before, too. If either occurs again in pro, this assertpro
+						 * distinguishes the two possibilities.
+						 */
+						assertpro((&FILE_INFO(gv_cur_region)->s_addrs == csa) && (csd == cs_data));
+						rts_error_csa(CSA_ARG(csa) VARLSTCNT(5) ERR_DBFILERR, 2, DB_LEN_STR(gv_cur_region),
+								status);
+					}
 				}
 				disk_blk_read = TRUE;
 				assert(0 <= cr->read_in_progress);
@@ -408,18 +452,18 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				{	/* keep the parantheses for the if (although single line) since the following is a macro */
 					RESET_FIRST_TP_SRCH_STATUS(first_tp_srch_status, cr, *cycle);
 				}
-				return (sm_uc_ptr_t)GDS_REL2ABS(cr->buffaddr);
+				return buffaddr;
 			} else  if (!was_crit && (BAD_LUCK_ABOUNDS > ocnt))
 			{
 				assert(!hold_onto_crit);
 				assert(TRUE == csa->now_crit);
-				assert(csa->nl->in_crit == process_id);
+				assert(cnl->in_crit == process_id);
 				rel_crit(gv_cur_region);
 			}
 		}
 		if (CR_NOTVALID == (sm_long_t)cr)
 		{
-			SET_TRACEABLE_VAR(cs_data->wc_blocked, TRUE);
+			SET_TRACEABLE_VAR(cnl->wc_blocked, TRUE);
 			BG_TRACE_PRO_ANY(csa, wc_blocked_t_qread_db_csh_get_invalid_blk);
 			set_wc_blocked = TRUE;
 			break;
@@ -442,8 +486,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 		{
 			if (0 > cr->read_in_progress)
 			{	/* it's not being read */
-				if (clustered && (0 == cr->bt_index) &&
-					(cr->tn < ((th_rec *)((uchar_ptr_t)csa->th_base + csa->th_base->tnque.fl))->tn))
+				if (clustered && (0 == cr->bt_index) && (cr->tn < OLDEST_HIST_TN(csa)))
 				{	/* can't rely on the buffer */
 					cr->cycle++;	/* increment cycle whenever blk number changes (tp_hist depends on this) */
 					cr->blk = CR_BLKEMPTY;
@@ -469,8 +512,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				)
 				if (cr->blk != blk)
 					break;
-				if ((was_crit != csa->now_crit) && !hold_onto_crit)
-					rel_crit(gv_cur_region);
+				REL_CRIT_IF_NEEDED(csa, gv_cur_region, was_crit, hold_onto_crit);
 				assert(was_crit == csa->now_crit);
 				/* Check if "cr" is locked for phase2 update by a concurrent process. Before doing so, need to
 				 * do a read memory barrier to ensure we read a consistent state. Otherwise, we could see
@@ -501,7 +543,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 					 * final retry in which case it is better to wait here as we dont want to end up in a
 					 * situation where "recompute_upd_array" indicates that a restart is necessary.
 					 */
-					if (dollar_tlevel && gv_target->noisolation && (ERR_GVPUTFAIL == t_err)
+					if (dollar_tlevel && (gv_target && gv_target->noisolation) && (ERR_GVPUTFAIL == t_err)
 						&& (CDB_STAGNATE > t_tries))	/* do not skip wait in case of final retry */
 					{	/* We know that the only caller in this case would be the function "gvcst_search".
 						 * If the input cr and cycle match corresponding fields of gv_target->hist.h[0],
@@ -525,10 +567,18 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 							blocking_pid = 0;	/* do not sleep in the for loop below */
 						}
 					}
-					if (blocking_pid && !wcs_phase2_commit_wait(csa, cr))
-					{	/* Timed out waiting for cr->in_tend to become non-zero. Restart. */
-						rdfail_detail = cdb_sc_phase2waitfail;
-						return NULL;
+					if (blocking_pid)
+					{
+						if (TREF(tqread_nowait) && ((sm_int_ptr_t)&gv_target->hist.h[0].cycle == cycle))
+						{	/* We're an update helper. Don't waste time waiting on a leaf blk */
+							rdfail_detail = cdb_sc_tqreadnowait;
+							return (sm_uc_ptr_t)NULL;
+						}
+						if (!wcs_phase2_commit_wait(csa, cr))
+						{	/* Timed out waiting for cr->in_tend to become non-zero. Restart. */
+							rdfail_detail = cdb_sc_phase2waitfail;
+							return (sm_uc_ptr_t)NULL;
+						}
 					}
 				}
 				if (reset_first_tp_srch_status)
@@ -560,14 +610,15 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				} else if (cr->read_in_progress >= 0)
 				{
 					BG_TRACE_PRO(t_qread_buf_owner_stuck);
-					if (0 != (blocking_pid = cr->r_epid))
+					blocking_pid = cr->r_epid;
+					if ((0 != blocking_pid) && (process_id != blocking_pid))
 					{
 						if (FALSE == is_proc_alive(blocking_pid, cr->image_count))
 						{	/* process gone: release that process's lock */
 							assert(0 == cr->bt_index);
 							if (cr->bt_index)
 							{
-								SET_TRACEABLE_VAR(csd->wc_blocked, TRUE);
+								SET_TRACEABLE_VAR(cnl->wc_blocked, TRUE);
 								BG_TRACE_PRO_ANY(csa, wc_blocked_t_qread_bad_bt_index1);
 								set_wc_blocked = TRUE;
 								break;
@@ -580,39 +631,50 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 						{
 							if (!hold_onto_crit)
 								rel_crit(gv_cur_region);
-							send_msg(VARLSTCNT(4) ERR_DBFILERR, 2, DB_LEN_STR(gv_cur_region));
-							send_msg(VARLSTCNT(9) ERR_BUFOWNERSTUCK, 7, process_id, blocking_pid,
-								 cr->blk, cr->blk, (lcnt / BUF_OWNER_STUCK),
-								 cr->read_in_progress, cr->rip_latch.u.parts.latch_pid);
+							send_msg_csa(CSA_ARG(csa) VARLSTCNT(4) ERR_DBFILERR, 2,
+									DB_LEN_STR(gv_cur_region));
+							send_msg_csa(CSA_ARG(csa) VARLSTCNT(9) ERR_BUFOWNERSTUCK, 7, process_id,
+									blocking_pid, cr->blk, cr->blk, (lcnt / BUF_OWNER_STUCK),
+								 	cr->read_in_progress, cr->rip_latch.u.parts.latch_pid);
 							stuck_cnt++;
 							GET_C_STACK_FROM_SCRIPT("BUFOWNERSTUCK", process_id, blocking_pid,
 										stuck_cnt);
-							if (MAX_TQREAD_WAIT <= lcnt)	/* max wait of 4 mins */
-								GTMASSERT;
 							/* Kickstart the process taking a long time in case it was suspended */
 							UNIX_ONLY(continue_proc(blocking_pid));
 						}
 					} else
-					{	/* process stopped before could set r_epid */
+					{	/* process stopped before could set r_epid OR
+						 * Process is waiting on the lock held by itself.
+						 * Process waiting on the lock held by itself is an out-of-design
+						 * situation that we dont how it can occur hence the following assert
+						 * but know how to handle so we dont have to gtmassert in pro.
+						 */
+						assert(process_id != blocking_pid);
 						assert(0 == cr->bt_index);
 						if (cr->bt_index)
 						{
-							SET_TRACEABLE_VAR(csd->wc_blocked, TRUE);
+							SET_TRACEABLE_VAR(cnl->wc_blocked, TRUE);
 							BG_TRACE_PRO_ANY(csa, wc_blocked_t_qread_bad_bt_index2);
 							set_wc_blocked = TRUE;
 							break;
 						}
 						cr->cycle++;	/* increment cycle for blk number changes (for tp_hist) */
 						cr->blk = CR_BLKEMPTY;
-						RELEASE_BUFF_READ_LOCK(cr);	/* cr->r_epid already zero - no need to set */
+						cr->r_epid = 0; /* If the process itself is lock holder, r_epid is non-zero */
+						RELEASE_BUFF_READ_LOCK(cr);
 						if (cr->read_in_progress < -1)	/* race: process released since if r_epid */
 							LOCK_BUFF_FOR_READ(cr, dummy);
 					}
 				}
-				if ((was_crit != csa->now_crit) && !hold_onto_crit)
-					rel_crit(gv_cur_region);
+				REL_CRIT_IF_NEEDED(csa, gv_cur_region, was_crit, hold_onto_crit);
 			} else
 			{
+				if (TREF(tqread_nowait) && ((sm_int_ptr_t)&gv_target->hist.h[0].cycle == cycle))
+				{	/* We're an update helper. Don't waste time waiting on a leaf blk; move on to useful work */
+					REL_CRIT_IF_NEEDED(csa, gv_cur_region, was_crit, hold_onto_crit);
+					rdfail_detail = cdb_sc_tqreadnowait;
+					return (sm_uc_ptr_t)NULL;
+				}
 				BG_TRACE_PRO_ANY(csa, t_qread_ripsleep_cnt);
 				if (!sleep_invoked)	/* Count # of blks for which we ended up sleeping on the read */
 					BG_TRACE_PRO_ANY(csa, t_qread_ripsleep_nblks);
@@ -620,7 +682,7 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 				sleep_invoked = TRUE;
 			}
 		}
-		if (set_wc_blocked)	/* cannot use csd->wc_blocked here as we might not necessarily have crit */
+		if (set_wc_blocked)	/* cannot use cnl->wc_blocked here as we might not necessarily have crit */
 			break;
 		ocnt++;
 		assert((0 == was_crit) || (1 == was_crit));
@@ -636,10 +698,9 @@ sm_uc_ptr_t t_qread(block_id blk, sm_int_ptr_t cycle, cache_rec_ptr_ptr_t cr_out
 		if (!csa->now_crit && !hold_onto_crit)
 			grab_crit(gv_cur_region);
 	} while (TRUE);
-	assert(set_wc_blocked && (csd->wc_blocked || !csa->now_crit));
-	rdfail_detail = cdb_sc_cacheprob;
-	if ((was_crit != csa->now_crit) && !hold_onto_crit)
-		rel_crit(gv_cur_region);
+	assert(set_wc_blocked && (cnl->wc_blocked || !csa->now_crit));
+	SET_CACHE_FAIL_STATUS(rdfail_detail, csd);
+	REL_CRIT_IF_NEEDED(csa, gv_cur_region, was_crit, hold_onto_crit);
 	assert(was_crit == csa->now_crit);
 	return (sm_uc_ptr_t)NULL;
 }

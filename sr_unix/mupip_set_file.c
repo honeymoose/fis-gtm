@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2011 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -58,6 +58,7 @@
 #include "desired_db_format_set.h"
 #include "gtmmsg.h"		/* for gtm_putmsg prototype */
 #include "gtmcrypt.h"
+#include "anticipatory_freeze.h"
 
 GBLREF	tp_region		*grlist;
 GBLREF	gd_region		*gv_cur_region;
@@ -83,12 +84,20 @@ error_def(ERR_WCWRNNOTCHG);
 
 #define MAX_ACC_METH_LEN	2
 #define MAX_DB_VER_LEN		2
+#define MIN_MAX_KEY_SZ		3
 
 #define DO_CLNUP_AND_SET_EXIT_STAT(EXIT_STAT, EXIT_WRN_ERR_MASK)		\
 {										\
 	exit_stat |= EXIT_WRN_ERR_MASK;						\
 	db_ipcs_reset(gv_cur_region);						\
 	mu_gv_cur_reg_free();							\
+}
+
+#define CLOSE_AND_RETURN							\
+{										\
+	CLOSEFILE_RESET(fd, rc);	/* resets "fd" to FD_INVALID */		\
+	db_ipcs_reset(gv_cur_region);						\
+	return (int4)ERR_WCWRNNOTCHG;						\
 }
 
 int4 mupip_set_file(int db_fn_len, char *db_fn)
@@ -101,8 +110,12 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 	int4			status;
 	int4			status1;
 	int			glbl_buff_status, defer_status, rsrvd_bytes_status,
-				extn_count_status, lock_space_status, disk_wait_status;
-	int4			new_disk_wait, new_cache_size, new_extn_count, new_lock_space, reserved_bytes, defer_time;
+				extn_count_status, lock_space_status, disk_wait_status,
+				inst_freeze_on_error_status, qdbrundown_status, mutex_space_status;
+	int4			new_disk_wait, new_cache_size, new_extn_count, new_lock_space, reserved_bytes, defer_time,
+				new_mutex_space;
+	int			key_size_status, rec_size_status;
+	int4			new_key_size, new_rec_size;
 	sgmnt_data_ptr_t	csd;
 	tp_region		*rptr, single;
 	enum db_acc_method	access, access_new;
@@ -111,13 +124,19 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 	char			*errptr, *command = "MUPIP SET VERSION";
 	int			save_errno;
 	int			rc;
-	ZOS_ONLY(int 		realfiletag;)
 
+	ZOS_ONLY(int 		realfiletag;)
+	DCL_THREADGBL_ACCESS;
+
+	SETUP_THREADGBL_ACCESS;
 	exit_stat = EXIT_NRM;
 	defer_status = cli_present("DEFER_TIME");
 	if (defer_status)
 		need_standalone = TRUE;
-	bypass_partial_recov = cli_present("PARTIAL_RECOV_BYPASS") == CLI_PRESENT;
+	/* If the user requested MUPIP SET -PARTIAL_RECOV_BYPASS, then skip the check in grab_crit, which triggers an rts_error, as
+	 * this is one of the ways of turning off the file_corrupt flag in the file header
+	 */
+	TREF(skip_file_corrupt_check) = bypass_partial_recov = cli_present("PARTIAL_RECOV_BYPASS") == CLI_PRESENT;
 	if (bypass_partial_recov)
 		need_standalone = TRUE;
 	if (disk_wait_status = cli_present("WAIT_DISK"))
@@ -205,6 +224,28 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 		}
 		need_standalone = TRUE;
 	}
+	if (mutex_space_status = cli_present("MUTEX_SLOTS"))
+	{
+		if (cli_get_int("MUTEX_SLOTS", &new_mutex_space))
+		{
+			if (new_mutex_space > MAX_CRIT_ENTRY)
+			{
+				util_out_print("!UL too large, maximum number of mutex slots allowed is !UL", TRUE,
+						new_mutex_space, MAX_CRIT_ENTRY);
+				return (int4)ERR_WCWRNNOTCHG;
+			} else if (new_mutex_space < MIN_CRIT_ENTRY)
+			{
+				util_out_print("!UL too small, minimum number of mutex slots allowed is !UL", TRUE,
+						new_mutex_space, MIN_CRIT_ENTRY);
+				return (int4)ERR_WCWRNNOTCHG;
+			}
+		} else
+		{
+			util_out_print("Error getting MUTEX_SPACE qualifier value", TRUE);
+			return (int4)ERR_WCWRNNOTCHG;
+		}
+		need_standalone = TRUE;
+	}
 	if (rsrvd_bytes_status = cli_present("RESERVED_BYTES"))
 	{
 		if (!cli_get_int("RESERVED_BYTES", &reserved_bytes))
@@ -228,6 +269,24 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 	} else
 		access = n_dba;		/* really want to keep current method,
 					    which has not yet been read */
+	if (key_size_status = cli_present("KEY_SIZE"))
+	{
+		if (!cli_get_int("KEY_SIZE", &new_key_size))
+		{
+			util_out_print("Error getting KEY_SIZE qualifier value", TRUE);
+			return (int4)ERR_WCWRNNOTCHG;
+		}
+		need_standalone = TRUE;
+	}
+	if (rec_size_status = cli_present("RECORD_SIZE"))
+	{
+		if (!cli_get_int("RECORD_SIZE", &new_rec_size))
+		{
+			util_out_print("Error getting RECORD_SIZE qualifier value", TRUE);
+			return (int4)ERR_WCWRNNOTCHG;
+		}
+		need_standalone = TRUE;
+	}
 	if (cli_present("VERSION"))
 	{
 		assert(!need_standalone);
@@ -235,12 +294,14 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 		cli_strupper(ver_spec);
 		if (0 == memcmp(ver_spec, "V4", ver_spec_len))
 			desired_dbver = GDSV4;
-		else  if (0 == memcmp(ver_spec, "V5", ver_spec_len))
-			desired_dbver = GDSV5;
+		else  if (0 == memcmp(ver_spec, "V6", ver_spec_len))
+			desired_dbver = GDSV6;
 		else
 			GTMASSERT;		/* CLI should prevent us ever getting here */
 	} else
 		desired_dbver = GDSVLAST;	/* really want to keep version, which has not yet been read */
+	inst_freeze_on_error_status = cli_present("INST_FREEZE_ON_ERROR");
+	qdbrundown_status = cli_present("QDBRUNDOWN");
 	if (region)
 		rptr = grlist;
 	else
@@ -321,10 +382,28 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 				if (GDSVLAST != desired_dbver)
 					util_out_print("Database file !AD now has desired DB format !AD", TRUE,
 						fn_len, fn, LEN_AND_STR(gtm_dbversion_table[cs_data->desired_db_format]));
+				if (CLI_NEGATED == inst_freeze_on_error_status)
+				{
+					cs_data->freeze_on_fail = FALSE;
+					util_out_print("Database file !AD now has inst freeze on fail flag set to FALSE",
+							TRUE, fn_len, fn);
+				}
+				else if (CLI_PRESENT == inst_freeze_on_error_status)
+				{
+					cs_data->freeze_on_fail = TRUE;
+					util_out_print("Database file !AD now has inst freeze on fail flag set to TRUE",
+							TRUE, fn_len, fn);
+				}
+				if (qdbrundown_status)
+				{
+					cs_data->mumps_can_bypass = CLI_PRESENT == qdbrundown_status;
+					util_out_print("Database file !AD now has quick database rundown flag set to !AD", TRUE,
+						       fn_len, fn, 5, (cs_data->mumps_can_bypass ? " TRUE" : "FALSE"));
+				}
 			} else
 				exit_stat |= status;
 			rel_crit(gv_cur_region);
-			gds_rundown();
+			UNIX_ONLY(exit_stat |=)gds_rundown();
 		} else
 		{	/* Following part needs standalone access */
 			assert(GDSVLAST == desired_dbver);
@@ -370,6 +449,53 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 				}
 				csd->reserved_bytes = reserved_bytes;
 			}
+			if (key_size_status)
+			{
+				if (MAX_KEY_SZ < new_key_size)
+				{	/* bigger than 1023 not supported */
+					util_out_print("!UL too large, highest maximum key size allowed is !UL", TRUE,
+							new_key_size, MAX_KEY_SZ);
+					CLOSE_AND_RETURN;
+				} else if (MIN_MAX_KEY_SZ > new_key_size)
+				{	/* less than 3 not supported */
+					util_out_print("!UL too small, lowest maximum key size allowed is !UL", TRUE,
+							new_key_size, MIN_MAX_KEY_SZ);
+					CLOSE_AND_RETURN;
+				} else if (csd->blk_size < (SIZEOF(blk_hdr) + SIZEOF(rec_hdr) + new_key_size + SIZEOF(block_id)
+								 + BSTAR_REC_SIZE + csd->reserved_bytes))
+				{	/* too big for block */
+					util_out_print("!UL too large, lowest maximum key size allowed (given block size) is !UL",
+							TRUE, new_key_size, csd->blk_size - SIZEOF(blk_hdr) - SIZEOF(rec_hdr)
+							 - SIZEOF(block_id) - csd->reserved_bytes + BSTAR_REC_SIZE);
+					CLOSE_AND_RETURN;
+				} else if (csd->max_key_size > new_key_size)
+				{	/* lowering the maximum key size can cause problems if large keys already exist in db */
+					util_out_print("!UL smaller than current maximum key size !UL", TRUE,
+							new_key_size, csd->max_key_size);
+					CLOSE_AND_RETURN;
+				}
+				csd->max_key_size = new_key_size;
+			}
+			if (rec_size_status)
+			{
+				if (MAX_STRLEN < new_rec_size)
+				{
+					util_out_print("!UL too large, highest maximum record size allowed is !UL", TRUE,
+							new_rec_size, MAX_STRLEN);
+					CLOSE_AND_RETURN;
+				} else if (0 > new_key_size)
+				{
+					util_out_print("!UL too small, lowest maximum record size allowed is !UL", TRUE,
+							new_rec_size, 0);
+					CLOSE_AND_RETURN;
+				} else if (csd->max_rec_size > new_rec_size)
+				{
+					util_out_print("!UL smaller than current maximum record size !UL", TRUE,
+							new_rec_size, csd->max_rec_size);
+					CLOSE_AND_RETURN;
+				}
+				csd->max_rec_size = new_rec_size;
+			}
 			access_new = (n_dba == access ? csd->acc_meth : access);
 							/* recalculate; n_dba is a proxy for no change */
 			change_fhead_timer("FLUSH_TIME", csd->flush_time,
@@ -406,6 +532,10 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 				csd->extension_size = (uint4)new_extn_count;
 			if (lock_space_status)
 				csd->lock_space_size = (uint4)new_lock_space * OS_PAGELET_SIZE;
+			if (mutex_space_status)
+				NUM_CRIT_ENTRY(csd) = new_mutex_space;
+			if (qdbrundown_status)
+				csd->mumps_can_bypass = CLI_PRESENT == qdbrundown_status;
 			if (bypass_partial_recov)
 			{
 				csd->file_corrupt = FALSE;
@@ -466,7 +596,11 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 					continue;
 				}
 			}
-			LSEEKWRITE(fd, 0, csd, SIZEOF(sgmnt_data), status);
+			if (CLI_NEGATED == inst_freeze_on_error_status)
+				csd->freeze_on_fail = FALSE;
+			else if (CLI_PRESENT == inst_freeze_on_error_status)
+				csd->freeze_on_fail = TRUE;
+			DB_LSEEKWRITE(NULL, NULL, fd, 0, csd, SIZEOF(sgmnt_data), status);
 			if (0 != status)
 			{
 				save_errno = errno;
@@ -487,15 +621,33 @@ int4 mupip_set_file(int db_fn_len, char *db_fn)
 			if (rsrvd_bytes_status)
 				util_out_print("Database file !AD now has !UL reserved bytes",
 						TRUE, fn_len, fn, csd->reserved_bytes);
+			if (key_size_status)
+				util_out_print("Database file !AD now has maximum key size !UL",
+						TRUE, fn_len, fn, csd->max_key_size);
+			if (rec_size_status)
+				util_out_print("Database file !AD now has maximum record size !UL",
+						TRUE, fn_len, fn, csd->max_rec_size);
 			if (extn_count_status)
 				util_out_print("Database file !AD now has extension count !UL",
 						TRUE, fn_len, fn, csd->extension_size);
 			if (lock_space_status)
 				util_out_print("Database file !AD now has lock space !UL pages",
 						TRUE, fn_len, fn, csd->lock_space_size/OS_PAGELET_SIZE);
+			if (mutex_space_status)
+				util_out_print("Database file !AD now has !UL mutex queue slots",
+						TRUE, fn_len, fn, NUM_CRIT_ENTRY(csd));
+			if (qdbrundown_status)
+				util_out_print("Database file !AD now has quick database rundown flag set to !AD", TRUE,
+					       fn_len, fn, 5, (csd->mumps_can_bypass ? " TRUE" : "FALSE"));
 			if (disk_wait_status)
 				util_out_print("Database file !AD now has wait disk set to !UL seconds",
 						TRUE, fn_len, fn, csd->wait_disk_space);
+			if (CLI_NEGATED == inst_freeze_on_error_status)
+				util_out_print("Database file !AD now has inst freeze on fail flag set to FALSE",
+						TRUE, fn_len, fn);
+			else if (CLI_PRESENT == inst_freeze_on_error_status)
+				util_out_print("Database file !AD now has inst freeze on fail flag set to TRUE",
+						TRUE, fn_len, fn);
 			db_ipcs_reset(gv_cur_region);
 		} /* end of else part if (!need_standalone) */
 		mu_gv_cur_reg_free();

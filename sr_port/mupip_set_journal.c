@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -26,6 +26,7 @@
 #endif
 #include "gtm_string.h"
 #include "gtm_time.h"
+#include "gtm_stdio.h"
 
 #include "gdsroot.h"
 #include "gtm_facility.h"
@@ -78,7 +79,8 @@ error_def(ERR_FILENAMETOOLONG);
 error_def(ERR_FILEPARSE);
 error_def(ERR_JNLALIGNTOOSM);
 error_def(ERR_JNLALLOCGROW);
-error_def(ERR_JNLBUFFTOOSM);
+error_def(ERR_JNLBUFFDBUPD);
+error_def(ERR_JNLBUFFREGUPD);
 error_def(ERR_JNLCREATE);
 error_def(ERR_JNLFNF);
 error_def(ERR_JNLINVSWITCHLMT);
@@ -109,13 +111,12 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 	int			curr_stat_res; 	/* gtm_file_stat() return value for current journal file name */
 	mu_set_rlist		*rptr, dummy_rlist, *next_rptr;
 	sgmnt_data_ptr_t	csd;
-	uint4			status,
-				exit_status = EXIT_NRM;
+	uint4			status,	exit_status = EXIT_NRM, gds_rundown_status = EXIT_NRM;
 	seq_num			max_reg_seqno;
 	unsigned int		fn_len;
 	unsigned char		tmp_full_jnl_fn[MAX_FN_LEN + 1], prev_jnl_fn[MAX_FN_LEN + 1];
 	char			*db_reg_name, db_or_reg[DB_OR_REG_SIZE];
-	int			db_reg_name_len, db_or_reg_len, jnl_buffer_size;
+	int			db_reg_name_len, db_or_reg_len;
 	set_jnl_options		jnl_options;
 	boolean_t		curr_jnl_present,	/* for current state 2, is current journal present? */
 				jnl_points_to_db, keep_prev_link, safe_to_switch, newjnlfiles, jnlname_same,
@@ -132,7 +133,11 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 	jnl_file_header		header;
 	int4			status1;
 	uint4			status2;
+	boolean_t		header_is_usable = FALSE;
 #	endif
+	boolean_t		jnl_buffer_updated = FALSE, jnl_buffer_invalid = FALSE;
+	int			jnl_buffer_size;
+	char			s[JNLBUFFUPDAPNDX_SIZE];	/* JNLBUFFUPDAPNDX_SIZE is defined in jnl.h */
 
 	assert(SGMNT_HDR_LEN == ROUND_UP(SIZEOF(sgmnt_data), DISK_BLOCK_SIZE));
 	memset(&jnl_info, 0, SIZEOF(jnl_info));
@@ -140,7 +145,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 	max_reg_seqno = 1;
 	if (!mupip_set_journal_parse(&jnl_options, &jnl_info))
 	{
-		gtm_putmsg(VARLSTCNT(1) ERR_MUPCLIERR);
+		gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_MUPCLIERR);
+		error_condition = ERR_MUPCLIERR;
 		return ERR_MUPCLIERR;
 	}
 	if (region && (NULL == grlist))
@@ -158,9 +164,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			return (uint4)ERR_MUNOFINISH;
 		}
 	} else
-	{	/* The command line specified a single database file;
-		   force the following do-loop to be one-trip */
-		dummy_rlist.fPtr= NULL;
+	{	/* The command line specified a single database file; force the following do-loop to be one-trip */
+		dummy_rlist.fPtr = NULL;
 		grlist = &dummy_rlist;
 	}
 	ESTABLISH_RET(mupip_set_jnl_ch, (uint4)ERR_MUNOFINISH);
@@ -174,7 +179,7 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 		{
 			if (dba_usr == rptr->reg->dyn.addr->acc_meth)
 			{
-				gtm_putmsg(VARLSTCNT(6) ERR_UNIMPLOP, 0, ERR_TEXT, 2,
+				gtm_putmsg_csa(CSA_ARG(REG2CSA(rptr->reg)) VARLSTCNT(6) ERR_UNIMPLOP, 0, ERR_TEXT, 2,
 					LEN_AND_LIT("Journaling is not supported for access method USR"));
 				exit_status |= EXIT_WRN;
 				continue;
@@ -213,7 +218,7 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 		assert(!gv_cur_region->was_open);	/* In case mupip_set_file opened it, they must have closed */
 		if (gv_cur_region->read_only)
 		{
-			gtm_putmsg(VARLSTCNT(4) ERR_DBPRIVERR, 2, DB_LEN_STR(gv_cur_region));
+			gtm_putmsg_csa(CSA_ARG(REG2CSA(gv_cur_region)) VARLSTCNT(4) ERR_DBPRIVERR, 2, DB_LEN_STR(gv_cur_region));
 			exit_status |= EXIT_RDONLY;
 			continue;
 		}
@@ -224,7 +229,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 		if (EXIT_NRM != (status = mupip_set_journal_newstate(&jnl_options, &jnl_info, rptr)))
 		{
 			exit_status |= status;
-			gds_rundown();
+			UNIX_ONLY(gds_rundown_status =) gds_rundown();
+			exit_status |= gds_rundown_status;
 			rptr->sd = NULL;
 			rptr->state = NONALLOCATED;	/* This means do not call gds_rundown() again for this region
 							 * and do not process this region anymore. */
@@ -253,7 +259,9 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			(repl_closed != repl_curr_state && repl_closed == rptr->repl_new_state) ||
 			(repl_closed == repl_curr_state && repl_open == rptr->repl_new_state))
 		{
-			gds_rundown(); /* Since we did gvcst_init() and now will call mu_rndwn_file() */
+			/* Since we did gvcst_init() and now will call mu_rndwn_file() */
+			UNIX_ONLY(gds_rundown_status =) gds_rundown();
+			exit_status |= gds_rundown_status;
 			rptr->state = NONALLOCATED;
 			rptr->sd = csd = NULL;
 			/* WARNING: The remaining code uses gv_cur_region and others
@@ -262,6 +270,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			assert(NULL != gv_cur_region->dyn.addr);
 			assert(NULL != gv_cur_region->dyn.addr->file_cntl);
 			assert(NULL != gv_cur_region->dyn.addr->file_cntl->file_info);
+			if (EXIT_NRM != gds_rundown_status)		/* skip mu_rndwn_file (STANDALONE) */
+				continue;
 			if (STANDALONE(gv_cur_region))
 			{
 				rptr->exclusive = TRUE;
@@ -294,7 +304,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 				rptr->state = ALLOCATED;
 			} else
 			{
-				gtm_putmsg(VARLSTCNT(4) ERR_MUSTANDALONE, 2, DB_LEN_STR(gv_cur_region));
+				gtm_putmsg_csa(CSA_ARG(REG2CSA(gv_cur_region)) VARLSTCNT(4) ERR_MUSTANDALONE, 2,
+						DB_LEN_STR(gv_cur_region));
 				exit_status |= EXIT_ERR;
 				continue;
 			}
@@ -337,6 +348,7 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 		jnl_curr_state = (enum jnl_state_codes)csd->jnl_state;
 		repl_curr_state = (enum repl_state_codes)csd->repl_state;
 		jnl_info.csd = csd;
+		jnl_info.csa = cs_addrs;
 		jnl_info.before_images = rptr->before_images;
 		jnl_info.repl_state = rptr->repl_new_state;
 		jnl_info.jnl_state = csd->jnl_state;
@@ -369,10 +381,7 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 				jnl_info.alloc = (0 == csd->jnl_alq) ? JNL_ALLOC_DEF : csd->jnl_alq;
 				assert(JNL_ALLOC_DEF >= JNL_ALLOC_MIN);
 				if (JNL_ALLOC_MIN > jnl_info.alloc)
-				{	/* Fix file header in addition to fixing new journal file settings */
-					csd->jnl_alq = JNL_ALLOC_MIN;
-					jnl_info.alloc = JNL_ALLOC_MIN;
-				}
+					jnl_info.alloc = JNL_ALLOC_MIN;				/* Fix new journal settings. */
 			}
 			if (!jnl_options.alignsize_specified)
 			{
@@ -380,19 +389,18 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 					csd->alignsize; /* In bytes */
 				assert(JNL_DEF_ALIGNSIZE >= JNL_MIN_ALIGNSIZE);
 				if ((DISK_BLOCK_SIZE * JNL_MIN_ALIGNSIZE) > jnl_info.alignsize)
-				{	/* Fix file header in addition to fixing new journal file settings */
-					csd->alignsize = (DISK_BLOCK_SIZE * JNL_MIN_ALIGNSIZE);
-					jnl_info.alignsize = (DISK_BLOCK_SIZE * JNL_MIN_ALIGNSIZE);
-				}
+					jnl_info.alignsize = (DISK_BLOCK_SIZE * JNL_MIN_ALIGNSIZE); /* Fix new journal settings. */
 			}
 			if (jnl_info.alignsize <= csd->blk_size)
 			{
 				if (region)
-					gtm_putmsg(VARLSTCNT(9) ERR_JNLALIGNTOOSM, 7, jnl_info.alignsize, csd->blk_size,
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(9) ERR_JNLALIGNTOOSM, 7,
+							jnl_info.alignsize, csd->blk_size,
 							LEN_AND_LIT("region"), REG_LEN_STR(gv_cur_region),
 							(DISK_BLOCK_SIZE * JNL_DEF_ALIGNSIZE));
 				else
-					gtm_putmsg(VARLSTCNT(9) ERR_JNLALIGNTOOSM, 7, jnl_info.alignsize, csd->blk_size,
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(9) ERR_JNLALIGNTOOSM, 7,
+							jnl_info.alignsize, csd->blk_size,
 							LEN_AND_LIT("database file"), jnl_info.fn_len, jnl_info.fn,
 							(DISK_BLOCK_SIZE * JNL_DEF_ALIGNSIZE));
 
@@ -411,32 +419,22 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 				/* jnl_info.extend = (0 == csd->jnl_deq) ? jnl_info.alloc * JNL_EXTEND_DEF_PERC : csd->jnl_deq;
 				 * Uncomment this section when code is ready to use extension = 10% of allocation */
 			}
-			if (!jnl_options.buffer_size_specified || jnl_info.buffer < csd->blk_size / DISK_BLOCK_SIZE + 1)
+			if (!jnl_options.buffer_size_specified)
+				jnl_info.buffer = (0 == csd->jnl_buffer_size) ? JNL_BUFFER_DEF : csd->jnl_buffer_size;
+			ROUND_UP_JNL_BUFF_SIZE(jnl_buffer_size, jnl_info.buffer, csd);
+			if (jnl_buffer_size < JNL_BUFF_PORT_MIN(csd))
 			{
-				if (jnl_options.buffer_size_specified)
-				{
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLBUFFTOOSM, 2,
-						jnl_info.buffer, csd->blk_size / DISK_BLOCK_SIZE + 1);
-					exit_status |= EXIT_WRN;
-				}
-				jnl_buffer_size = (0 == csd->jnl_buffer_size) ? JNL_BUFFER_DEF : csd->jnl_buffer_size;
-			} else
-				jnl_buffer_size = jnl_info.buffer;
-			jnl_buffer_size = ROUND_UP(jnl_buffer_size, MIN(MAX_IO_BLOCK_SIZE, cs_data->blk_size) / DISK_BLOCK_SIZE);
-			if ((jnl_options.buffer_size_specified && jnl_buffer_size != jnl_info.buffer)
-				|| (!jnl_options.buffer_size_specified
-				&& 0 != csd->jnl_buffer_size && jnl_buffer_size != csd->jnl_buffer_size))
+				jnl_buffer_invalid = TRUE;
+				ROUND_UP_MIN_JNL_BUFF_SIZE(jnl_buffer_size, csd);
+			} else if (jnl_buffer_size > JNL_BUFFER_MAX)
 			{
-				if (region)
-					util_out_print("Journal file buffer size for region !AD is now !SL", TRUE,
-						REG_LEN_STR(gv_cur_region), jnl_buffer_size);
-				else
-					util_out_print("Journal file buffer size for database file !AD is now !SL", TRUE,
-						jnl_info.fn_len, jnl_info.fn, jnl_buffer_size);
+				jnl_buffer_invalid = TRUE;
+				ROUND_DOWN_MAX_JNL_BUFF_SIZE(jnl_buffer_size, csd);
 			}
+			if (jnl_buffer_size != jnl_info.buffer)
+				jnl_buffer_updated = TRUE;
 			/* ensure we have exclusive access in case csd->jnl_buffer_size is going to be changed */
-			assert((!(jnl_options.buffer_size_specified && csd->jnl_buffer_size != jnl_buffer_size))
-				|| rptr->exclusive);
+			assert(!(jnl_options.buffer_size_specified && jnl_buffer_updated) || rptr->exclusive);
 			if (!jnl_options.epoch_interval_specified)
 				jnl_info.epoch_interval = (0 == csd->epoch_interval) ? DEFAULT_EPOCH_INTERVAL : csd->epoch_interval;
 			JNL_MAX_RECLEN(&jnl_info, csd);
@@ -454,18 +452,19 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			 */
 			if (jnl_info.autoswitchlimit < jnl_info.alloc)
 			{
-				gtm_putmsg(VARLSTCNT(7) ERR_JNLSWITCHTOOSM, 5, jnl_info.autoswitchlimit,
-								jnl_info.alloc, DB_LEN_STR(gv_cur_region));
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(7) ERR_JNLSWITCHTOOSM, 5,
+						jnl_info.autoswitchlimit, jnl_info.alloc, DB_LEN_STR(gv_cur_region));
 				if (newjnlfiles)
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+							jnl_info.jnl_len, jnl_info.jnl);
 				exit_status |= EXIT_ERR;
 				break;
 #ifdef UNIX
 			} else if (jnl_info.alloc + jnl_info.extend > jnl_info.autoswitchlimit
 					&& jnl_info.alloc != jnl_info.autoswitchlimit)
 			{
-				gtm_putmsg(VARLSTCNT(8) ERR_JNLALLOCGROW, 6, jnl_info.alloc, jnl_info.autoswitchlimit,
-						"database file", DB_LEN_STR(gv_cur_region));
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_JNLALLOCGROW, 6, jnl_info.alloc,
+						jnl_info.autoswitchlimit, "database file", DB_LEN_STR(gv_cur_region));
 				jnl_info.alloc = jnl_info.autoswitchlimit;
 #endif
 			} else
@@ -482,15 +481,15 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 					if (jnl_options.autoswitchlimit_specified || jnl_options.extension_specified
 											|| jnl_options.allocation_specified)
 					{	/* print rounding down of autoswitchlimit only if journal options were specified */
-						gtm_putmsg(VARLSTCNT(8) ERR_JNLSWITCHSZCHG, 6,
+						gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_JNLSWITCHSZCHG, 6,
 								jnl_info.autoswitchlimit, align_autoswitch,
 								jnl_info.alloc, jnl_info.extend, DB_LEN_STR(gv_cur_region));
 					}
 					jnl_info.autoswitchlimit = align_autoswitch;
 					if (JNL_AUTOSWITCHLIMIT_MIN > jnl_info.autoswitchlimit)
 					{
-						gtm_putmsg(VARLSTCNT(5) ERR_JNLINVSWITCHLMT, 3, jnl_info.autoswitchlimit,
-											JNL_AUTOSWITCHLIMIT_MIN, JNL_ALLOC_MAX);
+						gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(5) ERR_JNLINVSWITCHLMT, 3,
+								jnl_info.autoswitchlimit, JNL_AUTOSWITCHLIMIT_MIN, JNL_ALLOC_MAX);
 						exit_status |= EXIT_ERR;
 						break;
 					}
@@ -506,9 +505,11 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			jnldef.len = SIZEOF(JNL_EXT_DEF) - 1;
 			if (FILE_STAT_ERROR == (new_stat_res = gtm_file_stat(&jnlfile, &jnldef, &tmpjnlfile, TRUE, &status)))
 			{
-				gtm_putmsg(VARLSTCNT(5) ERR_FILEPARSE, 2, jnlfile.len, jnlfile.addr, status);
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(5) ERR_FILEPARSE, 2, jnlfile.len,
+						jnlfile.addr, status);
 				if (newjnlfiles)
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnlfile.len, jnlfile.addr);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+							jnlfile.len, jnlfile.addr);
 				exit_status |= EXIT_ERR;
 				break;
 			}
@@ -518,8 +519,9 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			/* Note: At this point jnlfile should have expanded journal name with extension */
 			if (MAX_FN_LEN + 1 < jnl_info.jnl_len)
 			{
-				gtm_putmsg(VARLSTCNT(1) ERR_FILENAMETOOLONG);
-				gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(1) ERR_FILENAMETOOLONG);
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+						jnl_info.jnl_len, jnl_info.jnl);
 				exit_status |= EXIT_ERR;
 				break;
 			}
@@ -531,9 +533,11 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			{
 				if (FILE_STAT_ERROR == (curr_stat_res = gtm_file_stat(&jnlfile, NULL, NULL, TRUE, &status)))
 				{
-					gtm_putmsg(VARLSTCNT(5) ERR_FILEPARSE, 2, jnlfile.len, jnlfile.addr, status);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(5) ERR_FILEPARSE, 2,
+							jnlfile.len, jnlfile.addr, status);
 					if (newjnlfiles)
-						gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+						gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+								jnl_info.jnl_len, jnl_info.jnl);
 					exit_status |= EXIT_ERR;
 					break;
 				}
@@ -576,13 +580,14 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 							if (is_file_identical((char *)header.data_file_name,
 												(char *)jnl_info.fn))
 								jnl_points_to_db = TRUE;
+							UNIX_ONLY(header_is_usable = TRUE;)
 						}
 					}
 				}
 				/* If journal file we are about to create exists, allow the switch only it is safe to do so.
 				 * This way we prevent multiple environments from interfering with each other through a
 				 * common journal file name. Also this way we disallow switching to a user-specified new
-				 * journal file that already exists (say the database file itself due to a commandline typo).
+				 * journal file that already exists (say the database file itself due to a command line typo).
 				 */
 				if (FILE_PRESENT & curr_stat_res)
 				{
@@ -604,8 +609,10 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 				}
 				if ((FILE_PRESENT & new_stat_res) && !safe_to_switch)
 				{
-					gtm_putmsg(VARLSTCNT(4) ERR_FILEEXISTS, 2, jnl_info.jnl_len, jnl_info.jnl);
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_FILEEXISTS, 2,
+							jnl_info.jnl_len, jnl_info.jnl);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+							jnl_info.jnl_len, jnl_info.jnl);
 					exit_status |= EXIT_ERR;
 					break;
 				}
@@ -624,14 +631,17 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 				{
 					if (FILE_READONLY & curr_stat_res)
 					{
-						gtm_putmsg(VARLSTCNT(4) ERR_JNLRDONLY, 2, JNL_LEN_STR(csd));
+						gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLRDONLY, 2,
+								JNL_LEN_STR(csd));
 						if (newjnlfiles)
-							gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+							gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4)
+									ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
 						exit_status |= EXIT_RDONLY;
 						continue;
 					}
 				} else
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLFNF, 2, JNL_LEN_STR(csd));
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLFNF, 2,
+							JNL_LEN_STR(csd));
 			}
 			if (!rptr->exclusive)
 			{
@@ -643,8 +653,7 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 					VMS_ONLY(if (memcmp(cs_addrs->nl->jnl_file.jnl_file_id.fid, zero_fid, SIZEOF(zero_fid))))
 					{
 						if (SS_NORMAL != (status = set_jnl_file_close(SET_JNL_FILE_CLOSE_SETJNL)))
-						{
-							/* Invoke jnl_file_lost to turn off journaling and retry journal creation
+						{	/* Invoke jnl_file_lost to turn off journaling and retry journal creation
 							 * to create fresh journal files.
 							 */
 							jnl_file_lost(jpc, status);
@@ -653,6 +662,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 							next_rptr = rptr;
 							continue;
 						}
+						UNIX_ONLY(header.crash = FALSE;)	/* Even if the journal was crashed, that
+											 * should be fixed now */
 					} else
 					{	/* Ideally, no other process should have a journal file for this database open.
 						 * But, As part of C9I03-002965, we realized it is possible for processes accessing
@@ -665,6 +676,11 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 						assert(NULL != jpc);
 						jpc->jnl_buff->cycle++;
 					}
+#					ifdef UNIX
+					/* Cut the link if the journal is crashed and there is no shared memory around */
+					if (header_is_usable && header.crash)
+						keep_prev_link = FALSE;
+#					endif
 					/* For MM, set_jnl_file_close() can call wcs_flu() which can remap the file.
 					 * So reset csd and rptr->sd since their value may have changed.
 					 */
@@ -689,8 +705,10 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 #						ifdef VMS
 						if (!jnlname_same && (FILE_PRESENT & new_stat_res))
 						{
-							gtm_putmsg(VARLSTCNT(4) ERR_FILEEXISTS, 2, jnl_info.jnl_len, jnl_info.jnl);
-							gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+							gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4)
+									ERR_FILEEXISTS, 2, jnl_info.jnl_len, jnl_info.jnl);
+							gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4)
+									ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
 							exit_status |= EXIT_ERR;
 							break;
 						}
@@ -720,20 +738,21 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
                                 if (EXIT_NRM != (status = cre_jnl_file(&jnl_info)))
 				{	/* There was an error attempting to create the journal file */
 					exit_status |= status;
-					gtm_putmsg(VARLSTCNT(4) ERR_JNLNOCREATE, 2, jnl_info.jnl_len, jnl_info.jnl);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(4) ERR_JNLNOCREATE, 2,
+							jnl_info.jnl_len, jnl_info.jnl);
 					continue;
 				}
 				csd->jnl_checksum = jnl_info.checksum;
 				csd->jnl_eovtn = csd->trans_hist.curr_tn;
-				gtm_putmsg(VARLSTCNT(10) ERR_JNLCREATE, 8, jnl_info.jnl_len, jnl_info.jnl,
+				gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(10) ERR_JNLCREATE, 8, jnl_info.jnl_len, jnl_info.jnl,
 					db_or_reg_len, db_or_reg, db_reg_name_len, db_reg_name,
 					LEN_AND_STR(before_image_lit[(jnl_info.before_images ? 1 : 0)]));
 				if ((!curr_jnl_present && (jnl_open == jnl_curr_state))
 					|| (curr_jnl_present && jnl_info.no_prev_link) || this_iter_prevlinkcut_error)
 				{
-					gtm_putmsg(VARLSTCNT(6) ERR_PREVJNLLINKCUT, 4,
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(6) ERR_PREVJNLLINKCUT, 4,
 						jnl_info.jnl_len, jnl_info.jnl, DB_LEN_STR(gv_cur_region));
-					send_msg(VARLSTCNT(6) ERR_PREVJNLLINKCUT, 4,
+					send_msg_csa(CSA_ARG(cs_addrs) VARLSTCNT(6) ERR_PREVJNLLINKCUT, 4,
 						jnl_info.jnl_len, jnl_info.jnl, DB_LEN_STR(gv_cur_region));
 				}
                         }
@@ -746,6 +765,21 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			csd->alignsize = jnl_info.alignsize;
 			csd->autoswitchlimit = jnl_info.autoswitchlimit;
 			csd->jnl_buffer_size = jnl_buffer_size;
+			if (jnl_buffer_updated)
+				if (jnl_buffer_invalid)
+				{
+					SNPRINTF(s, JNLBUFFUPDAPNDX_SIZE, JNLBUFFUPDAPNDX, JNL_BUFF_PORT_MIN(csd), JNL_BUFFER_MAX);
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(10)
+						(region ? ERR_JNLBUFFREGUPD : ERR_JNLBUFFDBUPD), 4,
+						(region ? gv_cur_region->rname_len : jnl_info.fn_len),
+						(region ? gv_cur_region->rname : jnl_info.fn),
+						jnl_info.buffer, jnl_buffer_size, ERR_TEXT, 2, LEN_AND_STR(s));
+				} else
+					gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(6)
+						(region ? ERR_JNLBUFFREGUPD : ERR_JNLBUFFDBUPD), 4,
+						(region ? gv_cur_region->rname_len : jnl_info.fn_len),
+						(region ? gv_cur_region->rname : jnl_info.fn),
+						jnl_info.buffer, jnl_buffer_size);
 			csd->epoch_interval = jnl_info.epoch_interval;
 			csd->jnl_deq = jnl_info.extend;
 			memcpy(csd->jnl_file_name, jnl_info.jnl, jnl_info.jnl_len);
@@ -771,11 +805,11 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 			UNIX_ONLY(csd->yield_lmt = DEFAULT_YIELD_LIMIT;)
 		}
 		if (CLI_ABSENT != jnl_options.cli_journal || CLI_ABSENT != jnl_options.cli_replic_on)
-			gtm_putmsg(VARLSTCNT(8) ERR_JNLSTATE, 6, db_or_reg_len, db_or_reg, db_reg_name_len, db_reg_name,
-				LEN_AND_STR(jnl_state_lit[rptr->jnl_new_state]));
+			gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_JNLSTATE, 6, db_or_reg_len, db_or_reg, db_reg_name_len,
+					db_reg_name, LEN_AND_STR(jnl_state_lit[rptr->jnl_new_state]));
 		if (CLI_ABSENT != jnl_options.cli_replic_on)
-			gtm_putmsg(VARLSTCNT(8) ERR_REPLSTATE, 6, db_or_reg_len, db_or_reg, db_reg_name_len, db_reg_name,
-				LEN_AND_STR(repl_state_lit[jnl_info.repl_state]));
+			gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_REPLSTATE, 6, db_or_reg_len, db_or_reg, db_reg_name_len,
+					db_reg_name, LEN_AND_STR(repl_state_lit[jnl_info.repl_state]));
 		/* Write the updated information back to the database file */
 		fc->op = FC_WRITE;
 		fc->op_buff = (sm_uc_ptr_t)csd;
@@ -792,7 +826,8 @@ uint4	mupip_set_journal(unsigned short db_fn_len, char *db_fn)
 	jgbl.dont_reset_gbl_jrec_time = FALSE;
 	/* Ensure jgbl.gbl_jrec_time did not get reset by any of the jnl writing functions */
 	assert(save_gbl_jrec_time == jgbl.gbl_jrec_time);
-	mupip_set_jnl_cleanup(TRUE);
+	REVERT;
+	mupip_set_jnl_cleanup();
 	if (EXIT_NRM == exit_status)
 		return (uint4)SS_NORMAL;
 	if (exit_status & EXIT_WRN)

@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -24,7 +24,6 @@
 #include "gtm_zos_io.h"
 #endif
 #include "stp_parms.h"
-#include "stringpool.h"
 #include "gdsroot.h"
 #include "gdsblk.h"
 #include "gtm_facility.h"
@@ -53,15 +52,16 @@
 #include "filestruct.h"
 #include "gvcst_protos.h"	/* for gvcst_root_search in GV_BIND_NAME_AND_ROOT_SEARCH macro */
 
-GBLREF int		(*op_open_ptr)(mval *v, mval *p, int t, mval *mspace);
-GBLREF bool		mu_ctrlc_occurred;
-GBLREF bool		mu_ctrly_occurred;
-GBLREF spdesc		rts_stringpool, stringpool;
-GBLREF gd_region	*gv_cur_region;
-GBLREF gd_addr		*gd_header;
-GBLREF io_pair          io_curr_device;
-GBLREF io_desc          *active_device;
-GBLREF gv_namehead	*gv_target;
+GBLREF	int		(*op_open_ptr)(mval *v, mval *p, int t, mval *mspace);
+GBLREF	bool		mu_ctrlc_occurred;
+GBLREF	bool		mu_ctrly_occurred;
+GBLREF	gd_region	*gv_cur_region;
+GBLREF	gd_addr		*gd_header;
+GBLREF	io_pair          io_curr_device;
+GBLREF	io_desc          *active_device;
+GBLREF	gv_namehead	*gv_target;
+GBLREF	boolean_t	jnlpool_init_needed;
+GBLREF	mstr		sys_output;
 
 error_def(ERR_EXTRACTCTRLY);
 error_def(ERR_EXTRACTFILERR);
@@ -72,6 +72,7 @@ error_def(ERR_MUPCLIERR);
 error_def(ERR_NOSELECT);
 error_def(ERR_NULLCOLLDIFF);
 error_def(ERR_RECORDSTAT);
+error_def(ERR_EXTRFILEXISTS);
 
 LITDEF mval	mu_bin_datefmt	= DEFINE_MVAL_LITERAL(MV_STR, 0, 0, SIZEOF(BIN_HEADER_DATEFMT) - 1,
 						      BIN_HEADER_DATEFMT, 0, 0);
@@ -79,7 +80,6 @@ LITDEF mval	mu_bin_datefmt	= DEFINE_MVAL_LITERAL(MV_STR, 0, 0, SIZEOF(BIN_HEADER
 LITREF mstr		chset_names[];
 
 static readonly unsigned char	datefmt_txt[] = "DD-MON-YEAR  24:60:SS";
-static readonly unsigned char	gt_lit[] = "TOTAL";
 static readonly unsigned char	select_text[] = "SELECT";
 static readonly mval		datefmt = DEFINE_MVAL_LITERAL(MV_STR, 0, 0, SIZEOF(datefmt_txt) - 1, (char *)datefmt_txt, 0, 0);
 static readonly mval		null_str = DEFINE_MVAL_LITERAL(MV_STR, 0, 0, 0, 0, 0, 0);
@@ -109,7 +109,6 @@ static readonly unsigned char no_param = (unsigned char)iop_eol;
 #define	WRITE_NUMERIC(nmfield)						\
 {									\
 	MV_FORCE_MVAL(&val, nmfield);					\
-	stringpool.free = stringpool.base;				\
 	n2s(&val);							\
 	if (val.mvtype & MV_NUM_APPROX)					\
 		GTMASSERT;						\
@@ -167,16 +166,16 @@ void mu_extract(void)
 	mval				val, curr_gbl_name, op_val, op_pars;
 	mstr				chset_mstr;
 	gtm_chset_t 			saved_out_set;
-	coll_hdr	extr_collhdr;
+	coll_hdr			extr_collhdr;
 	int				bin_header_size;
 	int	 			reg_no;
 	boolean_t			is_any_file_encrypted = FALSE;
-	GTMCRYPT_ONLY(
-		unsigned short		hash_buff_len;
-		sgmnt_data_ptr_t	csd;
-		sgmnt_addrs		*csa;
-		muext_hash_hdr_ptr_t	hash_array;
-	)
+#	ifdef GTM_CRYPT
+	unsigned short			hash_buff_len;
+	sgmnt_data_ptr_t		csd;
+	sgmnt_addrs			*csa;
+	muext_hash_hdr_ptr_t		hash_array;
+#	endif
 
 	/* Initialize all local character arrays to zero before using */
 	memset(cli_buff, 0, SIZEOF(cli_buff));
@@ -242,20 +241,21 @@ void mu_extract(void)
 		cli_buff[0] = '*';
 	}
 	/* gv_select will select globals */
+	jnlpool_init_needed = TRUE;
         gv_select(cli_buff, n_len, freeze, (char *)select_text, &gl_head, &reg_max_rec, &reg_max_key, &reg_max_blk, FALSE);
  	if (!gl_head.next)
         {
-                rts_error(VARLSTCNT(1) ERR_NOSELECT);
+                rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_NOSELECT);
                 mupip_exit(ERR_NOSELECT);
         }
 	/* For binary format, check whether all regions have same null collation order */
 	if (MU_FMT_BINARY == format)
 	{
-		GTMCRYPT_ONLY(
-			hash_buff_len = (SIZEOF(muext_hash_hdr) * gd_header->n_regions);
-			hash_array = (muext_hash_hdr *)malloc(hash_buff_len);
-			memset(hash_array, 0, hash_buff_len);
-		)
+#		ifdef GTM_CRYPT
+		hash_buff_len = (SIZEOF(muext_hash_hdr) * gd_header->n_regions);
+		hash_array = (muext_hash_hdr *)malloc(hash_buff_len);
+		memset(hash_array, 0, hash_buff_len);
+#		endif
 		for (reg = gd_header->regions, region_top = gd_header->regions + gd_header->n_regions,
 				reg_std_null_coll = -1, reg_no = 0;
 					reg < region_top ; reg++, reg_no++)
@@ -268,7 +268,7 @@ void mu_extract(void)
 						reg_std_null_coll = reg->std_null_coll;
 					else
 					{
-						rts_error(VARLSTCNT(1) ERR_NULLCOLLDIFF);
+						rts_error_csa(CSA_ARG(REG2CSA(reg)) VARLSTCNT(1) ERR_NULLCOLLDIFF);
 						mupip_exit(ERR_NULLCOLLDIFF);
 					}
 				}
@@ -285,32 +285,33 @@ void mu_extract(void)
 	}
 	grand_total.recknt = grand_total.reclen = grand_total.keylen = grand_total.datalen = 0;
 	global_total.recknt = global_total.reclen = global_total.keylen = global_total.datalen = 0;
-
 	n_len = SIZEOF(outfilename);
-	if (FALSE == cli_get_str("FILE", outfilename, &n_len))
+	if (CLI_PRESENT == cli_present("STDOUT"))
+		/* Redirect to standard output */
+		op_val.str = sys_output;
+	else if (FALSE == cli_get_str("FILE", outfilename, &n_len))
 	{
-		rts_error(VARLSTCNT(1) ERR_MUPCLIERR);
+		rts_error_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_MUPCLIERR);
 		mupip_exit(ERR_MUPCLIERR);
-	}
-	if (-1 == Stat((char *)outfilename, &statbuf))
-        {
+	} else if (-1 == Stat((char *)outfilename, &statbuf))
+	{	/* Redirect to file */
 		if (ENOENT != errno)
 		{
 			local_errno = errno;
-			perror("Error opening output file");
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(5) ERR_EXTRACTFILERR, 2, LEN_AND_STR(outfilename), local_errno);
 			mupip_exit(local_errno);
 		}
+		op_val.str.len = filename_len = n_len;
+		op_val.str.addr = (char *)outfilename;
 	} else
 	{
-		util_out_print("Error opening output file: !AD -- File exists", TRUE, n_len, outfilename);
+		gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(4) ERR_EXTRFILEXISTS, 2, LEN_AND_STR(outfilename));
 		mupip_exit(ERR_MUNOACTION);
 	}
 	op_pars.mvtype = MV_STR;
 	op_pars.str.len = SIZEOF(open_params_list);
 	op_pars.str.addr = (char *)open_params_list;
 	op_val.mvtype = MV_STR;
-	op_val.str.len = filename_len = n_len;
-	op_val.str.addr = (char *)outfilename;
 	(*op_open_ptr)(&op_val, &op_pars, 0, 0);
 	ESTABLISH(mu_extract_handler);
 	op_pars.str.len = SIZEOF(no_param);
@@ -327,16 +328,14 @@ void mu_extract(void)
 		outptr = outbuf;
 		if (is_any_file_encrypted)
 		{
-			MEMCPY_LIT(outptr, BIN_HEADER_LABEL);
-			outptr += STR_LIT_LEN(BIN_HEADER_LABEL);
+			MEMCPY_LIT(outptr, BIN_HEADER_LABEL_ENCR);
+			outptr += STR_LIT_LEN(BIN_HEADER_LABEL_ENCR);
 		} else
 		{
-			MEMCPY_LIT(outptr, V4_BIN_HEADER_LABEL);
-			outptr += STR_LIT_LEN(V4_BIN_HEADER_LABEL);
+			MEMCPY_LIT(outptr, BIN_HEADER_LABEL);
+			outptr += STR_LIT_LEN(BIN_HEADER_LABEL);
 		}
-		stringpool.free = stringpool.base;
 		op_horolog(&val);
-		stringpool.free = stringpool.base;
 		op_fnzdate(&val, (mval *)&mu_bin_datefmt, &null_str, &null_str, &val);
 		memcpy(outptr, val.str.addr, val.str.len);
 		outptr += val.str.len;
@@ -423,9 +422,7 @@ void mu_extract(void)
 		op_val.str.len = label_len;
 		op_val.str.addr = label_buff;
 		op_write(&op_val);
-		stringpool.free = stringpool.base;
 		op_horolog(&val);
-		stringpool.free = stringpool.base;
 		op_fnzdate(&val, &datefmt, &null_str, &null_str, &val);
 		op_val = val;
 		op_val.mvtype = MV_STR;
@@ -449,7 +446,7 @@ void mu_extract(void)
 		{
 			gbl_name_buff[0]='^';
 			memcpy(&gbl_name_buff[1], gl_ptr->name.str.addr, gl_ptr->name.str.len);
-			gtm_putmsg(VARLSTCNT(8) ERR_RECORDSTAT, 6, gl_ptr->name.str.len + 1, gbl_name_buff,
+			gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_RECORDSTAT, 6, gl_ptr->name.str.len + 1, gbl_name_buff,
 				global_total.recknt, global_total.keylen, global_total.datalen, global_total.reclen);
 			mu_ctrlc_occurred = FALSE;
 		}
@@ -484,7 +481,7 @@ void mu_extract(void)
 		{
 			gbl_name_buff[0]='^';
 			memcpy(&gbl_name_buff[1], gl_ptr->name.str.addr, gl_ptr->name.str.len);
-			gtm_putmsg(VARLSTCNT(8) ERR_RECORDSTAT, 6, gl_ptr->name.str.len + 1, gbl_name_buff,
+			gtm_putmsg_csa(CSA_ARG(cs_addrs) VARLSTCNT(8) ERR_RECORDSTAT, 6, gl_ptr->name.str.len + 1, gbl_name_buff,
 				global_total.recknt, global_total.keylen, global_total.datalen, global_total.reclen);
 			mu_ctrlc_occurred = FALSE;
 		}
@@ -505,10 +502,10 @@ void mu_extract(void)
 	REVERT;
 	if (mu_ctrly_occurred)
 	{
-		gtm_putmsg(VARLSTCNT(1) ERR_EXTRACTCTRLY);
+		gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(1) ERR_EXTRACTCTRLY);
 		mupip_exit(ERR_MUNOFINISH);
 	}
-	gtm_putmsg(VARLSTCNT(8) ERR_RECORDSTAT, 6, LEN_AND_LIT(gt_lit),
+	gtm_putmsg_csa(CSA_ARG(NULL) VARLSTCNT(8) ERR_RECORDSTAT, 6, LEN_AND_LIT("TOTAL"),
 		grand_total.recknt, grand_total.keylen, grand_total.datalen, grand_total.reclen);
 		if (MU_FMT_BINARY == format)
 	{	/*      truncate the last newline charactor flushed by op_close */

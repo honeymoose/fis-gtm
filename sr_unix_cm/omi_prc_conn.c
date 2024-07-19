@@ -1,6 +1,6 @@
 /****************************************************************
  *								*
- *	Copyright 2001, 2012 Fidelity Information Services, Inc	*
+ *	Copyright 2001, 2013 Fidelity Information Services, Inc	*
  *								*
  *	This source code contains the intellectual property	*
  *	of its copyright holder(s), and is made available	*
@@ -17,7 +17,7 @@
  */
 
 #ifndef lint
-static char rcsid[] = "$Header:$";
+static char rcsid[] = "$Header: /cvsroot/fis-gtm/gtm/sr_unix_cm/omi_prc_conn.c,v 1.7 2013/10/23 03:49:32 tuskentower Exp $";
 #endif
 
 #include "mdef.h"
@@ -150,7 +150,7 @@ int omi_prc_conn(omi_conn *cptr, char *xend, char *buff, char *bend)
     {
 	    OMI_DBG((omi_debug, "%s:  memory allocation error (insufficient resources) while\n", SRVR_NAME));
 	    OMI_DBG((omi_debug, "processing connect request from connection %d, %s.\n",
-	    		cptr->stats.id, gtcm_hname(&cptr->stats.sin)));
+	    		cptr->stats.id, gtcm_hname(&cptr->stats.ai)));
 	    return -OMI_ER_DB_UNRECOVER;
     }
     assert(ss_len.value < MAX_USER_NAME && ss_len.value > 0);
@@ -165,7 +165,7 @@ int omi_prc_conn(omi_conn *cptr, char *xend, char *buff, char *bend)
     {
 	    OMI_DBG((omi_debug, "%s:  memory allocation error (insufficient resources) while\n", SRVR_NAME));
 	    OMI_DBG((omi_debug, "processing connect request from connection %d, %s.\n",
-	    		cptr->stats.id, gtcm_hname(&cptr->stats.sin)));
+	    		cptr->stats.id, gtcm_hname(&cptr->stats.ai)));
 	    return -OMI_ER_DB_UNRECOVER;
     }
 
