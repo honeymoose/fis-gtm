@@ -1,0 +1,11 @@
+/arch.gtc////*////
+/caller_id.c////*////
+/genexport.csh////*////
+/gtm_env_sp.csh////*////
+/gtm_env_sp.mk////*////
+/gtm_getenv.c////*////
+/hugetlbfs_overrides.c////*////
+/hugetlbfs_overrides.h////*////
+/inst_flush.c////*////
+/platform.cmake////*////
+/release_name.h////*////
